@@ -39,6 +39,7 @@ const uint8_t buttonPins[12] = {
 
 PCF8575 pcf(PCF8575_ADDR);
 BleGamepad bleGamepad("CoolJoyBLE", "leDev", 100);
+BleGamepadConfiguration bleGamepadConfig;
 bool lastButtonState[12] = {0};
 bool bleConnected = false;
 
@@ -84,7 +85,12 @@ void setup() {
   // All pins are inputs by default for PCF8575
 
   // BLE Gamepad setup
-  bleGamepad.begin();
+  bleGamepadConfig.setButtonCount(12);
+  bleGamepadConfig.setIncludeRxAxis(false);
+  bleGamepadConfig.setWhichAxes(false,false,false,false,false,false,false,false);
+  bleGamepadConfig.setHatSwitchCount(0);
+
+  bleGamepad.begin(&bleGamepadConfig);
 }
 
 
