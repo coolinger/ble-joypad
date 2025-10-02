@@ -1,0 +1,468 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <PCF8575.h>
+#include <BleGamepad.h>
+//#include <TFT_eSPI.h>
+//#include <lvgl.h>
+
+//#include "CST820.h"
+/*
+#define LV_DISPLAY_ROTATION_0 0 // portrait, USB bottom side
+#define LV_DISPLAY_ROTATION_90 1 // landscape, USB right side
+#define LV_DISPLAY_ROTATION_180 2 // portrait, USB top side
+#define LV_DISPLAY_ROTATION_270 3 // landscape USB left side
+*/
+#include <LVGL_CYD.h>
+
+// PCF8575 I2C address (A0-A2 = GND)
+#define PCF8575_ADDR 0x20
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// RGB LED pins
+#define LED_R 4
+#define LED_G 16
+#define LED_B 17
+
+// Display settings
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
+#define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10)
+
+// Touch pins (CST816S/CST820)
+#define TOUCH_SDA 33
+#define TOUCH_SCL 32
+#define TOUCH_INT 21
+#define TOUCH_RST 25
+#define CST820_I2C_ADDR 0x15
+
+// Button mapping (PCF8575 pins)
+enum ButtonIndex
+{
+  SILVER_LEFT = 13,
+  SILVER_MID = 14,
+  SILVER_RIGHT = 15,
+  BLACK = 1,
+  WHITE = 0,
+  RED = 5,
+  YELLOW = 2,
+  BLUE = 3,
+  GREEN = 4,
+  LARGE_YELLOW = 12,
+  LARGE_BLUE = 11,
+  LARGE_GREEN = 10
+};
+
+const uint8_t buttonPins[12] = {
+    SILVER_LEFT, SILVER_MID, SILVER_RIGHT,
+    BLACK, WHITE, RED,
+    YELLOW, BLUE, GREEN,
+    LARGE_YELLOW, LARGE_BLUE, LARGE_GREEN};
+static uint32_t lastPrint = 0;
+PCF8575 pcf(PCF8575_ADDR, &Wire1);
+BleGamepad bleGamepad("CoolJoyBLE", "leDev", 100);
+BleGamepadConfiguration bleGamepadConfig;
+bool lastButtonState[12] = {0};
+bool bleConnected = false;
+
+// Display and LVGL objects
+//TFT_eSPI tft = TFT_eSPI();
+//static lv_disp_draw_buf_t draw_buf;
+//static lv_color_t buf[LVGL_BUFFER_SIZE];
+//static lv_disp_drv_t disp_drv;
+//static lv_indev_drv_t indev_drv;
+
+//CST820 touch(TOUCH_SDA, TOUCH_SCL, TOUCH_RST, TOUCH_INT);
+
+// Fighter command structure
+struct FighterCommand
+{
+  const char *name;
+  float angle;
+  uint8_t button_id;
+};
+
+// Fighter commands (button IDs 13-20 for display commands)
+FighterCommand commands[8] = {
+    {"Fighter Zurückordern", 0.0f, 13},
+    {"Verteidigen", 45.0f, 14},
+    {"Feuer Frei", 90.0f, 15},
+    {"Mein Ziel angreifen", 135.0f, 16},
+    {"Formation halten", 180.0f, 17},
+    {"Position halten", 225.0f, 18},
+    {"Mir folgen", 270.0f, 19},
+    {"Befehle öffnen", 315.0f, 20}};
+
+// UI objects
+lv_obj_t *fighter_screen;
+lv_obj_t *center_btn;
+bool display_active = false;
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b)
+{
+  // Invert logic: 0 = on, 255 = off
+  analogWrite(LED_R, 255 - r);
+  analogWrite(LED_G, 255 - g);
+  analogWrite(LED_B, 255 - b);
+}
+
+/*
+// Simple CST820 touch functions
+void initTouch()
+{
+
+  Serial.println("Init Touch");
+  touch.begin();
+  Serial.println("Touch Controller initialized");
+
+  // Test I2C communication
+  Wire1.beginTransmission(CST820_I2C_ADDR);
+  uint8_t error = Wire1.endTransmission();
+  if (error == 0)
+  {
+    Serial.println("CST820 found on I2C bus");
+  }
+  else
+  {
+    Serial.printf("CST820 NOT found! Error: %d\n", error);
+  }
+}
+*/
+
+/*
+// LVGL display flush callback
+void lvgl_flush_cb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
+{
+  uint32_t w = (area->x2 - area->x1 + 1);
+  uint32_t h = (area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, w, h);
+  tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+  tft.endWrite();
+
+  //tft.pushImageDMA(area->x1, area->y1, w, h, (uint16_t *)color_p);
+
+  lv_disp_flush_ready(disp);
+}
+*/
+// Calculate angle from center to point
+float calculateAngle(int16_t x, int16_t y, int16_t centerX, int16_t centerY)
+{
+  float angle = atan2(y - centerY, x - centerX) * 180.0 / PI;
+  if (angle < 0)
+    angle += 360.0;
+  return angle;
+}
+
+// Find closest command based on angle
+int findClosestCommand(float angle)
+{
+  int closest = 0;
+  float minDiff = 360.0;
+
+  for (int i = 0; i < 8; i++)
+  {
+    float diff = abs(angle - commands[i].angle);
+    if (diff > 180.0)
+      diff = 360.0 - diff; // Handle wrap-around
+    if (diff < minDiff)
+    {
+      minDiff = diff;
+      closest = i;
+    }
+  }
+  return closest;
+}
+
+// Touch event handler for fighter commands
+void fighter_touch_event(lv_event_t *e)
+{
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED)
+  {
+    lv_indev_t *indev = lv_indev_get_act();
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+
+    int16_t centerX = SCREEN_WIDTH / 2;
+    int16_t centerY = SCREEN_HEIGHT / 2;
+
+    // Check if click is in center button (30px radius)
+    int16_t dx = point.x - centerX;
+    int16_t dy = point.y - centerY;
+    if (sqrt(dx * dx + dy * dy) <= 30)
+    {
+      // Center button clicked - toggle display mode
+      display_active = !display_active;
+      Serial.println("Befehle öffnen/schließen");
+      bleGamepad.press(20); // Button 20 for "Befehle öffnen"
+      delay(50);
+      bleGamepad.release(20);
+      return;
+    }
+
+    // Calculate angle and find command
+    float angle = calculateAngle(point.x, point.y, centerX, centerY);
+    int cmdIndex = findClosestCommand(angle);
+
+    Serial.printf("Command: %s (Button %d)\n", commands[cmdIndex].name, commands[cmdIndex].button_id);
+    bleGamepad.press(commands[cmdIndex].button_id);
+    delay(50);
+    bleGamepad.release(commands[cmdIndex].button_id);
+    setLedColor(0, 255, 0); // Green flash for command
+  }
+}
+
+// Create fighter command wheel UI
+void create_fighter_ui()
+{
+  // Create main screen
+  fighter_screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(fighter_screen, lv_color_hex(0x121212), 0);
+
+  // Set as active screen
+  lv_scr_load(fighter_screen);
+
+  // Add touch event to the entire screen
+  lv_obj_add_event_cb(fighter_screen, fighter_touch_event, LV_EVENT_CLICKED, NULL);
+
+  // Draw center circle
+  center_btn = lv_obj_create(fighter_screen);
+  lv_obj_set_size(center_btn, 60, 60);
+  lv_obj_center(center_btn);
+  lv_obj_set_style_radius(center_btn, 30, 0);
+  lv_obj_set_style_bg_color(center_btn, lv_color_hex(0xff9500), 0);
+  lv_obj_set_style_border_width(center_btn, 2, 0);
+  lv_obj_set_style_border_color(center_btn, lv_color_hex(0xd4d4d4), 0);
+
+  // Add center label
+  lv_obj_t *center_label = lv_label_create(center_btn);
+  lv_label_set_text(center_label, "Befehle\noeffnen");
+  lv_obj_set_style_text_align(center_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(center_label, lv_color_hex(0x121212), 0);
+  lv_obj_center(center_label);
+
+  // Create command labels around the circle
+  int16_t centerX = SCREEN_WIDTH / 2;
+  int16_t centerY = SCREEN_HEIGHT / 2;
+
+  for (int i = 0; i < 8; i++)
+  {
+    float angleRad = commands[i].angle * PI / 180.0;
+
+    // Calculate position for labels
+    int16_t labelR = 80; // Distance from center
+    int16_t labelX = centerX + cos(angleRad) * labelR;
+    int16_t labelY = centerY + sin(angleRad) * labelR;
+
+    // Create command label
+    lv_obj_t *cmd_label = lv_label_create(fighter_screen);
+    lv_label_set_text(cmd_label, commands[i].name);
+    lv_obj_set_style_text_color(cmd_label, lv_color_hex(0xd4d4d4), 0);
+    lv_obj_set_style_text_font(cmd_label, LV_FONT_DEFAULT, 0);
+
+    // Position label with offset to center text
+    lv_obj_set_pos(cmd_label, labelX - 30, labelY - 10);
+
+    // Create sector button (invisible clickable area)
+    lv_obj_t *sector = lv_obj_create(fighter_screen);
+    lv_obj_set_size(sector, 60, 40);
+    lv_obj_set_pos(sector, labelX - 30, labelY - 20);
+    lv_obj_set_style_bg_opa(sector, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_opa(sector, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(sector, LV_OBJ_FLAG_CLICKABLE);
+  }
+}
+
+/*
+void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
+{
+  static uint32_t callCount = 0;
+  callCount++;
+  
+  // Print every 100 calls to verify the callback is being executed
+  if (callCount % 100 == 0) {
+    Serial.printf("Touch callback called %d times\n", callCount);
+  }
+  
+  bool touched;
+  uint8_t gesture;
+  uint16_t touchX, touchY;
+
+  touched = touch.getTouch(&touchX, &touchY, &gesture);
+
+  if (!touched)
+  {
+    data->state = LV_INDEV_STATE_REL;
+    // Print "no touch" every 2 seconds for debugging
+    if (millis() - lastPrint > 2000)
+    {
+      Serial.println("Touch: No touch detected");
+      lastPrint = millis();
+    }
+  }
+  else
+  {
+    Serial.printf("Touch at %d,%d\n", touchX, touchY);
+    data->state = LV_INDEV_STATE_PR;
+
+    //Set the coordinates
+    data->point.x = touchX;
+    data->point.y = touchY;
+  }
+}
+*/
+// Initialize display and LVGL
+void init_display()
+{
+  /*
+  // Initialize TFT
+    tft.begin();     
+  tft.setRotation(3); // Landscape
+    tft.initDMA();     
+
+
+  tft.fillScreen(TFT_BLACK);
+    digitalWrite(27, HIGH);
+    tft.fillScreen(TFT_RED);
+    delay(500);
+    tft.fillScreen(TFT_GREEN);
+    delay(500);
+    tft.fillScreen(TFT_BLUE);
+    delay(500);
+    tft.fillScreen(TFT_BLACK);
+    delay(500);
+
+  // Initialize touch controller
+  initTouch();
+
+  // Initialize LVGL
+  
+  lv_init();
+
+  // Initialize display buffer
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, LVGL_BUFFER_SIZE);
+
+  // Initialize display driver
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = SCREEN_WIDTH;
+  disp_drv.ver_res = SCREEN_HEIGHT;
+  disp_drv.flush_cb = lvgl_flush_cb;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  // Initialize input driver
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touchpad_read;
+    lv_indev_drv_register(&indev_drv);
+*/
+  LVGL_CYD::begin(USB_LEFT);
+
+  // Create UI
+  create_fighter_ui();
+}
+
+void checkBleConnection()
+{
+  if (bleGamepad.isConnected())
+  {
+    if (!bleConnected)
+    {
+      Serial.println("[BLE] Connected");
+      setLedColor(0, 0, 255); // Light blue
+      bleConnected = true;
+    }
+  }
+  else
+  {
+    if (bleConnected)
+    {
+      Serial.println("[BLE] Disconnected");
+      setLedColor(255, 0, 0); // Light red
+      bleConnected = false;
+    }
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+  // RGB LED setup
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setLedColor(255, 0, 0); // Start: red (no BLE)
+
+  // I2C and PCF8575 setup
+  Wire1.begin(I2C_SDA, I2C_SCL);
+  pcf.begin();
+  // All pins are inputs by default for PCF8575
+
+  //Wire1.begin(TOUCH_SDA, TOUCH_SCL);
+
+  // BLE Gamepad setup - 20 buttons (12 physical + 8 display commands)
+  bleGamepadConfig.setButtonCount(20);
+  bleGamepadConfig.setIncludeRxAxis(false);
+  bleGamepadConfig.setWhichAxes(false, false, false, false, false, false, false, false);
+  bleGamepadConfig.setHatSwitchCount(0);
+
+  bleGamepad.begin(&bleGamepadConfig);
+
+  // Initialize display and UI
+  init_display();
+
+  Serial.println("BLE Joypad with Fighter Commands ready!");
+}
+
+void loop()
+{
+  static uint32_t lastLvglPrint = 0;
+  
+  // Handle LVGL tasks - MUST be called every loop iteration!
+  lv_timer_handler();
+  
+  // Print LVGL status every 5 seconds
+  if (millis() - lastLvglPrint > 5000) {
+    Serial.println("LVGL timer handler running...");
+    lastLvglPrint = millis();
+  }
+
+  checkBleConnection();
+  
+  // Handle physical buttons only if BLE is connected
+  if (bleConnected) {
+    uint16_t pcfState = pcf.read16();
+    bool anyPressed = false;
+    for (uint8_t i = 0; i < 12; i++)
+    {
+      bool pressed = !(pcfState & (1 << buttonPins[i])); // Active low
+      if (pressed != lastButtonState[i])
+      {
+        if (pressed)
+        {
+          bleGamepad.press(i + 1); // Gamepad buttons start at 1
+          Serial.printf("Button %d pressed\n", i + 1);
+          anyPressed = true;
+        }
+        else
+        {
+          bleGamepad.release(i + 1);
+          Serial.printf("Button %d released\n", i + 1);
+        }
+        lastButtonState[i] = pressed;
+      }
+    }
+    bleGamepad.sendReport();
+    if (anyPressed)
+      setLedColor(0, 255, 0); // Green on keypress
+    else
+      setLedColor(0, 0, 255); // Blue when connected, no keypress
+  }
+  
+  delay(5);
+}
