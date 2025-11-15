@@ -4,6 +4,8 @@
 #include <BleGamepad.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#include <WiFi.h>
+
 
 #define PCF8575_ADDR 0x20
 #define I2C_SDA 21
@@ -14,6 +16,7 @@
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 #define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 20)
+uint32_t buf[LVGL_BUFFER_SIZE / 4];
 #define TOUCH_SDA 33
 #define TOUCH_SCL 32
 #define CST820_I2C_ADDR 0x15
@@ -47,8 +50,7 @@ uint16_t lastButtonState = 0;
 bool bleConnected = false;
 
 // Display and LVGL objects
-TFT_eSPI tft = TFT_eSPI();
-static lv_color_t* buf;
+//TFT_eSPI tft = TFT_eSPI();
 static lv_display_t* disp;
 
 // Fighter command structure
@@ -57,6 +59,11 @@ struct FighterCommand
   const char *name;
   uint8_t button_id;
 };
+
+
+#define WIFI_SSID "0619562e-bcbf-4bfc-97a8"
+#define WIFI_PASSWORD "3869212721440634"
+#define HOSTNAME "FighterController"
 
 // Fighter commands - Store in Flash
 const FighterCommand PROGMEM commands[8] = {
@@ -77,7 +84,10 @@ lv_obj_t *btnmatrix;
 bool displayOn = true;
 uint32_t lastTouchTime = 0;
 uint32_t lastBleActiveTime = 0;
+uint32_t bleDisconnectedTime = 0;
 const uint32_t DISPLAY_TIMEOUT = 30 * 60 * 1000; // 30 minutes in milliseconds
+const uint32_t LED_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+bool ledOn = true;
 
 static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
@@ -145,7 +155,7 @@ void initTouch()
   Wire1.end();
 }
 
-void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, unsigned char *color_p)
+/*void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, unsigned char *color_p)
 {
   uint32_t w = (area->x2 - area->x1 + 1);
   uint32_t h = (area->y2 - area->y1 + 1);
@@ -154,7 +164,7 @@ void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, unsigned char *col
   tft.pushColors((uint16_t *)color_p, w * h, true);
   tft.endWrite();
   lv_display_flush_ready(disp);
-}
+}*/
 
 void create_fighter_ui()
 {
@@ -164,14 +174,25 @@ void create_fighter_ui()
 
   btnmatrix = lv_btnmatrix_create(fighter_screen);
   lv_btnmatrix_set_map(btnmatrix, btnm_map);
-  lv_obj_set_size(btnmatrix, 300, 220);
-  lv_obj_center(btnmatrix);
-  
+      
+  static lv_style_t style_bg;
+    lv_style_init(&style_bg);
+    lv_style_set_pad_all(&style_bg, 0);
+    lv_style_set_pad_gap(&style_bg, 1);
+    lv_style_set_clip_corner(&style_bg, true);
+    lv_style_set_radius(&style_bg, LV_RADIUS_CIRCLE);
+    lv_style_set_border_width(&style_bg, 0);
+
+  // Fill entire screen with 1px padding
+  lv_obj_set_size(btnmatrix, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2);
+  lv_obj_set_pos(btnmatrix, 1, 1);
+
   lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0x222222), 0);
   lv_obj_set_style_border_color(btnmatrix, lv_color_hex(0x555555), 0);
-  lv_obj_set_style_border_width(btnmatrix, 2, 0);
+  lv_obj_set_style_border_width(btnmatrix, 0, 0);
   lv_obj_set_style_radius(btnmatrix, 10, 0);
-  
+  lv_obj_add_style(btnmatrix, &style_bg, 0);
+
   lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0x444444), LV_PART_ITEMS);
   lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0xff9500), LV_PART_ITEMS | LV_STATE_PRESSED);
   lv_obj_set_style_text_color(btnmatrix, lv_color_hex(0xffffff), LV_PART_ITEMS);
@@ -216,23 +237,22 @@ static void touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
   int raw_x = ((touchdata[1] & 0x0f) << 8) | touchdata[2];
   int raw_y = ((touchdata[3] & 0x0f) << 8) | touchdata[4];
   
-  // Transform coordinates for rotation 3 (landscape)
-  // Based on your description: touch controller seems to be in portrait mode
-  // We need to rotate the coordinates to match the display orientation
-  x = 320 - raw_y;                    // X becomes raw Y
-  y = raw_x;              // Y becomes inverted raw X
-  
-  // Clamp coordinates to screen bounds
-  if (x < 0) x = 0;
-  if (x >= SCREEN_WIDTH) x = SCREEN_WIDTH - 1;
-  if (y < 0) y = 0;
-  if (y >= SCREEN_HEIGHT) y = SCREEN_HEIGHT - 1;
-  
+  // Correct for orientation.
+  // (Mostly done by LVGL, it just has the axes inverted in landscape somehow.)
+  lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+  if (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270) {
+    x = SCREEN_HEIGHT - raw_x;
+    y = SCREEN_WIDTH - raw_y;
+  } else {
+    x = raw_x;
+    y = raw_y;
+  }
+
   data->point.x = x;
   data->point.y = y;
   data->state = LV_INDEV_STATE_PRESSED;
 
-  //Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", raw_x, raw_y, x, y);
+  Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", raw_x, raw_y, x, y);
 
 }
 
@@ -247,28 +267,41 @@ void my_print(lv_log_level_t level, const char * buf)
 
 void init_display()
 {
-  buf = (lv_color_t*)ps_malloc(LVGL_BUFFER_SIZE * sizeof(lv_color_t));
-  if (!buf) {
-    Serial.println("Failed to allocate LVGL buffer in PSRAM, using regular RAM");
-    buf = (lv_color_t*)malloc(LVGL_BUFFER_SIZE * sizeof(lv_color_t));
-  } else {
-    Serial.println("LVGL buffer allocated in PSRAM");
-  }
 
-  tft.begin();
+  
+
+  /*tft.begin();
   tft.setRotation(3);
   tft.initDMA();
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);*/
   digitalWrite(27, HIGH);
 
   initTouch();
 
   lv_init();
+  lv_tick_set_cb([]() -> uint32_t { return millis(); });
   lv_log_register_print_cb(my_print);
 
-  disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
-  lv_display_set_flush_cb(disp, lvgl_flush_cb);
-  lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  //disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+  disp = lv_tft_espi_create(SCREEN_HEIGHT, SCREEN_WIDTH, buf, sizeof(buf));
+  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+  //lv_display_set_flush_cb(disp, lvgl_flush_cb);
+  //lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+  /*TFT_eSPI *tft = (TFT_eSPI *) lv_display_get_driver_data(disp);
+
+    // ST7789 needs to be inverted
+    tft->invertDisplay(true);
+
+    // gamma fix for ST7789
+    tft->writecommand(0x26); //Gamma curve selected
+    tft->writedata(2);
+    delay(120);
+    tft->writecommand(0x26); //Gamma curve selected
+    tft->writedata(1);
+  */
+
+
 
   lv_indev_t* indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
@@ -286,9 +319,10 @@ void checkBleConnection()
       Serial.println("[BLE] Connected");
       setLedColor(0, 0, 255);
       bleConnected = true;
-      setDisplayPower(true); // Turn on display when BLE connects
+      ledOn = true;
+      setDisplayPower(true);
     }
-    lastBleActiveTime = millis(); // Update BLE active time
+    lastBleActiveTime = millis();
   }
   else
   {
@@ -297,7 +331,16 @@ void checkBleConnection()
       Serial.println("[BLE] Disconnected");
       setLedColor(255, 0, 0);
       bleConnected = false;
-      setDisplayPower(false); // Turn off display when BLE disconnects
+      ledOn = true;
+      bleDisconnectedTime = millis();
+      setDisplayPower(false);
+    }
+    
+    // Turn off red LED after 5 minutes of no connection
+    if (ledOn && (millis() - bleDisconnectedTime) > LED_TIMEOUT) {
+      setLedColor(0, 0, 0); // Turn off LED
+      ledOn = false;
+      Serial.println("[LED] Timeout - turning off");
     }
   }
 }
@@ -318,6 +361,38 @@ void checkDisplayTimeout()
   }
 }
 
+void WifiConnect()
+{
+  setLedColor(255, 0, 255); // Magenta during WiFi setup
+  
+  // Configure WiFi with auto-reconnect
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  // Set hostname
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  Serial.print("Connecting to WiFi");
+  uint8_t retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) { // 10 seconds timeout
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed, continuing without WiFi");
+  }
+  
+  setLedColor(255, 0, 0); // Red = waiting for BLE
+  
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -325,11 +400,12 @@ void setup()
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  setLedColor(255, 0, 0);
-
+  WifiConnect();
+  delay(500);
   // Initialize display power management
   lastTouchTime = millis();
   lastBleActiveTime = millis();
+  bleDisconnectedTime = millis();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   pcf.begin();
@@ -348,9 +424,9 @@ void loop()
 {
   static uint32_t lastTick = 0;
   
-  uint32_t currentTime = millis();
-  lv_tick_inc(currentTime - lastTick);
-  lastTick = currentTime;
+  //uint32_t currentTime = millis();
+  //lv_tick_inc(currentTime - lastTick);
+  //lastTick = currentTime;
   
   lv_timer_handler();
   checkBleConnection();
