@@ -6,6 +6,7 @@
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 
 
@@ -93,6 +94,7 @@ struct NavRouteInfo {
 struct EventLogEntry {
   char text[55];  // Reduced to fit 8 entries in memory
   uint32_t timestamp;
+  int count;  // For consolidating repeated entries
 };
 
 // Global Elite data
@@ -100,7 +102,7 @@ CargoInfo cargoInfo;
 FuelInfo fuelInfo;
 HullInfo hullInfo;
 NavRouteInfo navRouteInfo;
-EventLogEntry eventLog[8];  // Show last 8 events
+EventLogEntry eventLog[9];  // Show last 9 events
 int eventLogIndex = 0;
 int eventLogCount = 0;  // Track how many events we actually have
 char motherlodeMaterial[32] = "";
@@ -114,6 +116,13 @@ WiFiUDP udpSender;    // Core 1 - sends SUMMARY requests
 char* udpBuffer = nullptr;
 const int UDP_BUFFER_SIZE = 2048;
 int lastEventId = -1;  // Track last event ID for deduplication
+
+// TCP/HTTP variables for Elite Dangerous data polling
+String serverIP = "";
+int httpPort = 0;
+int udpControlPort = 0;
+bool useTCP = false;
+int lastHttpEntryId = 0;  // Track last entry ID from HTTP responses
 
 // Task handle for Core 0
 TaskHandle_t udpTaskHandle = NULL;
@@ -426,7 +435,7 @@ void updateLogDisplay() {
     logText[0] = 0;
   
   // Only show as many entries as we actually have
-  int entriesToShow = (eventLogCount < 8) ? eventLogCount : 8;
+  int entriesToShow = (eventLogCount < 9) ? eventLogCount : 9;
   
   Serial.print("[LOG] Updating display: showing ");
   Serial.print(entriesToShow);
@@ -438,7 +447,7 @@ void updateLogDisplay() {
   
   for (int i = 0; i < entriesToShow; i++) {
     // Calculate index going backwards from most recent
-    int idx = (eventLogIndex - 1 - i + 8) % 8;
+    int idx = (eventLogIndex - 1 - i + 9) % 9;
     Serial.print("  [");
     Serial.print(i);
     Serial.print("] idx=");
@@ -447,6 +456,12 @@ void updateLogDisplay() {
     Serial.println(eventLog[idx].text);
     
     if (eventLog[idx].text[0] != 0) {
+      // Add count prefix if entry was repeated
+      if (eventLog[idx].count > 1) {
+        char countPrefix[10];
+        snprintf(countPrefix, sizeof(countPrefix), "%dx ", eventLog[idx].count);
+        strcat(logText, countPrefix);
+      }
       strcat(logText, eventLog[idx].text);
       strcat(logText, "\n");
     }
@@ -460,17 +475,47 @@ void updateLogDisplay() {
 }
 
 void addLogEntry(const char* text) {
+  // Check if this is a repeat of the most recent entry
+  if (eventLogCount > 0) {
+    int lastIdx = (eventLogIndex - 1 + 9) % 9;
+    
+    // Extract base text without count prefix (e.g., "5x Scan" -> "Scan")
+    const char* baseText = text;
+    const char* lastBaseText = eventLog[lastIdx].text;
+    
+    // Skip count prefix if it exists in last entry (e.g., "5x ")
+    const char* xPos = strchr(lastBaseText, 'x');
+    if (xPos && xPos > lastBaseText && *(xPos + 1) == ' ') {
+      lastBaseText = xPos + 2;  // Skip "Nx "
+    }
+    
+    // Compare base text
+    if (strcmp(baseText, lastBaseText) == 0) {
+      // Same as last entry - increment count
+      eventLog[lastIdx].count++;
+      eventLog[lastIdx].timestamp = millis();
+      
+      Serial.printf("[LOG] Consolidated entry #%d: %dx %s\n", 
+        lastIdx, eventLog[lastIdx].count, lastBaseText);
+      
+      updateLogDisplay();
+      return;
+    }
+  }
+  
+  // New different entry - add normally
   strncpy(eventLog[eventLogIndex].text, text, sizeof(eventLog[eventLogIndex].text) - 1);
   eventLog[eventLogIndex].text[sizeof(eventLog[eventLogIndex].text) - 1] = 0;
   eventLog[eventLogIndex].timestamp = millis();
+  eventLog[eventLogIndex].count = 1;
   
   Serial.print("[LOG] Added entry #");
   Serial.print(eventLogIndex);
   Serial.print(": ");
   Serial.println(eventLog[eventLogIndex].text);
   
-  eventLogIndex = (eventLogIndex + 1) % 8;
-  if (eventLogCount < 8) eventLogCount++;
+  eventLogIndex = (eventLogIndex + 1) % 9;
+  if (eventLogCount < 9) eventLogCount++;
   updateLogDisplay();
 }
 
@@ -809,7 +854,34 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
   static char logBuf[80];
   static char tempBuf[60];
   
-  if (eventType == "SUMMARY") {
+  if (eventType == "KEEPALIVE") {
+    // Parse KEEPALIVE packet: KEEPALIVE|0|{"ip": "x.x.x.x", "http_port": 12345, "udp_control_port": 12346, "current_message_id": 32}
+    const char* ip = doc["ip"];
+    int http_port = doc["http_port"];
+    int udp_ctrl_port = doc["udp_control_port"];
+    int current_msg_id = doc["current_message_id"] | 0;  // Default to 0 if not present
+    
+    if (ip && http_port > 0) {
+      serverIP = String(ip);
+      httpPort = http_port;
+      udpControlPort = udp_ctrl_port;
+      useTCP = true;
+      
+      // Initialize lastHttpEntryId to get only recent messages (last 10)
+      if (current_msg_id > 10) {
+        lastHttpEntryId = current_msg_id - 10;
+        Serial.printf("[KEEPALIVE] Setting entry ID to %d (server at %d, requesting last 10)\n", 
+          lastHttpEntryId, current_msg_id);
+      } else {
+        lastHttpEntryId = 0;
+      }
+      
+      Serial.printf("[KEEPALIVE] TCP enabled - Server: %s:%d, UDP Control: %d, Msg ID: %d\n", 
+        serverIP.c_str(), httpPort, udpControlPort, current_msg_id);
+    }
+    // Do not show KEEPALIVE in display
+    return;
+  } else if (eventType == "SUMMARY") {
     // Parse comprehensive summary data
     Serial.println("[SUMMARY] Received state update");
     summaryReceived = true;  // Mark that we've received first summary
@@ -1081,7 +1153,125 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
   }
 }
 
-void checkUdpMessages() {
+void checkMessages() {
+  // Check for HTTP updates when TCP is enabled
+  if (useTCP && serverIP.length() > 0 && httpPort > 0) {
+    // Rate limit HTTP requests to once per second
+    static uint32_t lastHttpRequest = 0;
+    static int consecutiveHttpErrors = 0;
+    uint32_t currentTime = millis();
+    if (currentTime - lastHttpRequest < 1000) {
+      return;  // Skip this request
+    }
+    lastHttpRequest = currentTime;
+    
+    HTTPClient http;
+    // Limit to max 10 entries per request to avoid memory issues
+    String url = "http://" + serverIP + ":" + String(httpPort) + "/sinceentry/" + String(lastHttpEntryId) + "?limit=10";
+    
+    http.begin(url);
+    http.setTimeout(5000);  // 5 second timeout
+    
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      
+      // Check payload size before parsing
+      if (payload.length() > 50000) {
+        Serial.printf("[HTTP] ERROR: Payload too large (%d bytes), skipping\n", payload.length());
+        http.end();
+        consecutiveHttpErrors++;
+        if (consecutiveHttpErrors >= 3) {
+          Serial.println("[TCP] Too many errors, falling back to UDP");
+          useTCP = false;
+          consecutiveHttpErrors = 0;
+        }
+        return;
+      }
+      
+      // Use streaming parser to reduce memory usage
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      
+      // Check if server sent an error (e.g., message ID reset)
+      if (!error && doc.is<JsonObject>() && doc["error"].is<const char*>()) {
+        const char* errorMsg = doc["error"];
+        int currentMsgId = doc["current_message_id"] | 0;
+        
+        Serial.printf("[HTTP] Server error: %s\n", errorMsg);
+        
+        if (currentMsgId > 0) {
+          // Server restarted - reset to get last 10 messages
+          if (currentMsgId > 10) {
+            lastHttpEntryId = currentMsgId - 10;
+          } else {
+            lastHttpEntryId = 0;
+          }
+          Serial.printf("[HTTP] Resetting entry ID to %d (server at %d)\n", 
+            lastHttpEntryId, currentMsgId);
+        }
+        
+        consecutiveHttpErrors = 0;  // Don't count this as an error
+      } else if (!error && doc.is<JsonArray>()) {
+        JsonArray entries = doc.as<JsonArray>();
+        
+        if (entries.size() > 0) {
+          Serial.printf("[HTTP] Received %d entries since ID %d\n", entries.size(), lastHttpEntryId);
+          
+          // Reset timeout and turn on display on message received
+          lastTouchTime = millis();
+          if (!displayOn) {
+            setDisplayPower(true);
+          }
+        }
+        
+        for (JsonObject entry : entries) {
+          int id = entry["id"];
+          const char* type = entry["type"];
+          JsonObject data = entry["data"];
+          
+          if (type && !data.isNull()) {
+            // Update last entry ID
+            if (id > lastHttpEntryId) {
+              lastHttpEntryId = id;
+            }
+            
+            // Process entry through existing event handler
+            JsonDocument eventDoc;
+            eventDoc.set(data);
+            handleEliteEvent(String(type), eventDoc);
+          }
+        }
+        consecutiveHttpErrors = 0;  // Reset on successful parse
+      } else if (error) {
+        Serial.printf("[HTTP] JSON parse error: %s (payload size: %d bytes)\n", 
+          error.c_str(), payload.length());
+        consecutiveHttpErrors++;
+      }
+    } else if (httpCode > 0 && httpCode != HTTP_CODE_OK) {
+      Serial.printf("[HTTP] Request failed with code: %d\n", httpCode);
+      consecutiveHttpErrors++;
+    } else {
+      Serial.printf("[HTTP] Connection failed (code: %d)\n", httpCode);
+      Serial.printf("[HTTP] Trying to connect to: %s\n", url.c_str());
+      consecutiveHttpErrors++;
+    }
+    
+    http.end();
+    
+    // Fall back to UDP if we have 3 consecutive HTTP errors
+    if (consecutiveHttpErrors >= 3) {
+      Serial.println("[TCP] Too many errors, falling back to UDP");
+      useTCP = false;
+      consecutiveHttpErrors = 0;
+      return;
+    }
+    
+    // Skip UDP processing when TCP is active
+    return;
+  }
+  // Check for UDP messages (only when TCP is not enabled)
   int packetSize = udpReceiver.parsePacket();
   
   if (packetSize > 0) {
@@ -1135,13 +1325,15 @@ void checkUdpMessages() {
           
           int eventId = eventIdStr.toInt();
           
-          // Deduplicate: skip if we've already seen this ID
-          if (eventId == lastEventId) {
+          // Deduplicate: skip if we've already seen this ID (except KEEPALIVE)
+          if (eventId == lastEventId && eventType != "KEEPALIVE") {
             Serial.printf("[UDP] Duplicate %s ID %d - skipping\n", eventType.c_str(), eventId);
             return;
           }
           
-          lastEventId = eventId;
+          if (eventType != "KEEPALIVE") {
+            lastEventId = eventId;
+          }
           Serial.printf("[UDP] Processing %s event ID: %d\n", eventType.c_str(), eventId);
           
           // Parse JSON with reduced buffer
@@ -1164,14 +1356,30 @@ void checkUdpMessages() {
   }
 }
 
-// UDP task running on Core 0 for non-blocking message reception
+// Message handling task running on Core 0 for non-blocking UDP and HTTP reception
 void loop2(void* parameter) {
-  Serial.print("[UDP] Task started on core: ");
+  Serial.print("[MSG] Task started on core: ");
   Serial.println(xPortGetCoreID());
   
+  uint32_t lastHttpPollCore0 = 0;
+  const uint32_t HTTP_POLL_INTERVAL_CORE0 = 1000;  // Poll every 1 second
+  
   while (1) {
-    checkUdpMessages();  // Check for UDP packets
-    vTaskDelay(pdMS_TO_TICKS(1));  // 1ms polling - faster for large packets
+    // Check UDP messages continuously
+    checkMessages();
+    
+    // Only delay if not using TCP, otherwise poll more frequently for HTTP
+    if (useTCP) {
+      uint32_t currentTime = millis();
+      if ((currentTime - lastHttpPollCore0) < HTTP_POLL_INTERVAL_CORE0) {
+        vTaskDelay(pdMS_TO_TICKS(100));  // 100ms delay between HTTP polls
+      } else {
+        lastHttpPollCore0 = currentTime;
+        vTaskDelay(pdMS_TO_TICKS(10));  // Quick check
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling for UDP
+    }
   }
 }
 
@@ -1284,10 +1492,10 @@ void setup()
     while(1);
   }
   
-  // Start UDP receiver task on Core 0
+  // Start message handler task on Core 0 (UDP + HTTP)
   xTaskCreatePinnedToCore(
     loop2,              // Task function
-    "UDP_Receiver",     // Task name
+    "MSG_Handler",      // Task name
     8192,               // Stack size (8KB for JSON parsing)
     NULL,               // Parameters
     2,                  // Priority (2 = higher than default)
@@ -1316,7 +1524,7 @@ void loop()
   checkBleConnection();
   checkDisplayTimeout();
   checkWifiConnection();
-  // checkUdpMessages();  // Now handled by loop2 on Core 0
+  // checkMessages();  // Now handled by loop2 on Core 0
   
   uint32_t currentTime = millis();
   
