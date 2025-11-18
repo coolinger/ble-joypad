@@ -108,11 +108,16 @@ bool blinkScreen = false;
 int blinkCount = 0;
 uint32_t lastBlinkTime = 0;
 
-// UDP
-WiFiUDP udp;
+// UDP - Separate sockets for receiving (Core 0) and sending (Core 1)
+WiFiUDP udpReceiver;  // Core 0 - receives messages on UDP_PORT
+WiFiUDP udpSender;    // Core 1 - sends SUMMARY requests
 char* udpBuffer = nullptr;
 const int UDP_BUFFER_SIZE = 2048;
 int lastEventId = -1;  // Track last event ID for deduplication
+
+// Task handle for Core 0
+TaskHandle_t udpTaskHandle = NULL;
+SemaphoreHandle_t lvglMutex = NULL;
 
 // List of journal events to ignore - Store in Flash to save DRAM
 const char ignoreEvent_Music[] PROGMEM = "Music";
@@ -122,7 +127,6 @@ const char ignoreEvent_LoadGame[] PROGMEM = "LoadGame";
 const char ignoreEvent_Loadout[] PROGMEM = "Loadout";
 const char ignoreEvent_Materials[] PROGMEM = "Materials";
 const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
-const char ignoreEvent_Cargo[] PROGMEM = "Cargo";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
 const char ignoreEvent_Missions[] PROGMEM = "Missions";
 
@@ -134,11 +138,18 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Loadout,
   ignoreEvent_Materials,
   ignoreEvent_MaterialCollected,
-  ignoreEvent_Cargo,
   ignoreEvent_ShipLocker,
   ignoreEvent_Missions
 };
 const int ignoreJournalEventsCount = sizeof(ignoreJournalEvents) / sizeof(ignoreJournalEvents[0]);
+
+// List of journal events to hide from display but still process
+const char hideEvent_Cargo[] PROGMEM = "Cargo";
+
+const char* const hideJournalEvents[] PROGMEM = {
+  hideEvent_Cargo
+};
+const int hideJournalEventsCount = sizeof(hideJournalEvents) / sizeof(hideJournalEvents[0]);
 
 // Fighter commands - Store in Flash
 const FighterCommand PROGMEM commands[8] = {
@@ -160,7 +171,8 @@ lv_obj_t *cargo_bar;
 lv_obj_t *header_label;
 lv_obj_t *fuel_bar;
 lv_obj_t *hull_bar;
-int currentPage = 0;  // 0 = fighter, 1 = logviewer
+lv_obj_t *wifi_icon;
+int currentPage = 1;  // 0 = fighter, 1 = logviewer (start on page 2)
 
 // Display power management
 bool displayOn = true;
@@ -170,6 +182,18 @@ uint32_t bleDisconnectedTime = 0;
 const uint32_t DISPLAY_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 const uint32_t LED_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 bool ledOn = true;
+
+// WiFi reconnection management
+uint32_t lastWifiCheck = 0;
+const uint32_t WIFI_CHECK_INTERVAL = 10000; // Check every 10 seconds
+bool wifiWasConnected = false;
+uint32_t lastWifiStatusPrint = 0;
+const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
+
+// Summary request management
+bool summaryReceived = false;
+uint32_t lastSummaryRequest = 0;
+const uint32_t SUMMARY_REQUEST_INTERVAL = 10000; // Request every 10 seconds until first received
 
 static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
@@ -328,7 +352,8 @@ void create_fighter_ui()
 void updateCargoBar() {
   if (!cargo_bar) return;
   
-  int total = cargoInfo.totalCapacity;
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    int total = cargoInfo.totalCapacity;
   int used = cargoInfo.usedSpace;
   int drones = cargoInfo.dronesCount;
   int cargo = cargoInfo.cargoCount;
@@ -344,12 +369,16 @@ void updateCargoBar() {
     snprintf(buf, sizeof(buf), "Cargo: %d/%d (Drones: %d)", used, total, drones);
     lv_label_set_text(label, buf);
   }
+    
+    xSemaphoreGive(lvglMutex);
+  }
 }
 
 void updateHeader() {
   if (!header_label) return;
   
-  char buf[64];
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    char buf[64];
   snprintf(buf, sizeof(buf), "Jumps: %d", navRouteInfo.jumpsRemaining);
   lv_label_set_text(header_label, buf);
   
@@ -364,6 +393,27 @@ void updateHeader() {
   if (hull_bar) {
     lv_bar_set_value(hull_bar, (int)(hullInfo.hullHealth * 100.0f), LV_ANIM_OFF);
   }
+  
+  // Update WiFi icon color based on signal quality
+  if (wifi_icon) {
+    if (WiFi.status() == WL_CONNECTED) {
+      int rssi = WiFi.RSSI();
+      if (rssi > -50) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x006400), 0);  // darkgreen - Excellent
+      } else if (rssi > -60) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x9ACD32), 0);  // yellowgreen - Good
+      } else if (rssi > -70) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFFA500), 0);  // orange - Fair
+      } else {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF0000), 0);  // red - Weak
+      }
+    } else {
+      lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
+    }
+  }
+    
+    xSemaphoreGive(lvglMutex);
+  }
 }
 
 static char* logText = nullptr;  // Allocated on heap
@@ -371,7 +421,9 @@ static char* logText = nullptr;  // Allocated on heap
 void updateLogDisplay() {
   if (!log_label) return;
   
-  logText[0] = 0;
+  // Take mutex before accessing LVGL objects
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    logText[0] = 0;
   
   // Only show as many entries as we actually have
   int entriesToShow = (eventLogCount < 8) ? eventLogCount : 8;
@@ -399,7 +451,12 @@ void updateLogDisplay() {
       strcat(logText, "\n");
     }
   }
-  lv_label_set_text(log_label, logText);
+    lv_label_set_text(log_label, logText);
+    
+    xSemaphoreGive(lvglMutex);
+  } else {
+    Serial.println("[LOG] Failed to take mutex, skipping display update");
+  }
 }
 
 void addLogEntry(const char* text) {
@@ -421,31 +478,33 @@ void create_logviewer_ui() {
   logviewer_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(logviewer_screen, lv_color_hex(0x000000), 0);
   
-  // Header with jumps, fuel, hull
+  // Header with jumps, fuel, hull (reduced height to 22px to fit bars)
   lv_obj_t* header = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(header, SCREEN_WIDTH, 40);
+  lv_obj_set_size(header, SCREEN_WIDTH, 22);
   lv_obj_set_pos(header, 0, 0);
   lv_obj_set_style_bg_color(header, lv_color_hex(0x1a1a1a), 0);
   lv_obj_set_style_border_width(header, 0, 0);
   lv_obj_set_style_radius(header, 0, 0);
   lv_obj_set_style_pad_all(header, 2, 0);
+  lv_obj_set_scrollbar_mode(header, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scroll_dir(header, LV_DIR_NONE);
   
   // Jumps label
   header_label = lv_label_create(header);
   lv_label_set_text(header_label, "Jumps: 0");
   lv_obj_set_style_text_color(header_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_pos(header_label, 5, 2);
+  lv_obj_set_pos(header_label, 5, 3);
   
   // Fuel label
   lv_obj_t* fuel_label = lv_label_create(header);
   lv_label_set_text(fuel_label, "F");
   lv_obj_set_style_text_color(fuel_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_pos(fuel_label, 100, 2);
+  lv_obj_set_pos(fuel_label, 100, 3);
   
-  // Fuel bar
+  // Fuel bar (reduced size)
   fuel_bar = lv_bar_create(header);
-  lv_obj_set_size(fuel_bar, 70, 15);
-  lv_obj_set_pos(fuel_bar, 115, 2);
+  lv_obj_set_size(fuel_bar, 55, 15);
+  lv_obj_set_pos(fuel_bar, 115, 3);
   lv_bar_set_range(fuel_bar, 0, 100);
   lv_bar_set_value(fuel_bar, 100, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(fuel_bar, lv_color_hex(0x333333), LV_PART_MAIN);
@@ -456,22 +515,28 @@ void create_logviewer_ui() {
   lv_obj_t* hull_label = lv_label_create(header);
   lv_label_set_text(hull_label, "H");
   lv_obj_set_style_text_color(hull_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_pos(hull_label, 195, 2);
+  lv_obj_set_pos(hull_label, 180, 3);
   
-  // Hull bar
+  // Hull bar (reduced size)
   hull_bar = lv_bar_create(header);
-  lv_obj_set_size(hull_bar, 70, 15);
-  lv_obj_set_pos(hull_bar, 210, 2);
+  lv_obj_set_size(hull_bar, 55, 15);
+  lv_obj_set_pos(hull_bar, 195, 3);
   lv_bar_set_range(hull_bar, 0, 100);
   lv_bar_set_value(hull_bar, 100, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(hull_bar, lv_color_hex(0x333333), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(hull_bar, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(hull_bar, lv_color_hex(0x00ff00), LV_PART_INDICATOR);
   
-  // Log area
+  // WiFi icon (top right corner, centered vertically)
+  wifi_icon = lv_label_create(header);
+  lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // Start with black (no connection)
+  lv_obj_set_pos(wifi_icon, 285, 2);
+  
+  // Log area (adjusted for smaller header)
   lv_obj_t* log_area = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 80);
-  lv_obj_set_pos(log_area, 0, 40);
+  lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 62);
+  lv_obj_set_pos(log_area, 0, 22);
   lv_obj_set_style_bg_color(log_area, lv_color_hex(0x000000), 0);
   lv_obj_set_style_border_width(log_area, 0, 0);
   lv_obj_set_style_radius(log_area, 0, 0);
@@ -500,8 +565,9 @@ void create_logviewer_ui() {
 }
 
 void switchToPage(int page) {
-  if (page == 0) {
-    lv_scr_load(fighter_screen);
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (page == 0) {
+      lv_scr_load(fighter_screen);
     currentPage = 0;
   } else if (page == 1) {
     if (!logviewer_screen) {
@@ -510,8 +576,11 @@ void switchToPage(int page) {
     lv_scr_load(logviewer_screen);
     currentPage = 1;
     // Don't call updateLogDisplay here - it will update when events arrive
-    updateCargoBar();
-    updateHeader();
+      updateCargoBar();
+      updateHeader();
+    }
+    
+    xSemaphoreGive(lvglMutex);
   }
   // Reset timeout and turn on display on page switch
   lastTouchTime = millis();
@@ -625,6 +694,8 @@ void init_display()
   lv_indev_set_read_cb(indev, touch_read);
 
   create_fighter_ui();
+  create_logviewer_ui();
+  lv_scr_load(logviewer_screen);  // Start on page 2 (logviewer)
 }
 
 void checkBleConnection()
@@ -664,19 +735,59 @@ void checkBleConnection()
   }
 }
 
+// Forward declaration
+void requestSummary();
+
 void checkDisplayTimeout()
 {
   uint32_t currentTime = millis();
   
-  // Turn off display if no BLE connection
-  if (!bleConnected && displayOn) {
+  // Turn off display after timeout regardless of BLE connection
+  if (displayOn && (currentTime - lastTouchTime) > DISPLAY_TIMEOUT) {
     setDisplayPower(false);
+  }
+}
+
+void checkWifiConnection() {
+  uint32_t currentTime = millis();
+  
+  // Check WiFi status every 10 seconds
+  if (currentTime - lastWifiCheck < WIFI_CHECK_INTERVAL) {
     return;
   }
   
-  // Turn off display after 30 minutes of no touch (only if BLE is connected)
-  if (bleConnected && displayOn && (currentTime - lastTouchTime) > DISPLAY_TIMEOUT) {
-    setDisplayPower(false);
+  lastWifiCheck = currentTime;
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      Serial.println("[WiFi] Connected!");
+      Serial.print("[WiFi] IP: ");
+      Serial.println(WiFi.localIP());
+      beepConnect();
+      wifiWasConnected = true;
+      
+      // Restart UDP receiver if it wasn't running
+      udpReceiver.stop();
+      if (udpReceiver.begin(UDP_PORT)) {
+        Serial.print("[WiFi] UDP receiver listening on port: ");
+        Serial.println(UDP_PORT);
+      }
+      
+      // Request summary after UDP is ready
+      delay(500);
+      requestSummary();
+    }
+  } else {
+    if (wifiWasConnected) {
+      Serial.println("[WiFi] Connection lost, attempting reconnect...");
+      wifiWasConnected = false;
+    }
+    
+    // Attempt non-blocking reconnect
+    if (WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_CONNECTION_LOST) {
+      Serial.println("[WiFi] Reconnecting...");
+      WiFi.reconnect();
+    }
   }
 }
 
@@ -698,7 +809,93 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
   static char logBuf[80];
   static char tempBuf[60];
   
-  if (eventType == "JOURNAL") {
+  if (eventType == "SUMMARY") {
+    // Parse comprehensive summary data
+    Serial.println("[SUMMARY] Received state update");
+    summaryReceived = true;  // Mark that we've received first summary
+    
+    // Update fuel (now has percent, current, and capacity)
+    if (!doc["fuel"].isNull()) {
+      if (doc["fuel"]["current"].is<float>()) {
+        fuelInfo.fuelMain = doc["fuel"]["current"];
+      }
+      if (doc["fuel"]["capacity"].is<float>()) {
+        fuelInfo.fuelCapacity = doc["fuel"]["capacity"];
+      }
+    }
+    
+    // Update cargo
+    if (!doc["cargo"].isNull()) {
+      cargoInfo.totalCapacity = doc["cargo"]["capacity"];
+      cargoInfo.usedSpace = doc["cargo"]["count"].as<int>();
+      cargoInfo.dronesCount = doc["cargo"]["drones"].as<int>();
+      // Calculate cargo without drones
+      cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
+    }
+    
+    // Update hull
+    if (!doc["hull"].isNull()) {
+      hullInfo.hullHealth = doc["hull"].as<float>() / 100.0f;
+    }
+    
+    // Update shields
+    if (!doc["shields"].isNull()) {
+      // shields is a percentage (0-100)
+      float shieldsPercent = doc["shields"].as<float>();
+      Serial.printf("[SHIELDS] %.1f%%\n", shieldsPercent);
+    }
+    
+    // Update route jumps (now a single integer, not an object)
+    if (!doc["route"].isNull()) {
+      navRouteInfo.jumpsRemaining = doc["route"].as<int>();
+    }
+    
+    // Update balance
+    if (!doc["balance"].is<nullptr_t>()) {
+      long balance = doc["balance"];
+      Serial.printf("[BALANCE] Credits: %ld\n", balance);
+    }
+    
+    // Update legal state
+    if (doc["legal_state"].is<const char*>()) {
+      const char* legalState = doc["legal_state"];
+      Serial.printf("[LEGAL] State: %s\n", legalState);
+    }
+    
+    // Update location
+    if (!doc["location"].isNull()) {
+      const char* system = doc["location"]["system"];
+      const char* station = doc["location"]["station"];
+      if (system) {
+        Serial.printf("[LOCATION] System: %s", system);
+        if (station) {
+          Serial.printf(", Station: %s\n", station);
+        } else {
+          Serial.println();
+        }
+      }
+    }
+    
+    // Update destination
+    if (!doc["destination"].isNull() && !doc["destination"].is<nullptr_t>()) {
+      const char* destName = doc["destination"]["Name"];
+      if (destName) {
+        Serial.printf("[DESTINATION] %s\n", destName);
+      }
+    }
+    
+    // Update all displays
+    updateHeader();
+    updateCargoBar();
+    
+    Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
+      fuelInfo.fuelMain, fuelInfo.fuelCapacity,
+      (fuelInfo.fuelCapacity > 0) ? (fuelInfo.fuelMain / fuelInfo.fuelCapacity * 100.0f) : 0.0f,
+      cargoInfo.usedSpace, cargoInfo.totalCapacity,
+      cargoInfo.dronesCount,
+      hullInfo.hullHealth * 100.0f,
+      navRouteInfo.jumpsRemaining);
+  } else if (eventType == "JOURNAL") {
     String event = doc["event"].as<String>();
     
     // Check if event should be ignored (read from PROGMEM)
@@ -712,7 +909,46 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
     }
     
-    if (event == "ProspectedAsteroid") {
+    // Check if event should be hidden from display but still processed
+    bool hideFromDisplay = false;
+    for (int i = 0; i < hideJournalEventsCount; i++) {
+      strcpy_P(ignoreBuf, (char*)pgm_read_ptr(&hideJournalEvents[i]));
+      if (event == ignoreBuf) {
+        hideFromDisplay = true;
+        Serial.print("[JOURNAL] Hidden event (processing): ");
+        Serial.println(event);
+        break;
+      }
+    }
+    
+    if (event == "CommunityGoal") {
+      // Show player's percentile band for community goals
+      if (!doc["CurrentGoals"].isNull()) {
+        JsonArray goals = doc["CurrentGoals"];
+        for (JsonObject goal : goals) {
+          if (!goal["PlayerPercentileBand"].isNull()) {
+            int percentile = goal["PlayerPercentileBand"];
+            snprintf(logBuf, sizeof(logBuf), "CommunityGoal: Top %d%%", percentile);
+            addLogEntry(logBuf);
+            Serial.printf("[CG] Player percentile: Top %d%%\n", percentile);
+          }
+        }
+      }
+    } else if (event == "FSDTarget") {
+      // Update remaining jumps from FSD target
+      if (!doc["RemainingJumpsInRoute"].isNull()) {
+        navRouteInfo.jumpsRemaining = doc["RemainingJumpsInRoute"];
+        updateHeader();
+        Serial.printf("[NAV] Jumps remaining: %d\n", navRouteInfo.jumpsRemaining);
+      }
+    } else if (event == "HullDamage") {
+      // Update hull health from damage event
+      if (!doc["Health"].isNull()) {
+        hullInfo.hullHealth = doc["Health"];
+        updateHeader();
+        Serial.printf("[HULL] Health: %.1f%%\n", hullInfo.hullHealth * 100.0f);
+      }
+    } else if (event == "ProspectedAsteroid") {
       // Check for motherlode material
       if (doc["MotherlodeMaterial"].is<const char*>()) {
         const char* material = doc["MotherlodeMaterial"];
@@ -767,19 +1003,50 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
     } else {
-      // Generic journal event
-      addLogEntry(event.c_str());
+      // Generic journal event - only add to display if not hidden
+      if (!hideFromDisplay) {
+        addLogEntry(event.c_str());
+      }
     }
   } else if (eventType == "STATUS") {
-    // Update fuel
+    // Update fuel from STATUS (has FuelMain and FuelReservoir)
     if (!doc["Fuel"].isNull()) {
-      fuelInfo.fuelMain = doc["Fuel"]["FuelMain"];
+      if (doc["Fuel"]["FuelMain"].is<float>()) {
+        fuelInfo.fuelMain = doc["Fuel"]["FuelMain"];
+      }
+      // Note: FuelReservoir is the small reserve tank, we track main tank
     }
-    // Update cargo count
+    
+    // Update cargo count from STATUS event (it's an absolute count)
     if (!doc["Cargo"].isNull()) {
-      cargoInfo.usedSpace = doc["Cargo"];
+      cargoInfo.usedSpace = doc["Cargo"].as<int>();
+      Serial.printf("[CARGO] Updated from STATUS: %d/%d (%.1f%%)\n", 
+        cargoInfo.usedSpace, cargoInfo.totalCapacity,
+        (float)cargoInfo.usedSpace / cargoInfo.totalCapacity * 100.0f);
     }
+    
+    // Update balance
+    if (!doc["Balance"].is<nullptr_t>()) {
+      long balance = doc["Balance"];
+      // Balance updated, but not displayed currently
+    }
+    
+    // Update legal state
+    if (doc["LegalState"].is<const char*>()) {
+      const char* legalState = doc["LegalState"];
+      // Legal state updated (e.g., "Clean", "Wanted", "Speeding")
+    }
+    
+    // Update destination from STATUS (same format as SUMMARY)
+    if (!doc["Destination"].isNull() && !doc["Destination"].is<nullptr_t>()) {
+      const char* destName = doc["Destination"]["Name"];
+      if (destName) {
+        Serial.printf("[STATUS] Destination: %s\n", destName);
+      }
+    }
+    
     updateHeader();
+    updateCargoBar();
   } else if (eventType == "CARGO") {
     // Parse cargo inventory
     cargoInfo.usedSpace = doc["Count"];
@@ -808,21 +1075,45 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       navRouteInfo.jumpsRemaining = route.size();
     }
     updateHeader();
+  } else {
+    Serial.print("[UDP] Unhandled event type: ");
+    Serial.println(eventType);
   }
 }
 
 void checkUdpMessages() {
-  int packetSize = udp.parsePacket();
+  int packetSize = udpReceiver.parsePacket();
   
-  if (packetSize > 0 && packetSize < UDP_BUFFER_SIZE) {
-    int len = udp.read(udpBuffer, UDP_BUFFER_SIZE - 1);
+  if (packetSize > 0) {
+    Serial.printf("[UDP] Detected packet: %d bytes\n", packetSize);
+    
+    if (packetSize >= UDP_BUFFER_SIZE) {
+      Serial.printf("[UDP] ERROR: Packet too large (%d bytes), buffer is %d bytes - DISCARDING\n", 
+        packetSize, UDP_BUFFER_SIZE);
+      udpReceiver.flush();  // Clear the buffer
+      return;
+    }
+    
+    int len = udpReceiver.read(udpBuffer, UDP_BUFFER_SIZE - 1);
     if (len > 0) {
       udpBuffer[len] = 0;
       
-      Serial.print("[UDP] Received ");
+      Serial.print("[UDP Core ");
+      Serial.print(xPortGetCoreID());
+      Serial.print("] Received ");
       Serial.print(len);
       Serial.print(" bytes: ");
-      Serial.println(udpBuffer);
+      
+      // For large packets, only print first 100 chars
+      if (len > 100) {
+        char preview[101];
+        strncpy(preview, udpBuffer, 100);
+        preview[100] = 0;
+        Serial.print(preview);
+        Serial.println("... (truncated)");
+      } else {
+        Serial.println(udpBuffer);
+      }
       
       // Reset timeout and turn on display on message received
       lastTouchTime = millis();
@@ -846,15 +1137,12 @@ void checkUdpMessages() {
           
           // Deduplicate: skip if we've already seen this ID
           if (eventId == lastEventId) {
-            Serial.print("[UDP] Duplicate ID ");
-            Serial.print(eventId);
-            Serial.println(" - skipping");
+            Serial.printf("[UDP] Duplicate %s ID %d - skipping\n", eventType.c_str(), eventId);
             return;
           }
           
           lastEventId = eventId;
-          Serial.print("[UDP] New event ID: ");
-          Serial.println(eventId);
+          Serial.printf("[UDP] Processing %s event ID: %d\n", eventType.c_str(), eventId);
           
           // Parse JSON with reduced buffer
           JsonDocument doc;
@@ -866,9 +1154,41 @@ void checkUdpMessages() {
             Serial.print("JSON Parse Error: ");
             Serial.println(error.c_str());
           }
+        } else {
+          Serial.println("[UDP] ERROR: No second separator found");
         }
+      } else {
+        Serial.println("[UDP] ERROR: No first separator found");
       }
     }
+  }
+}
+
+// UDP task running on Core 0 for non-blocking message reception
+void loop2(void* parameter) {
+  Serial.print("[UDP] Task started on core: ");
+  Serial.println(xPortGetCoreID());
+  
+  while (1) {
+    checkUdpMessages();  // Check for UDP packets
+    vTaskDelay(pdMS_TO_TICKS(1));  // 1ms polling - faster for large packets
+  }
+}
+
+void requestSummary() {
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress broadcastIP = WiFi.localIP();
+    broadcastIP[3] = 255;  // Change last octet to 255 for broadcast
+    
+    Serial.println("[SUMMARY] Requesting summary data...");
+    
+    // Send to broadcast address using sender socket
+    udpSender.beginPacket(broadcastIP, UDP_PORT + 1);
+    udpSender.write((const uint8_t*)"SUMMARY", 7);
+    udpSender.endPacket();
+    
+    Serial.printf("[SUMMARY] Sent request to %s:%d\n", 
+      broadcastIP.toString().c_str(), UDP_PORT + 1);
   }
 }
 
@@ -896,15 +1216,23 @@ void WifiConnect()
     Serial.println("\nWiFi connected!");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    wifiWasConnected = true;
     beepConnect();  // Rising tone for WiFi connection
     
-    // Start UDP listener
-    if (udp.begin(UDP_PORT)) {
-      Serial.print("UDP listening on port: ");
+    // Start UDP receiver (Core 0 will use this)
+    if (udpReceiver.begin(UDP_PORT)) {
+      Serial.print("UDP receiver listening on port: ");
       Serial.println(UDP_PORT);
     } else {
-      Serial.println("ERROR: Failed to start UDP listener!");
+      Serial.println("ERROR: Failed to start UDP receiver!");
     }
+    
+    // Initialize UDP sender (Core 1 will use this)
+    Serial.println("UDP sender initialized for outgoing packets");
+    
+    // Request initial summary data
+    delay(500);  // Give UDP stack time to initialize
+    requestSummary();
   } else {
     Serial.println("\nWiFi connection failed, continuing without WiFi");
   }
@@ -948,6 +1276,27 @@ void setup()
 
   bleGamepad.begin(&bleGamepadConfig);
   init_display();
+  
+  // Create mutex for LVGL thread safety
+  lvglMutex = xSemaphoreCreateMutex();
+  if (!lvglMutex) {
+    Serial.println("[ERROR] Failed to create LVGL mutex!");
+    while(1);
+  }
+  
+  // Start UDP receiver task on Core 0
+  xTaskCreatePinnedToCore(
+    loop2,              // Task function
+    "UDP_Receiver",     // Task name
+    8192,               // Stack size (8KB for JSON parsing)
+    NULL,               // Parameters
+    2,                  // Priority (2 = higher than default)
+    &udpTaskHandle,     // Task handle
+    0                   // Core 0 (PRO_CPU)
+  );
+  
+  Serial.print("[MAIN] Loop running on core: ");
+  Serial.println(xPortGetCoreID());
   Serial.println("BLE Joypad with Fighter Commands ready!");
 }
 
@@ -959,10 +1308,44 @@ void loop()
   //lv_tick_inc(currentTime - lastTick);
   //lastTick = currentTime;
   
-  lv_timer_handler();
+  // Protect LVGL rendering with mutex
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    lv_timer_handler();
+    xSemaphoreGive(lvglMutex);
+  }
   checkBleConnection();
   checkDisplayTimeout();
-  checkUdpMessages();
+  checkWifiConnection();
+  // checkUdpMessages();  // Now handled by loop2 on Core 0
+  
+  uint32_t currentTime = millis();
+  
+  // Request SUMMARY every 10 seconds until first one is received
+  if (!summaryReceived && WiFi.status() == WL_CONNECTED && 
+      (currentTime - lastSummaryRequest) > SUMMARY_REQUEST_INTERVAL) {
+    requestSummary();
+    lastSummaryRequest = currentTime;
+  }
+  
+  // Print WiFi signal quality every 30 seconds
+  if (WiFi.status() == WL_CONNECTED && (currentTime - lastWifiStatusPrint) > WIFI_STATUS_PRINT_INTERVAL) {
+    int rssi = WiFi.RSSI();
+    Serial.printf("[WIFI STATUS] Signal: %d dBm", rssi);
+    updateHeader();  // Update WiFi icon color
+    
+    // Add quality interpretation
+    if (rssi > -50) {
+      Serial.println(" (Excellent)");
+    } else if (rssi > -60) {
+      Serial.println(" (Good)");
+    } else if (rssi > -70) {
+      Serial.println(" (Fair)");
+    } else {
+      Serial.println(" (Weak)");
+    }
+    
+    lastWifiStatusPrint = currentTime;
+  }
   
   // Handle screen blinking for motherlode detection
   if (blinkScreen && blinkCount > 0) {
@@ -985,41 +1368,42 @@ void loop()
     }
   }
   
+  // Read PCF8575 state
+  uint16_t pcfState = pcf.read16();
+  bool anyPressed = false;
+  
+  // Check SILVER buttons for page switching (first 3 buttons) - always available
+  static bool silverLeftWasPressed = false;
+  static bool silverMidWasPressed = false;
+  static bool silverRightWasPressed = false;
+  
+  bool silverLeftPressed = !(pcfState & (1 << SILVER_LEFT));
+  bool silverMidPressed = !(pcfState & (1 << SILVER_MID));
+  bool silverRightPressed = !(pcfState & (1 << SILVER_RIGHT));
+  
+  // Handle SILVER_LEFT - switch to page 0 (Fighter)
+  if (silverLeftPressed && !silverLeftWasPressed) {
+    switchToPage(0);
+    Serial.println("Page: Fighter (0)");
+  }
+  silverLeftWasPressed = silverLeftPressed;
+  
+  // Handle SILVER_MID - switch to page 1 (Log Viewer)
+  if (silverMidPressed && !silverMidWasPressed) {
+    switchToPage(1);
+    Serial.println("Page: Log Viewer (1)");
+  }
+  silverMidWasPressed = silverMidPressed;
+  
+  // Handle SILVER_RIGHT - reserved for page 2 (future)
+  if (silverRightPressed && !silverRightWasPressed) {
+    // Reserved for third page
+    Serial.println("Page: Reserved (2)");
+  }
+  silverRightWasPressed = silverRightPressed;
+  
+  // Handle remaining buttons (indices 3-11) for gamepad - only when BLE connected
   if (bleConnected) {
-    uint16_t pcfState = pcf.read16();
-    bool anyPressed = false;
-    
-    // Check SILVER buttons for page switching (first 3 buttons)
-    static bool silverLeftWasPressed = false;
-    static bool silverMidWasPressed = false;
-    static bool silverRightWasPressed = false;
-    
-    bool silverLeftPressed = !(pcfState & (1 << SILVER_LEFT));
-    bool silverMidPressed = !(pcfState & (1 << SILVER_MID));
-    bool silverRightPressed = !(pcfState & (1 << SILVER_RIGHT));
-    
-    // Handle SILVER_LEFT - switch to page 0 (Fighter)
-    if (silverLeftPressed && !silverLeftWasPressed) {
-      switchToPage(0);
-      Serial.println("Page: Fighter (0)");
-    }
-    silverLeftWasPressed = silverLeftPressed;
-    
-    // Handle SILVER_MID - switch to page 1 (Log Viewer)
-    if (silverMidPressed && !silverMidWasPressed) {
-      switchToPage(1);
-      Serial.println("Page: Log Viewer (1)");
-    }
-    silverMidWasPressed = silverMidPressed;
-    
-    // Handle SILVER_RIGHT - reserved for page 2 (future)
-    if (silverRightPressed && !silverRightWasPressed) {
-      // Reserved for third page
-      Serial.println("Page: Reserved (2)");
-    }
-    silverRightWasPressed = silverRightPressed;
-    
-    // Handle remaining buttons (indices 3-11) for gamepad
     for (uint8_t i = 3; i < 12; i++) {
       bool pressed = !(pcfState & (1 << buttonPins[i]));
       bool lastPressed = (lastButtonState & (1 << i)) != 0;
