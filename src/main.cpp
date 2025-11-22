@@ -6,8 +6,11 @@
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ArduinoWebsockets.h>
+#include <esp_heap_caps.h>
+
+using namespace websockets;
 
 
 #define PCF8575_ADDR 0x20
@@ -102,7 +105,7 @@ CargoInfo cargoInfo;
 FuelInfo fuelInfo;
 HullInfo hullInfo;
 NavRouteInfo navRouteInfo;
-EventLogEntry eventLog[9];  // Show last 9 events
+EventLogEntry eventLog[9] = {};  // Show last 9 events, initialized to zero
 int eventLogIndex = 0;
 int eventLogCount = 0;  // Track how many events we actually have
 char motherlodeMaterial[32] = "";
@@ -117,12 +120,12 @@ char* udpBuffer = nullptr;
 const int UDP_BUFFER_SIZE = 2048;
 int lastEventId = -1;  // Track last event ID for deduplication
 
-// TCP/HTTP variables for Elite Dangerous data polling
+// WebSocket variables for Elite Dangerous data
 String serverIP = "";
-int httpPort = 0;
+int websocketPort = 0;
 int udpControlPort = 0;
-bool useTCP = false;
-int lastHttpEntryId = 0;  // Track last entry ID from HTTP responses
+bool useWebSocket = false;
+WebsocketsClient wsClient;
 
 // Task handle for Core 0
 TaskHandle_t udpTaskHandle = NULL;
@@ -181,6 +184,8 @@ lv_obj_t *header_label;
 lv_obj_t *fuel_bar;
 lv_obj_t *hull_bar;
 lv_obj_t *wifi_icon;
+lv_obj_t *websocket_icon;
+lv_obj_t *bluetooth_icon;
 int currentPage = 1;  // 0 = fighter, 1 = logviewer (start on page 2)
 
 // Display power management
@@ -198,6 +203,10 @@ const uint32_t WIFI_CHECK_INTERVAL = 10000; // Check every 10 seconds
 bool wifiWasConnected = false;
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
+
+// Heap monitoring
+uint32_t lastHeapPrint = 0;
+const uint32_t HEAP_PRINT_INTERVAL = 10000; // Print every 10 seconds
 
 // Summary request management
 bool summaryReceived = false;
@@ -358,6 +367,21 @@ void create_fighter_ui()
   lv_obj_add_event_cb(btnmatrix, btnmatrix_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
+// Helper function to print heap status
+void printHeapStatus(const char* location) {
+
+  //disable it for now, but leave the code here for future debugging
+  return;
+
+
+  size_t freeHeap = esp_get_free_heap_size();
+  size_t minFreeHeap = esp_get_minimum_free_heap_size();
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  
+  Serial.printf("[HEAP %s] Free: %d bytes, Min: %d bytes, Largest block: %d bytes\n",
+    location, freeHeap, minFreeHeap, largestBlock);
+}
+
 void updateCargoBar() {
   if (!cargo_bar) return;
   
@@ -420,55 +444,119 @@ void updateHeader() {
       lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
     }
   }
+  
+  // Update WebSocket icon
+  if (websocket_icon) {
+    if (useWebSocket && wsClient.available()) {
+      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
+    } else {
+      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // black - not connected
+    }
+  }
+  
+  // Update Bluetooth icon
+  if (bluetooth_icon) {
+    if (bleGamepad.isConnected()) {
+      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
+    } else {
+      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
+    }
+  }
     
     xSemaphoreGive(lvglMutex);
   }
 }
 
 static char* logText = nullptr;  // Allocated on heap
+static const int LOG_TEXT_SIZE = 600;  // Increased buffer size for 9 entries
 
 void updateLogDisplay() {
-  if (!log_label) return;
+  if (!log_label || !logText) return;  // Check logText is allocated
+  
+  // Print heap status before display update
+  static int updateCount = 0;
+  if (updateCount++ % 10 == 0) {  // Every 10th update
+    printHeapStatus("before display");
+  }
   
   // Take mutex before accessing LVGL objects
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    logText[0] = 0;
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    // Clear buffer safely
+    memset(logText, 0, LOG_TEXT_SIZE);
+    int currentLen = 0;
   
-  // Only show as many entries as we actually have
-  int entriesToShow = (eventLogCount < 9) ? eventLogCount : 9;
-  
-  Serial.print("[LOG] Updating display: showing ");
-  Serial.print(entriesToShow);
-  Serial.print(" entries (count=");
-  Serial.print(eventLogCount);
-  Serial.print(", index=");
-  Serial.print(eventLogIndex);
-  Serial.println(")");
-  
-  for (int i = 0; i < entriesToShow; i++) {
-    // Calculate index going backwards from most recent
-    int idx = (eventLogIndex - 1 - i + 9) % 9;
-    Serial.print("  [");
-    Serial.print(i);
-    Serial.print("] idx=");
-    Serial.print(idx);
-    Serial.print(": ");
-    Serial.println(eventLog[idx].text);
+    // Only show as many entries as we actually have
+    int entriesToShow = (eventLogCount < 9) ? eventLogCount : 9;
     
-    if (eventLog[idx].text[0] != 0) {
+    Serial.printf("[LOG] Updating display: showing %d entries (count=%d, index=%d)\n",
+      entriesToShow, eventLogCount, eventLogIndex);
+    
+    for (int i = 0; i < entriesToShow; i++) {
+      // Calculate index going backwards from most recent
+      int idx = (eventLogIndex - 1 - i + 9) % 9;
+      
+      // Validate entry has text
+      if (eventLog[idx].text[0] == 0) {
+        Serial.printf("  [%d] idx=%d: <empty>\n", i, idx);
+        continue;
+      }
+      
+      Serial.printf("  [%d] idx=%d: %s\n", i, idx, eventLog[idx].text);
+      
+      // Calculate space needed for this entry
+      int textLen = strnlen(eventLog[idx].text, sizeof(eventLog[idx].text));
+      int countPrefixLen = 0;
+      if (eventLog[idx].count > 1) {
+        countPrefixLen = snprintf(nullptr, 0, "%dx ", eventLog[idx].count);
+      }
+      int totalNeeded = countPrefixLen + textLen + 2;  // +2 for \n and \0
+      
+      // Check if we have enough space
+      int remainingSpace = LOG_TEXT_SIZE - currentLen;
+      if (totalNeeded > remainingSpace) {
+        Serial.printf("[LOG] Buffer full, stopping at entry %d (needed %d, have %d)\n",
+          i, totalNeeded, remainingSpace);
+        break;
+      }
+      
       // Add count prefix if entry was repeated
       if (eventLog[idx].count > 1) {
-        char countPrefix[10];
-        snprintf(countPrefix, sizeof(countPrefix), "%dx ", eventLog[idx].count);
-        strcat(logText, countPrefix);
+        int written = snprintf(logText + currentLen, remainingSpace, "%dx ", eventLog[idx].count);
+        if (written > 0 && written < remainingSpace) {
+          currentLen += written;
+          remainingSpace -= written;
+        } else {
+          Serial.println("[LOG] ERROR: Count prefix write failed");
+          break;
+        }
       }
-      strcat(logText, eventLog[idx].text);
-      strcat(logText, "\n");
+      
+      // Safely copy text
+      int copyLen = (textLen < remainingSpace - 2) ? textLen : (remainingSpace - 2);
+      if (copyLen > 0) {
+        memcpy(logText + currentLen, eventLog[idx].text, copyLen);
+        currentLen += copyLen;
+        logText[currentLen++] = '\n';
+        logText[currentLen] = '\0';
+      } else {
+        Serial.println("[LOG] ERROR: No space for text copy");
+        break;
+      }
     }
-  }
+    
+    // Ensure null termination
+    logText[LOG_TEXT_SIZE - 1] = '\0';
+    
+    // Update label - this is where LVGL might run out of memory
+    Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
     lv_label_set_text(log_label, logText);
     
     xSemaphoreGive(lvglMutex);
+    
+    // Print heap after display update
+    if (updateCount % 10 == 0) {
+      printHeapStatus("after display");
+    }
   } else {
     Serial.println("[LOG] Failed to take mutex, skipping display update");
   }
@@ -572,11 +660,24 @@ void create_logviewer_ui() {
   lv_obj_set_style_bg_opa(hull_bar, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(hull_bar, lv_color_hex(0x00ff00), LV_PART_INDICATOR);
   
-  // WiFi icon (top right corner, centered vertically)
+  // Status icons (right side of header)
+  // WiFi icon (rightmost)
   wifi_icon = lv_label_create(header);
   lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // Start with black (no connection)
-  lv_obj_set_pos(wifi_icon, 285, 2);
+  lv_obj_set_pos(wifi_icon, 300, 2);
+  
+  // WebSocket icon (middle)
+  websocket_icon = lv_label_create(header);
+  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // Start with black (not connected)
+  lv_obj_set_pos(websocket_icon, 280, 2);
+  
+  // Bluetooth icon (left of websocket)
+  bluetooth_icon = lv_label_create(header);
+  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
+  lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // Start with black (not connected)
+  lv_obj_set_pos(bluetooth_icon, 260, 2);
   
   // Log area (adjusted for smaller header)
   lv_obj_t* log_area = lv_obj_create(logviewer_screen);
@@ -850,34 +951,143 @@ void replaceUmlauts(char* str) {
   str[59] = 0;
 }
 
+// Forward declaration
+void handleEliteEvent(const String& eventType, JsonDocument& doc);
+
+// WebSocket event handlers
+void onWebSocketMessage(WebsocketsMessage message) {
+  // Check message size before processing to avoid out-of-memory on large payloads
+  size_t len = message.length();
+  const size_t MAX_WS_MESSAGE_SIZE = 10240; // 10KB limit
+
+  if (len > MAX_WS_MESSAGE_SIZE) {
+    Serial.printf("[WS] ERROR: Message too large (%d bytes), discarding.\n", len);
+    // We must still read the message to clear the buffer, but we won't process it.
+    // Reading it as a string is the easiest way, even if it temporarily allocates.
+    // The crash happens during JSON parsing, not just allocation of a large string.
+    String temp = message.data(); 
+    return;
+  }
+
+  String data = message.data();
+  
+  printHeapStatus("WS start");
+  Serial.printf("[WS] Received %d bytes\n", data.length());
+  
+  // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, data);
+  
+  if (error) {
+    Serial.printf("[WS] JSON parse error: %s\n", error.c_str());
+    printHeapStatus("WS error");
+    return;
+  }
+  
+  // Extract message fields
+  const char* type = doc["type"];
+  int id = doc["id"] | 0;
+  JsonObject dataObj = doc["data"];
+  
+  if (!type || dataObj.isNull()) {
+    Serial.println("[WS] Invalid message format");
+    doc.clear();
+    return;
+  }
+  
+  String eventType = String(type);
+  Serial.printf("[WS] Processing %s event ID: %d\n", eventType.c_str(), id);
+  
+  // Reset display timeout on message
+  lastTouchTime = millis();
+  if (!displayOn) {
+    setDisplayPower(true);
+  }
+  
+  // Process event - reuse the doc to avoid extra allocations
+  JsonDocument eventDoc;
+  eventDoc.set(dataObj);
+  
+  printHeapStatus("before handler");
+  handleEliteEvent(eventType, eventDoc);
+  printHeapStatus("after handler");
+  
+  // Clear docs to free memory immediately
+  eventDoc.clear();
+  doc.clear();
+  
+  printHeapStatus("WS end");
+}
+
+void onWebSocketEvent(WebsocketsEvent event, String data) {
+  switch(event) {
+    case WebsocketsEvent::ConnectionOpened:
+      Serial.println("[WS] Connected to server");
+      useWebSocket = true;
+      // Request initial summary
+      wsClient.send("{\"command\":\"SUMMARY\"}");
+      break;
+      
+    case WebsocketsEvent::ConnectionClosed:
+      Serial.println("[WS] Disconnected from server");
+      useWebSocket = false;
+      break;
+      
+    case WebsocketsEvent::GotPing:
+      Serial.println("[WS] Got ping");
+      break;
+      
+    case WebsocketsEvent::GotPong:
+      Serial.println("[WS] Got pong");
+      break;
+  }
+}
+
+void connectWebSocket() {
+  if (serverIP.length() > 0 && websocketPort > 0) {
+    String wsUrl = "ws://" + serverIP + ":" + String(websocketPort);
+    
+    Serial.printf("[WS] Connecting to %s\n", wsUrl.c_str());
+    
+    wsClient.onMessage(onWebSocketMessage);
+    wsClient.onEvent(onWebSocketEvent);
+    
+    if (wsClient.connect(wsUrl)) {
+      Serial.println("[WS] Connection initiated");
+    } else {
+      Serial.println("[WS] Connection failed");
+    }
+  }
+}
+
 void handleEliteEvent(const String& eventType, JsonDocument& doc) {
   static char logBuf[80];
   static char tempBuf[60];
   
   if (eventType == "KEEPALIVE") {
-    // Parse KEEPALIVE packet: KEEPALIVE|0|{"ip": "x.x.x.x", "http_port": 12345, "udp_control_port": 12346, "current_message_id": 32}
+    // Parse KEEPALIVE packet: KEEPALIVE|0|{"ip": "x.x.x.x", "websocket_port": 12347, "udp_control_port": 12346, "current_message_id": 1}
     const char* ip = doc["ip"];
-    int http_port = doc["http_port"];
-    int udp_ctrl_port = doc["udp_control_port"];
-    int current_msg_id = doc["current_message_id"] | 0;  // Default to 0 if not present
+    int ws_port = doc["websocket_port"] | 0;
+    int udp_ctrl_port = doc["udp_control_port"] | 0;
     
-    if (ip && http_port > 0) {
+    if (ip && ws_port > 0) {
+      // Check if server changed
+      bool serverChanged = (serverIP != String(ip) || websocketPort != ws_port);
+      
       serverIP = String(ip);
-      httpPort = http_port;
+      websocketPort = ws_port;
       udpControlPort = udp_ctrl_port;
-      useTCP = true;
       
-      // Initialize lastHttpEntryId to get only recent messages (last 10)
-      if (current_msg_id > 10) {
-        lastHttpEntryId = current_msg_id - 10;
-        Serial.printf("[KEEPALIVE] Setting entry ID to %d (server at %d, requesting last 10)\n", 
-          lastHttpEntryId, current_msg_id);
-      } else {
-        lastHttpEntryId = 0;
+      Serial.printf("[KEEPALIVE] WebSocket server: %s:%d, UDP Control: %d\n", 
+        serverIP.c_str(), websocketPort, udpControlPort);
+      
+      // If server changed or not connected, reconnect WebSocket
+      if (serverChanged || !wsClient.available()) {
+        if (wsClient.available()) {
+          Serial.println("[WS] Server changed, reconnecting...");
+          wsClient.close();
+        }
       }
-      
-      Serial.printf("[KEEPALIVE] TCP enabled - Server: %s:%d, UDP Control: %d, Msg ID: %d\n", 
-        serverIP.c_str(), httpPort, udpControlPort, current_msg_id);
     }
     // Do not show KEEPALIVE in display
     return;
@@ -1147,6 +1357,14 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       navRouteInfo.jumpsRemaining = route.size();
     }
     updateHeader();
+  } else if (eventType == "MISSIONSTATUS") {
+    // Display missions in current system
+    if (!doc["MissionsInSystem"].isNull()) {
+      int missionsInSystem = doc["MissionsInSystem"].as<int>();
+      snprintf(logBuf, sizeof(logBuf), "Mission in System: %d", missionsInSystem);
+      addLogEntry(logBuf);
+      Serial.printf("[MISSION] Missions in system: %d\n", missionsInSystem);
+    }
   } else {
     Serial.print("[UDP] Unhandled event type: ");
     Serial.println(eventType);
@@ -1154,122 +1372,25 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
 }
 
 void checkMessages() {
-  // Check for HTTP updates when TCP is enabled
-  if (useTCP && serverIP.length() > 0 && httpPort > 0) {
-    // Rate limit HTTP requests to once per second
-    static uint32_t lastHttpRequest = 0;
-    static int consecutiveHttpErrors = 0;
-    uint32_t currentTime = millis();
-    if (currentTime - lastHttpRequest < 1000) {
-      return;  // Skip this request
-    }
-    lastHttpRequest = currentTime;
-    
-    HTTPClient http;
-    // Limit to max 10 entries per request to avoid memory issues
-    String url = "http://" + serverIP + ":" + String(httpPort) + "/sinceentry/" + String(lastHttpEntryId) + "?limit=10";
-    
-    http.begin(url);
-    http.setTimeout(5000);  // 5 second timeout
-    
-    int httpCode = http.GET();
-    
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = http.getString();
+  // Check WebSocket connection and handle messages
+  if (serverIP.length() > 0 && websocketPort > 0) {
+    // Try to connect if not connected
+    if (!wsClient.available()) {
+      static uint32_t lastConnectAttempt = 0;
+      uint32_t currentTime = millis();
       
-      // Check payload size before parsing
-      if (payload.length() > 50000) {
-        Serial.printf("[HTTP] ERROR: Payload too large (%d bytes), skipping\n", payload.length());
-        http.end();
-        consecutiveHttpErrors++;
-        if (consecutiveHttpErrors >= 3) {
-          Serial.println("[TCP] Too many errors, falling back to UDP");
-          useTCP = false;
-          consecutiveHttpErrors = 0;
-        }
-        return;
+      if (currentTime - lastConnectAttempt > 5000) {  // Try every 5 seconds
+        connectWebSocket();
+        lastConnectAttempt = currentTime;
       }
-      
-      // Use streaming parser to reduce memory usage
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, payload);
-      
-      // Check if server sent an error (e.g., message ID reset)
-      if (!error && doc.is<JsonObject>() && doc["error"].is<const char*>()) {
-        const char* errorMsg = doc["error"];
-        int currentMsgId = doc["current_message_id"] | 0;
-        
-        Serial.printf("[HTTP] Server error: %s\n", errorMsg);
-        
-        if (currentMsgId > 0) {
-          // Server restarted - reset to get last 10 messages
-          if (currentMsgId > 10) {
-            lastHttpEntryId = currentMsgId - 10;
-          } else {
-            lastHttpEntryId = 0;
-          }
-          Serial.printf("[HTTP] Resetting entry ID to %d (server at %d)\n", 
-            lastHttpEntryId, currentMsgId);
-        }
-        
-        consecutiveHttpErrors = 0;  // Don't count this as an error
-      } else if (!error && doc.is<JsonArray>()) {
-        JsonArray entries = doc.as<JsonArray>();
-        
-        if (entries.size() > 0) {
-          Serial.printf("[HTTP] Received %d entries since ID %d\n", entries.size(), lastHttpEntryId);
-          
-          // Reset timeout and turn on display on message received
-          lastTouchTime = millis();
-          if (!displayOn) {
-            setDisplayPower(true);
-          }
-        }
-        
-        for (JsonObject entry : entries) {
-          int id = entry["id"];
-          const char* type = entry["type"];
-          JsonObject data = entry["data"];
-          
-          if (type && !data.isNull()) {
-            // Update last entry ID
-            if (id > lastHttpEntryId) {
-              lastHttpEntryId = id;
-            }
-            
-            // Process entry through existing event handler
-            JsonDocument eventDoc;
-            eventDoc.set(data);
-            handleEliteEvent(String(type), eventDoc);
-          }
-        }
-        consecutiveHttpErrors = 0;  // Reset on successful parse
-      } else if (error) {
-        Serial.printf("[HTTP] JSON parse error: %s (payload size: %d bytes)\n", 
-          error.c_str(), payload.length());
-        consecutiveHttpErrors++;
-      }
-    } else if (httpCode > 0 && httpCode != HTTP_CODE_OK) {
-      Serial.printf("[HTTP] Request failed with code: %d\n", httpCode);
-      consecutiveHttpErrors++;
-    } else {
-      Serial.printf("[HTTP] Connection failed (code: %d)\n", httpCode);
-      Serial.printf("[HTTP] Trying to connect to: %s\n", url.c_str());
-      consecutiveHttpErrors++;
     }
     
-    http.end();
-    
-    // Fall back to UDP if we have 3 consecutive HTTP errors
-    if (consecutiveHttpErrors >= 3) {
-      Serial.println("[TCP] Too many errors, falling back to UDP");
-      useTCP = false;
-      consecutiveHttpErrors = 0;
+    // Poll WebSocket for incoming messages
+    if (wsClient.available()) {
+      wsClient.poll();
+      // Skip UDP when WebSocket is active
       return;
     }
-    
-    // Skip UDP processing when TCP is active
-    return;
   }
   // Check for UDP messages (only when TCP is not enabled)
   int packetSize = udpReceiver.parsePacket();
@@ -1356,30 +1477,17 @@ void checkMessages() {
   }
 }
 
-// Message handling task running on Core 0 for non-blocking UDP and HTTP reception
+// Message handling task running on Core 0 for non-blocking UDP and WebSocket reception
 void loop2(void* parameter) {
   Serial.print("[MSG] Task started on core: ");
   Serial.println(xPortGetCoreID());
   
-  uint32_t lastHttpPollCore0 = 0;
-  const uint32_t HTTP_POLL_INTERVAL_CORE0 = 1000;  // Poll every 1 second
-  
   while (1) {
-    // Check UDP messages continuously
+    // Check messages (WebSocket polling or UDP)
     checkMessages();
     
-    // Only delay if not using TCP, otherwise poll more frequently for HTTP
-    if (useTCP) {
-      uint32_t currentTime = millis();
-      if ((currentTime - lastHttpPollCore0) < HTTP_POLL_INTERVAL_CORE0) {
-        vTaskDelay(pdMS_TO_TICKS(100));  // 100ms delay between HTTP polls
-      } else {
-        lastHttpPollCore0 = currentTime;
-        vTaskDelay(pdMS_TO_TICKS(10));  // Quick check
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling for UDP
-    }
+    // Poll frequently for WebSocket or UDP
+    vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling
   }
 }
 
@@ -1453,7 +1561,7 @@ void setup()
 {
   Serial.begin(115200);
   udpBuffer = (char*)malloc(UDP_BUFFER_SIZE);  // Allocates from HEAP
-  logText = (char*)malloc(480);  // Allocates from HEAP
+  logText = (char*)malloc(LOG_TEXT_SIZE);  // Allocates from HEAP
   if (!udpBuffer || !logText) {
     Serial.println("ERROR: Failed to allocate buffers!");
     while(1);
@@ -1492,11 +1600,11 @@ void setup()
     while(1);
   }
   
-  // Start message handler task on Core 0 (UDP + HTTP)
+  // Start message handler task on Core 0 (UDP + WebSocket)
   xTaskCreatePinnedToCore(
     loop2,              // Task function
     "MSG_Handler",      // Task name
-    8192,               // Stack size (8KB for JSON parsing)
+    16384,              // Stack size (16KB - increased for WebSocket + JSON parsing)
     NULL,               // Parameters
     2,                  // Priority (2 = higher than default)
     &udpTaskHandle,     // Task handle
@@ -1527,6 +1635,17 @@ void loop()
   // checkMessages();  // Now handled by loop2 on Core 0
   
   uint32_t currentTime = millis();
+  
+  // Print heap status periodically
+  if (currentTime - lastHeapPrint > HEAP_PRINT_INTERVAL) {
+    printHeapStatus("main loop");
+    
+    // Print task stack high water marks
+    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
+    Serial.printf("[STACK] MSG_Handler high water mark: %d bytes free\n", stackHighWater * 4);
+    
+    lastHeapPrint = currentTime;
+  }
   
   // Request SUMMARY every 10 seconds until first one is received
   if (!summaryReceived && WiFi.status() == WL_CONNECTED && 
