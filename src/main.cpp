@@ -28,6 +28,19 @@ uint32_t buf[LVGL_BUFFER_SIZE / 4];
 #define TOUCH_SCL 32
 #define CST820_I2C_ADDR 0x15
 
+
+
+#include "colors.h"
+/*
+//definiere Farben aus HTML Farbcode
+#define COLOR_BG lv_color_hex(0x250700)
+#define COLOR_FG lv_color_hex(0xdc5904)
+#define COLOR_BAR_FG lv_color_hex(0x7e5407)
+#define COLOR_BAR_BG lv_color_hex(0x4a1504)
+#define COLOR_ALERT lv_color_hex(0xff0000)
+*/
+
+
 // Button mapping (PCF8575 pins)
 enum ButtonIndex
 {
@@ -206,7 +219,7 @@ const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
 
 // Heap monitoring
 uint32_t lastHeapPrint = 0;
-const uint32_t HEAP_PRINT_INTERVAL = 10000; // Print every 10 seconds
+const uint32_t HEAP_PRINT_INTERVAL = 45000; // Print every 45 seconds
 
 // Summary request management
 bool summaryReceived = false;
@@ -371,7 +384,7 @@ void create_fighter_ui()
 void printHeapStatus(const char* location) {
 
   //disable it for now, but leave the code here for future debugging
-  return;
+  //return;
 
 
   size_t freeHeap = esp_get_free_heap_size();
@@ -609,13 +622,13 @@ void addLogEntry(const char* text) {
 
 void create_logviewer_ui() {
   logviewer_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(logviewer_screen, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_color(logviewer_screen, LV_COLOR_BG, 0);
   
   // Header with jumps, fuel, hull (reduced height to 22px to fit bars)
   lv_obj_t* header = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(header, SCREEN_WIDTH, 22);
+  lv_obj_set_size(header, SCREEN_WIDTH, 24);
   lv_obj_set_pos(header, 0, 0);
-  lv_obj_set_style_bg_color(header, lv_color_hex(0x1a1a1a), 0);
+  lv_obj_set_style_bg_color(header, LV_COLOR_GAUGE_BG, 0);
   lv_obj_set_style_border_width(header, 0, 0);
   lv_obj_set_style_radius(header, 0, 0);
   lv_obj_set_style_pad_all(header, 2, 0);
@@ -625,13 +638,13 @@ void create_logviewer_ui() {
   // Jumps label
   header_label = lv_label_create(header);
   lv_label_set_text(header_label, "Jumps: 0");
-  lv_obj_set_style_text_color(header_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_color(header_label, LV_COLOR_FG, 0);
   lv_obj_set_pos(header_label, 5, 3);
   
   // Fuel label
   lv_obj_t* fuel_label = lv_label_create(header);
   lv_label_set_text(fuel_label, "F");
-  lv_obj_set_style_text_color(fuel_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_color(fuel_label, LV_COLOR_FG, 0);
   lv_obj_set_pos(fuel_label, 100, 3);
   
   // Fuel bar (reduced size)
@@ -640,14 +653,14 @@ void create_logviewer_ui() {
   lv_obj_set_pos(fuel_bar, 115, 3);
   lv_bar_set_range(fuel_bar, 0, 100);
   lv_bar_set_value(fuel_bar, 100, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(fuel_bar, lv_color_hex(0x333333), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(fuel_bar, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(fuel_bar, lv_color_hex(0xff9500), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(fuel_bar, LV_COLOR_BG, LV_PART_MAIN);
+  //lv_obj_set_style_bg_opa(fuel_bar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(fuel_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
   
   // Hull label
   lv_obj_t* hull_label = lv_label_create(header);
   lv_label_set_text(hull_label, "H");
-  lv_obj_set_style_text_color(hull_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_color(hull_label, LV_COLOR_FG, 0);
   lv_obj_set_pos(hull_label, 180, 3);
   
   // Hull bar (reduced size)
@@ -656,9 +669,9 @@ void create_logviewer_ui() {
   lv_obj_set_pos(hull_bar, 195, 3);
   lv_bar_set_range(hull_bar, 0, 100);
   lv_bar_set_value(hull_bar, 100, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(hull_bar, lv_color_hex(0x333333), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(hull_bar, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(hull_bar, lv_color_hex(0x00ff00), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(hull_bar, LV_COLOR_BG, LV_PART_MAIN);
+  //lv_obj_set_style_bg_opa(hull_bar, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(hull_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
   
   // Status icons (right side of header)
   // WiFi icon (rightmost)
@@ -682,8 +695,8 @@ void create_logviewer_ui() {
   // Log area (adjusted for smaller header)
   lv_obj_t* log_area = lv_obj_create(logviewer_screen);
   lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 62);
-  lv_obj_set_pos(log_area, 0, 22);
-  lv_obj_set_style_bg_color(log_area, lv_color_hex(0x000000), 0);
+  lv_obj_set_pos(log_area, 0, 25);
+  lv_obj_set_style_bg_color(log_area, LV_COLOR_BG, 0);
   lv_obj_set_style_border_width(log_area, 0, 0);
   lv_obj_set_style_radius(log_area, 0, 0);
   lv_obj_set_scrollbar_mode(log_area, LV_SCROLLBAR_MODE_OFF);
@@ -691,7 +704,7 @@ void create_logviewer_ui() {
   
   log_label = lv_label_create(log_area);
   lv_label_set_text(log_label, "Waiting for events...");
-  lv_obj_set_style_text_color(log_label, lv_color_hex(0x00ff00), 0);
+  lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
   lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(log_label, SCREEN_WIDTH - 10);
   
@@ -701,12 +714,12 @@ void create_logviewer_ui() {
   lv_obj_set_pos(cargo_bar, 0, SCREEN_HEIGHT - 40);
   lv_bar_set_range(cargo_bar, 0, 256);
   lv_bar_set_value(cargo_bar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(cargo_bar, lv_color_hex(0x333333), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(cargo_bar, lv_color_hex(0x0088ff), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(cargo_bar, LV_COLOR_GAUGE_BG, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cargo_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
   
   lv_obj_t* cargo_label = lv_label_create(cargo_bar);
   lv_label_set_text(cargo_label, "Cargo: 0/256");
-  lv_obj_set_style_text_color(cargo_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_color(cargo_label, LV_COLOR_FG, 0);
   lv_obj_center(cargo_label);
 }
 
@@ -957,8 +970,10 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc);
 // WebSocket event handlers
 void onWebSocketMessage(WebsocketsMessage message) {
   // Check message size before processing to avoid out-of-memory on large payloads
+  printHeapStatus("WS start");
   size_t len = message.length();
-  const size_t MAX_WS_MESSAGE_SIZE = 10240; // 10KB limit
+  Serial.printf("[WS] Message length: %d bytes\n", len);
+  const size_t MAX_WS_MESSAGE_SIZE = 8000; // 8KB limit
 
   if (len > MAX_WS_MESSAGE_SIZE) {
     Serial.printf("[WS] ERROR: Message too large (%d bytes), discarding.\n", len);
@@ -971,7 +986,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
 
   String data = message.data();
   
-  printHeapStatus("WS start");
   Serial.printf("[WS] Received %d bytes\n", data.length());
   
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
