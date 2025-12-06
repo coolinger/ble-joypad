@@ -20,7 +20,8 @@ using namespace websockets;
 #define BUZZER_PIN 5
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
-#define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10)  // Larger buffer with PSRAM
+#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 10)  // Buffer in pixels
+#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * sizeof(lv_color_t))  // Buffer in bytes
 uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define INT_N_PIN 17
 #define RST_N_PIN 18
@@ -1112,7 +1113,8 @@ void init_display()
   lv_tick_set_cb([]() -> uint32_t { return millis(); });
   lv_log_register_print_cb(my_print);
 
-  Serial.printf("[LVGL] Creating display with buffer: %p, size: %d bytes\n", buf, LVGL_BUFFER_SIZE);
+  Serial.printf("[LVGL] Creating display with buffer: %p, size: %d bytes (pixels: %d)\n", 
+                buf, LVGL_BUFFER_SIZE, LVGL_BUFFER_PIXELS);
   disp = lv_tft_espi_create(SCREEN_HEIGHT, SCREEN_WIDTH, buf, LVGL_BUFFER_SIZE);
   lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
   Serial.println("[LVGL] Display created");
