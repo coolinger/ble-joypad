@@ -17,9 +17,6 @@ using namespace websockets;
 #define PCF8575_ADDR 0x20
 #define I2C_SDA 16
 #define I2C_SCL 15
-#define LED_R 4
-#define LED_G 16
-#define LED_B 17
 #define BUZZER_PIN 5
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
@@ -256,12 +253,6 @@ const uint32_t SUMMARY_REQUEST_INTERVAL = 10000; // Request every 10 seconds unt
 static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
                                   "Position", "Formation", "Befehle", ""};
-void setLedColor(uint8_t r, uint8_t g, uint8_t b)
-{
-  analogWrite(LED_R, 255 - r);
-  analogWrite(LED_G, 255 - g);
-  analogWrite(LED_B, 255 - b);
-}
 
 // Buzzer helper functions
 void beepShort() {
@@ -328,7 +319,6 @@ static void btnmatrix_event_handler(lv_event_t * e)
             bleGamepad.press(20);
             delay(50);
             bleGamepad.release(20);
-            setLedColor(255, 255, 0);
         } else if (cmd_idx < 8) {
             FighterCommand cmd;
             memcpy_P(&cmd, &commands[cmd_idx], sizeof(FighterCommand));
@@ -338,7 +328,6 @@ static void btnmatrix_event_handler(lv_event_t * e)
             bleGamepad.press(cmd.button_id);
             delay(50);
             bleGamepad.release(cmd.button_id);
-            setLedColor(0, 255, 0);
         }
     }
 }
@@ -1173,7 +1162,6 @@ void checkBleConnection()
     {
       Serial.println("[BLE] Connected");
       beepConnect();  // Rising tone for connection
-      setLedColor(0, 0, 255);
       bleConnected = true;
       ledOn = true;
       setDisplayPower(true);
@@ -1186,18 +1174,16 @@ void checkBleConnection()
     {
       Serial.println("[BLE] Disconnected");
       beepDisconnect();  // Falling tone for disconnection
-      setLedColor(255, 0, 0);
       bleConnected = false;
       ledOn = true;
       bleDisconnectedTime = millis();
       setDisplayPower(false);
     }
     
-    // Turn off red LED after 5 minutes of no connection
+    // LED timeout tracking (LED removed on ESP32S3)
     if (ledOn && (millis() - bleDisconnectedTime) > LED_TIMEOUT) {
-      setLedColor(0, 0, 0); // Turn off LED
       ledOn = false;
-      Serial.println("[LED] Timeout - turning off");
+      Serial.println("[LED] Timeout - LED feature disabled on ESP32S3");
     }
   }
 }
@@ -1903,7 +1889,6 @@ void requestSummary() {
 
 void WifiConnect()
 {
-  setLedColor(255, 0, 255); // Magenta during WiFi setup
   
   // Configure WiFi with auto-reconnect
   WiFi.mode(WIFI_STA);
@@ -1945,9 +1930,6 @@ void WifiConnect()
   } else {
     Serial.println("\nWiFi connection failed, continuing without WiFi");
   }
-  
-  setLedColor(255, 0, 0); // Red = waiting for BLE
-  
 }
 
 void setup()
@@ -1971,9 +1953,6 @@ void setup()
   Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   delay(500);
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   
   beepBootup();  // Play three startup tones
@@ -2202,10 +2181,6 @@ void loop()
       }
     }
     bleGamepad.sendReport();
-    if (anyPressed)
-      setLedColor(0, 255, 0);
-    else
-      setLedColor(0, 0, 255);
   }
   
   delay(5);
