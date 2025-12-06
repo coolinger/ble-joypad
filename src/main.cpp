@@ -107,6 +107,15 @@ struct NavRouteInfo {
   int jumpsRemaining = 0;
 };
 
+struct BackpackInfo {
+  int healthpack = 0;
+  int energycell = 0;
+};
+
+struct BioscanInfo {
+  int totalScans = 0;
+};
+
 struct EventLogEntry {
   char text[55];  // Reduced to fit 8 entries in memory
   uint32_t timestamp;
@@ -118,6 +127,8 @@ CargoInfo cargoInfo;
 FuelInfo fuelInfo;
 HullInfo hullInfo;
 NavRouteInfo navRouteInfo;
+BackpackInfo backpackInfo;
+BioscanInfo bioscanInfo;
 EventLogEntry eventLog[9] = {};  // Show last 9 events, initialized to zero
 int eventLogIndex = 0;
 int eventLogCount = 0;  // Track how many events we actually have
@@ -154,6 +165,7 @@ const char ignoreEvent_Materials[] PROGMEM = "Materials";
 const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
 const char ignoreEvent_Missions[] PROGMEM = "Missions";
+const char ignoreEvent_FSSSignalDiscovered[] PROGMEM = "FSSSignalDiscovered";
 
 const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Music,
@@ -164,7 +176,8 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Materials,
   ignoreEvent_MaterialCollected,
   ignoreEvent_ShipLocker,
-  ignoreEvent_Missions
+  ignoreEvent_Missions,
+  ignoreEvent_FSSSignalDiscovered
 };
 const int ignoreJournalEventsCount = sizeof(ignoreJournalEvents) / sizeof(ignoreJournalEvents[0]);
 
@@ -199,7 +212,21 @@ lv_obj_t *hull_bar;
 lv_obj_t *wifi_icon;
 lv_obj_t *websocket_icon;
 lv_obj_t *bluetooth_icon;
-int currentPage = 1;  // 0 = fighter, 1 = logviewer (start on page 2)
+lv_obj_t *settings_screen;
+lv_obj_t *sys_info_label;
+lv_obj_t *medpack_label;
+lv_obj_t *energycell_label;
+lv_obj_t *bioscan_label;
+lv_obj_t *bioscan_data_label;
+lv_obj_t *jump_overlay_label;
+int currentPage = 1;  // 0 = fighter, 1 = logviewer, 2 = settings (start on page 1)
+bool pendingJumpOverlay = false;
+int pendingJumpValue = 0;
+
+// Forward declarations for animation callbacks
+static void jump_overlay_zoom_exec(void* obj, int32_t value);
+static void jump_overlay_opa_exec(void* obj, int32_t value);
+static void jump_overlay_anim_ready(lv_anim_t* anim);
 
 // Display power management
 bool displayOn = true;
@@ -384,7 +411,7 @@ void create_fighter_ui()
 void printHeapStatus(const char* location) {
 
   //disable it for now, but leave the code here for future debugging
-  //return;
+  return;
 
 
   size_t freeHeap = esp_get_free_heap_size();
@@ -415,6 +442,42 @@ void updateCargoBar() {
     snprintf(buf, sizeof(buf), "Cargo: %d/%d (Drones: %d)", used, total, drones);
     lv_label_set_text(label, buf);
   }
+    
+    xSemaphoreGive(lvglMutex);
+  }
+}
+
+void updateBackpackDisplay() {
+  if (!medpack_label || !energycell_label) return;
+  
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    char buf[8];
+    
+    // Update medpack count
+    snprintf(buf, sizeof(buf), "%d", backpackInfo.healthpack);
+    lv_label_set_text(medpack_label, buf);
+    
+    // Update energycell count
+    snprintf(buf, sizeof(buf), "%d", backpackInfo.energycell);
+    lv_label_set_text(energycell_label, buf);
+    
+    // Update bioscan count if available
+    if (bioscan_label) {
+      snprintf(buf, sizeof(buf), "%d", bioscanInfo.totalScans);
+      lv_label_set_text(bioscan_label, buf);
+      
+      if (bioscanInfo.totalScans > 0) {
+        lv_obj_clear_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
+        if (bioscan_data_label) {
+          lv_obj_clear_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
+        }
+      } else {
+        lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
+        if (bioscan_data_label) {
+          lv_obj_add_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+    }
     
     xSemaphoreGive(lvglMutex);
   }
@@ -626,7 +689,7 @@ void create_logviewer_ui() {
   
   // Header with jumps, fuel, hull (reduced height to 22px to fit bars)
   lv_obj_t* header = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(header, SCREEN_WIDTH, 24);
+  lv_obj_set_size(header, SCREEN_WIDTH, 25);
   lv_obj_set_pos(header, 0, 0);
   lv_obj_set_style_bg_color(header, LV_COLOR_GAUGE_BG, 0);
   lv_obj_set_style_border_width(header, 0, 0);
@@ -694,20 +757,111 @@ void create_logviewer_ui() {
   
   // Log area (adjusted for smaller header)
   lv_obj_t* log_area = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 62);
+  lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 25 - 40);  // Leave space for header and footer
   lv_obj_set_pos(log_area, 0, 25);
   lv_obj_set_style_bg_color(log_area, LV_COLOR_BG, 0);
   lv_obj_set_style_border_width(log_area, 0, 0);
   lv_obj_set_style_radius(log_area, 0, 0);
   lv_obj_set_scrollbar_mode(log_area, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scroll_dir(log_area, LV_DIR_NONE);  // Disable all scrolling
-  
+  lv_obj_set_style_border_color(log_area, LV_COLOR_GAUGE_FG, 0);
+  lv_obj_set_style_border_width(log_area, 1, 0);
+  //kein padding oben und unten
+  lv_obj_set_style_pad_top(log_area, 1, 0);
+  lv_obj_set_style_pad_bottom(log_area, 1, 0);
+  lv_obj_set_style_pad_left(log_area, 0, 0);
+  lv_obj_set_style_pad_right(log_area, 0, 0);
+  lv_obj_set_style_border_width(log_area, 0, 0);
+
   log_label = lv_label_create(log_area);
+  lv_obj_set_pos(log_label, 5, 5);
   lv_label_set_text(log_label, "Waiting for events...");
   lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
   lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(log_label, SCREEN_WIDTH - 10);
+  lv_obj_set_width(log_label, SCREEN_WIDTH - 75);  // Reduced width to make room for backpack panel
   
+  // Backpack panel (right side of log area) - styled like settings panel
+  lv_obj_t* backpack_panel = lv_obj_create(log_area);
+  lv_obj_set_size(backpack_panel, 40, SCREEN_HEIGHT - 62);  // Full height minus padding
+  lv_obj_set_pos(backpack_panel, SCREEN_WIDTH - 40, 0);
+  lv_obj_set_style_bg_color(backpack_panel, LV_COLOR_BG, 0);
+  lv_obj_set_style_border_width(backpack_panel, 0, 0);
+  lv_obj_set_scrollbar_mode(backpack_panel, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scroll_dir(backpack_panel, LV_DIR_NONE);
+  //remove round corners
+  lv_obj_set_style_radius(backpack_panel, 0, 0);
+  //remove top, bottom and right borders
+  lv_obj_set_style_border_side(backpack_panel, LV_BORDER_SIDE_LEFT, 0);
+  lv_obj_set_style_pad_all(backpack_panel, 0, 0);
+  
+  // Panel title
+  lv_obj_t* backpack_title = lv_label_create(backpack_panel);
+  lv_label_set_text(backpack_title, "PACK");
+  lv_obj_set_style_text_color(backpack_title, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(backpack_title, &lv_font_montserrat_10, 0);
+  lv_obj_align(backpack_title, LV_ALIGN_TOP_MID, 0, 0);
+  
+  
+  // Decorative line under title
+  lv_obj_t* title_line = lv_obj_create(backpack_panel);
+  lv_obj_set_size(title_line, 30, 1);
+  lv_obj_set_pos(title_line, 5, 20);
+  lv_obj_set_style_bg_color(title_line, LV_COLOR_GAUGE_FG, 0);
+  lv_obj_set_style_border_width(title_line, 0, 0);
+  lv_obj_set_scrollbar_mode(title_line, LV_SCROLLBAR_MODE_OFF);
+  
+  // Medpack section
+  lv_obj_t* medpack_m_label = lv_label_create(backpack_panel);
+  lv_label_set_text(medpack_m_label, "M");
+  lv_obj_set_style_text_color(medpack_m_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(medpack_m_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(medpack_m_label, LV_ALIGN_TOP_LEFT, 2, 25);
+  
+  medpack_label = lv_label_create(backpack_panel);
+  lv_label_set_text(medpack_label, "m");
+  lv_obj_set_style_text_color(medpack_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(medpack_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(medpack_label, LV_ALIGN_TOP_LEFT, 18, 25);
+  
+  // Divider line
+  lv_obj_t* divider_line = lv_obj_create(backpack_panel);
+  lv_obj_set_size(divider_line, 30, 1);
+  lv_obj_set_pos(divider_line, 5, 45);
+  lv_obj_set_style_bg_color(divider_line, LV_COLOR_GAUGE_FG, 0);
+  lv_obj_set_style_border_width(divider_line, 0, 0);
+  lv_obj_set_scrollbar_mode(divider_line, LV_SCROLLBAR_MODE_OFF);
+  
+  // Energycell section
+  lv_obj_t* energycell_e_label = lv_label_create(backpack_panel);
+  lv_label_set_text(energycell_e_label, "E");
+  lv_obj_set_style_text_color(energycell_e_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(energycell_e_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_pos(energycell_e_label, 2, 50);
+    
+  energycell_label = lv_label_create(backpack_panel);
+  lv_label_set_text(energycell_label, "e");
+  lv_obj_set_style_text_color(energycell_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(energycell_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_pos(energycell_label, 18, 50);
+  
+  // Bioscan DATA section (initially hidden if no scans)
+  bioscan_data_label = lv_label_create(backpack_panel);
+  lv_label_set_text(bioscan_data_label, "DATA");
+  lv_obj_set_style_text_color(bioscan_data_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(bioscan_data_label, &lv_font_montserrat_10, 0);
+  lv_obj_align(bioscan_data_label, LV_ALIGN_TOP_MID, 0, 75);
+  
+  bioscan_label = lv_label_create(backpack_panel);
+  lv_label_set_text(bioscan_label, "0");
+  lv_obj_set_style_text_color(bioscan_label, LV_COLOR_FG, 0);
+  lv_obj_set_style_text_font(bioscan_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(bioscan_label, LV_ALIGN_TOP_MID, 0, 95);
+  // Start hidden if no scans
+  if (bioscanInfo.totalScans == 0) {
+    lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
+  }
+
   // Cargo bar at bottom
   cargo_bar = lv_bar_create(logviewer_screen);
   lv_obj_set_size(cargo_bar, SCREEN_WIDTH, 40);
@@ -723,20 +877,189 @@ void create_logviewer_ui() {
   lv_obj_center(cargo_label);
 }
 
+// Forward declaration for settings handlers
+void connectWebSocket();
+
+// System settings button handlers
+static void restart_wifi_handler(lv_event_t * e) {
+  Serial.println("[SETTINGS] Restarting WiFi...");
+  beepClick();
+  WiFi.disconnect();
+  delay(500);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+static void restart_websocket_handler(lv_event_t * e) {
+  Serial.println("[SETTINGS] Restarting WebSocket...");
+  beepClick();
+  if (wsClient.available()) {
+    wsClient.close();
+  }
+  delay(500);
+  connectWebSocket();
+}
+
+static void reboot_handler(lv_event_t * e) {
+  Serial.println("[SETTINGS] Rebooting system...");
+  beepDisconnect();
+  delay(500);
+  ESP.restart();
+}
+
+void updateSystemInfo() {
+  if (!sys_info_label) return;
+  
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    size_t freeHeap = esp_get_free_heap_size();
+    size_t minFreeHeap = esp_get_minimum_free_heap_size();
+    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    
+    // Get CPU utilization (approximate via task runtime)
+    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
+    
+    // Get WiFi info
+    String wifiStatus = "Disconnected";
+    String wifiIP = "N/A";
+    int rssi = 0;
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiStatus = "Connected";
+      wifiIP = WiFi.localIP().toString();
+      rssi = WiFi.RSSI();
+    }
+    
+    // Get WebSocket status
+    String wsStatus = useWebSocket && wsClient.available() ? "Connected" : "Disconnected";
+    
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+      "SYSTEM INFORMATION\n\n"
+      "Memory:\n"
+      "  Free: %d KB\n"
+      "  Min Free: %d KB\n"
+      "  Largest Block: %d KB\n\n"
+      "WiFi: %s\n"
+      "  IP: %s\n"
+      "  RSSI: %d dBm\n\n"
+      "WebSocket: %s\n"
+      "  Server: %s:%d\n\n"
+      "Task Stack Free: %d bytes\n\n"
+      "Uptime: %lu sec",
+      freeHeap / 1024, minFreeHeap / 1024, largestBlock / 1024,
+      wifiStatus.c_str(), wifiIP.c_str(), rssi,
+      wsStatus.c_str(), serverIP.c_str(), websocketPort,
+      stackHighWater * 4,
+      millis() / 1000);
+    
+    lv_label_set_text(sys_info_label, buf);
+    xSemaphoreGive(lvglMutex);
+  }
+}
+
+void create_settings_ui() {
+  settings_screen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(settings_screen, LV_COLOR_BG, 0);
+  
+  // Title
+  lv_obj_t* title = lv_label_create(settings_screen);
+  lv_label_set_text(title, "SYSTEM SETTINGS");
+  lv_obj_set_style_text_color(title, LV_COLOR_FG, 0);
+  lv_obj_set_pos(title, 10, 10);
+  
+  // System info display area
+  lv_obj_t* info_area = lv_obj_create(settings_screen);
+  lv_obj_set_size(info_area, SCREEN_WIDTH - 20, 120);
+  lv_obj_set_pos(info_area, 10, 35);
+  lv_obj_set_style_bg_color(info_area, LV_COLOR_GAUGE_BG, 0);
+  lv_obj_set_style_border_width(info_area, 1, 0);
+  lv_obj_set_style_border_color(info_area, LV_COLOR_GAUGE_FG, 0);
+  lv_obj_set_style_radius(info_area, 5, 0);
+  lv_obj_set_scrollbar_mode(info_area, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scroll_dir(info_area, LV_DIR_NONE);
+  
+  sys_info_label = lv_label_create(info_area);
+  lv_label_set_text(sys_info_label, "Loading...");
+  lv_obj_set_style_text_color(sys_info_label, LV_COLOR_FG, 0);
+  lv_label_set_long_mode(sys_info_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(sys_info_label, SCREEN_WIDTH - 40);
+  lv_obj_set_pos(sys_info_label, 5, 5);
+  
+  // Button styles
+  static lv_style_t btn_style;
+  lv_style_init(&btn_style);
+  lv_style_set_bg_color(&btn_style, LV_COLOR_GAUGE_BG);
+  lv_style_set_bg_opa(&btn_style, LV_OPA_COVER);
+  lv_style_set_border_color(&btn_style, LV_COLOR_GAUGE_FG);
+  lv_style_set_border_width(&btn_style, 1);
+  lv_style_set_radius(&btn_style, 5);
+  lv_style_set_text_color(&btn_style, LV_COLOR_FG);
+  
+  static lv_style_t btn_pressed_style;
+  lv_style_init(&btn_pressed_style);
+  lv_style_set_bg_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_BG);
+  lv_style_set_text_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_FG);
+  
+  // Restart WiFi button
+  lv_obj_t* btn_wifi = lv_btn_create(settings_screen);
+  lv_obj_set_size(btn_wifi, 145, 35);
+  lv_obj_set_pos(btn_wifi, 10, 165);
+  lv_obj_add_style(btn_wifi, &btn_style, 0);
+  lv_obj_add_style(btn_wifi, &btn_pressed_style, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(btn_wifi, restart_wifi_handler, LV_EVENT_CLICKED, NULL);
+  
+  lv_obj_t* label_wifi = lv_label_create(btn_wifi);
+  lv_label_set_text(label_wifi, "Restart WiFi");
+  lv_obj_center(label_wifi);
+  
+  // Restart WebSocket button
+  lv_obj_t* btn_ws = lv_btn_create(settings_screen);
+  lv_obj_set_size(btn_ws, 145, 35);
+  lv_obj_set_pos(btn_ws, 165, 165);
+  lv_obj_add_style(btn_ws, &btn_style, 0);
+  lv_obj_add_style(btn_ws, &btn_pressed_style, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(btn_ws, restart_websocket_handler, LV_EVENT_CLICKED, NULL);
+  
+  lv_obj_t* label_ws = lv_label_create(btn_ws);
+  lv_label_set_text(label_ws, "Restart WS");
+  lv_obj_center(label_ws);
+  
+  // Reboot button
+  lv_obj_t* btn_reboot = lv_btn_create(settings_screen);
+  lv_obj_set_size(btn_reboot, 300, 35);
+  lv_obj_set_pos(btn_reboot, 10, 205);
+  lv_obj_add_style(btn_reboot, &btn_style, 0);
+  lv_obj_add_style(btn_reboot, &btn_pressed_style, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(btn_reboot, reboot_handler, LV_EVENT_CLICKED, NULL);
+  
+  lv_obj_t* label_reboot = lv_label_create(btn_reboot);
+  lv_label_set_text(label_reboot, "REBOOT SYSTEM");
+  lv_obj_center(label_reboot);
+  
+  // Update system info
+  updateSystemInfo();
+}
+
 void switchToPage(int page) {
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     if (page == 0) {
       lv_scr_load(fighter_screen);
-    currentPage = 0;
-  } else if (page == 1) {
-    if (!logviewer_screen) {
-      create_logviewer_ui();
-    }
-    lv_scr_load(logviewer_screen);
-    currentPage = 1;
-    // Don't call updateLogDisplay here - it will update when events arrive
+      currentPage = 0;
+    } else if (page == 1) {
+      if (!logviewer_screen) {
+        create_logviewer_ui();
+      }
+      lv_scr_load(logviewer_screen);
+      currentPage = 1;
+      // Don't call updateLogDisplay here - it will update when events arrive
       updateCargoBar();
       updateHeader();
+      updateBackpackDisplay();
+    } else if (page == 2) {
+      if (!settings_screen) {
+        create_settings_ui();
+      }
+      lv_scr_load(settings_screen);
+      currentPage = 2;
+      updateSystemInfo();
     }
     
     xSemaphoreGive(lvglMutex);
@@ -896,6 +1219,9 @@ void checkBleConnection()
 
 // Forward declaration
 void requestSummary();
+void connectWebSocket();
+void updateJumpsRemaining(int newValue);
+void showJumpOverlay(int jumps);
 
 void checkDisplayTimeout()
 {
@@ -972,7 +1298,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   // Check message size before processing to avoid out-of-memory on large payloads
   printHeapStatus("WS start");
   size_t len = message.length();
-  Serial.printf("[WS] Message length: %d bytes\n", len);
+  //Serial.printf("[WS] Message length: %d bytes\n", len);
   const size_t MAX_WS_MESSAGE_SIZE = 8000; // 8KB limit
 
   if (len > MAX_WS_MESSAGE_SIZE) {
@@ -986,7 +1312,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
 
   String data = message.data();
   
-  Serial.printf("[WS] Received %d bytes\n", data.length());
+  //Serial.printf("[WS] Received %d bytes\n", data.length());
   
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
   JsonDocument doc;
@@ -1105,6 +1431,47 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     }
     // Do not show KEEPALIVE in display
     return;
+  } else if (eventType == "BACKPACK") {
+    // Parse backpack consumables
+    Serial.println("[BACKPACK] Processing backpack update");
+    
+    if (!doc["Consumables"].isNull()) {
+      JsonArray consumables = doc["Consumables"];
+      
+      // Reset counts
+      backpackInfo.healthpack = 0;
+      backpackInfo.energycell = 0;
+      
+      for (JsonObject item : consumables) {
+        const char* name = item["Name"];
+        int count = item["Count"] | 0;
+        
+        if (strcmp(name, "healthpack") == 0) {
+          backpackInfo.healthpack = count;
+          Serial.printf("[BACKPACK] Healthpack: %d\n", count);
+        } else if (strcmp(name, "energycell") == 0) {
+          backpackInfo.energycell = count;
+          Serial.printf("[BACKPACK] Energycell: %d\n", count);
+        }
+      }
+      
+      updateBackpackDisplay();
+    }
+    return;
+  } else if (eventType == "BIOSCAN") {
+    // Parse bioscan data and accumulate counts
+    Serial.println("[BIOSCAN] Processing bioscan");
+    
+    int count = doc["count"] | 0;
+    const char* variant = doc["variant"];
+    
+    if (count > 0) {
+      // Just track total count, ignore variants
+      bioscanInfo.totalScans = count;
+      Serial.printf("[BIOSCAN] Total scans: %d\n", bioscanInfo.totalScans);
+      updateBackpackDisplay();
+    }
+    return;
   } else if (eventType == "SUMMARY") {
     // Parse comprehensive summary data
     Serial.println("[SUMMARY] Received state update");
@@ -1143,7 +1510,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     
     // Update route jumps (now a single integer, not an object)
     if (!doc["route"].isNull()) {
-      navRouteInfo.jumpsRemaining = doc["route"].as<int>();
+      updateJumpsRemaining(doc["route"].as<int>());
     }
     
     // Update balance
@@ -1180,9 +1547,36 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
     }
     
+    // Update backpack from summary if available
+    if (!doc["backpack"].isNull()) {
+      if (doc["backpack"]["healthpack"].is<int>()) {
+        backpackInfo.healthpack = doc["backpack"]["healthpack"];
+      }
+      if (doc["backpack"]["energycell"].is<int>()) {
+        backpackInfo.energycell = doc["backpack"]["energycell"];
+      }
+      Serial.printf("[BACKPACK] Healthpack: %d, Energycell: %d\n",
+        backpackInfo.healthpack, backpackInfo.energycell);
+    }
+    
+    // Update bioscans from summary if available
+    if (!doc["bioscans"].isNull()) {
+      JsonObject bioscans = doc["bioscans"];
+      bioscanInfo.totalScans = 0;
+      
+      // Sum all bioscan counts across all variants
+      for (JsonPair kv : bioscans) {
+        int count = kv.value().as<int>();
+        bioscanInfo.totalScans += count;
+      }
+      
+      Serial.printf("[BIOSCAN] Total scans from summary: %d\n", bioscanInfo.totalScans);
+    }
+    
     // Update all displays
     updateHeader();
     updateCargoBar();
+    updateBackpackDisplay();
     
     Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
       fuelInfo.fuelMain, fuelInfo.fuelCapacity,
@@ -1231,9 +1625,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
     } else if (event == "FSDTarget") {
-      // Update remaining jumps from FSD target
-      if (!doc["RemainingJumpsInRoute"].isNull()) {
-        navRouteInfo.jumpsRemaining = doc["RemainingJumpsInRoute"];
+      // Update remaining jumps from FSD target journal entries
+      if (doc["RemainingJumpsInRoute"].is<int>()) {
+        updateJumpsRemaining(doc["RemainingJumpsInRoute"].as<int>());
         updateHeader();
         Serial.printf("[NAV] Jumps remaining: %d\n", navRouteInfo.jumpsRemaining);
       }
@@ -1368,7 +1762,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Count route entries
     if (!doc["Route"].isNull()) {
       JsonArray route = doc["Route"];
-      navRouteInfo.jumpsRemaining = route.size();
+      updateJumpsRemaining(route.size());
     }
     updateHeader();
   } else if (eventType == "MISSIONSTATUS") {
@@ -1639,8 +2033,52 @@ void loop()
   //lastTick = currentTime;
   
   // Protect LVGL rendering with mutex
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     lv_timer_handler();
+    
+    // Process pending jump overlay from main loop to avoid mutex contention
+    if (pendingJumpOverlay) {
+      pendingJumpOverlay = false;
+      if (jump_overlay_label) {
+        lv_obj_del(jump_overlay_label);
+        jump_overlay_label = nullptr;
+      }
+      lv_obj_t* parent = lv_scr_act();
+      if (parent) {
+        jump_overlay_label = lv_label_create(parent);
+        lv_label_set_text_fmt(jump_overlay_label, "%d", pendingJumpValue);
+        lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
+        lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
+        lv_obj_center(jump_overlay_label);
+        lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
+        lv_obj_set_style_transform_zoom(jump_overlay_label, 768, LV_PART_MAIN);
+        lv_obj_update_layout(jump_overlay_label);
+        lv_coord_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
+        lv_coord_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
+        lv_obj_set_style_transform_pivot_x(jump_overlay_label, pivotX, LV_PART_MAIN);
+        lv_obj_set_style_transform_pivot_y(jump_overlay_label, pivotY, LV_PART_MAIN);
+
+        lv_anim_t zoom_anim;
+        lv_anim_init(&zoom_anim);
+        lv_anim_set_var(&zoom_anim, jump_overlay_label);
+        lv_anim_set_values(&zoom_anim, 768, 0);
+        lv_anim_set_time(&zoom_anim, 1000);
+        lv_anim_set_path_cb(&zoom_anim, lv_anim_path_ease_out);
+        lv_anim_set_exec_cb(&zoom_anim, jump_overlay_zoom_exec);
+        lv_anim_set_ready_cb(&zoom_anim, jump_overlay_anim_ready);
+        lv_anim_start(&zoom_anim);
+
+        lv_anim_t fade_anim;
+        lv_anim_init(&fade_anim);
+        lv_anim_set_var(&fade_anim, jump_overlay_label);
+        lv_anim_set_values(&fade_anim, LV_OPA_COVER, LV_OPA_TRANSP);
+        lv_anim_set_time(&fade_anim, 1000);
+        lv_anim_set_path_cb(&fade_anim, lv_anim_path_ease_out);
+        lv_anim_set_exec_cb(&fade_anim, jump_overlay_opa_exec);
+        lv_anim_start(&fade_anim);
+      }
+    }
+    
     xSemaphoreGive(lvglMutex);
   }
   checkBleConnection();
@@ -1657,6 +2095,11 @@ void loop()
     // Print task stack high water marks
     UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
     Serial.printf("[STACK] MSG_Handler high water mark: %d bytes free\n", stackHighWater * 4);
+    
+    // Update system info if on settings page
+    if (currentPage == 2) {
+      updateSystemInfo();
+    }
     
     lastHeapPrint = currentTime;
   }
@@ -1736,10 +2179,10 @@ void loop()
   }
   silverMidWasPressed = silverMidPressed;
   
-  // Handle SILVER_RIGHT - reserved for page 2 (future)
+  // Handle SILVER_RIGHT - switch to page 2 (System Settings)
   if (silverRightPressed && !silverRightWasPressed) {
-    // Reserved for third page
-    Serial.println("Page: Reserved (2)");
+    switchToPage(2);
+    Serial.println("Page: System Settings (2)");
   }
   silverRightWasPressed = silverRightPressed;
   
@@ -1770,4 +2213,81 @@ void loop()
   }
   
   delay(5);
+}
+
+static void jump_overlay_zoom_exec(void* obj, int32_t value) {
+  lv_obj_set_style_transform_zoom(static_cast<lv_obj_t*>(obj), value, LV_PART_MAIN);
+}
+
+static void jump_overlay_opa_exec(void* obj, int32_t value) {
+  lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), (lv_opa_t)value, LV_PART_MAIN);
+}
+
+static void jump_overlay_anim_ready(lv_anim_t* anim) {
+  lv_obj_t* obj = static_cast<lv_obj_t*>(anim->var);
+  if (obj) {
+    lv_obj_del_async(obj);
+    if (obj == jump_overlay_label) {
+      jump_overlay_label = nullptr;
+    }
+  }
+}
+
+void showJumpOverlay(int jumps) {
+  return; // Disabled for now, battle the freezing issue
+  if (!lvglMutex) return;
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (jump_overlay_label) {
+      lv_obj_del(jump_overlay_label);
+      jump_overlay_label = nullptr;
+    }
+    lv_obj_t* parent = lv_scr_act();
+    if (!parent) {
+      xSemaphoreGive(lvglMutex);
+      return;
+    }
+    jump_overlay_label = lv_label_create(parent);
+    lv_label_set_text_fmt(jump_overlay_label, "%d", jumps);
+    lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
+    lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
+    lv_obj_center(jump_overlay_label);
+    lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
+    lv_obj_set_style_transform_zoom(jump_overlay_label, 768, LV_PART_MAIN);
+    lv_obj_update_layout(jump_overlay_label);
+    lv_coord_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
+    lv_coord_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
+    lv_obj_set_style_transform_pivot_x(jump_overlay_label, pivotX, LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(jump_overlay_label, pivotY, LV_PART_MAIN);
+
+    lv_anim_t zoom_anim;
+    lv_anim_init(&zoom_anim);
+    lv_anim_set_var(&zoom_anim, jump_overlay_label);
+    lv_anim_set_values(&zoom_anim, 768, 0);
+    lv_anim_set_time(&zoom_anim, 1000);
+    lv_anim_set_path_cb(&zoom_anim, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&zoom_anim, jump_overlay_zoom_exec);
+    lv_anim_set_ready_cb(&zoom_anim, jump_overlay_anim_ready);
+    lv_anim_start(&zoom_anim);
+
+    lv_anim_t fade_anim;
+    lv_anim_init(&fade_anim);
+    lv_anim_set_var(&fade_anim, jump_overlay_label);
+    lv_anim_set_values(&fade_anim, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&fade_anim, 1000);
+    lv_anim_set_path_cb(&fade_anim, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&fade_anim, jump_overlay_opa_exec);
+    lv_anim_start(&fade_anim);
+
+    xSemaphoreGive(lvglMutex);
+  }
+}
+
+void updateJumpsRemaining(int newValue) {
+  if (newValue < 0) newValue = 0;
+  bool changed = navRouteInfo.jumpsRemaining != newValue;
+  navRouteInfo.jumpsRemaining = newValue;
+  if (changed) {
+    pendingJumpOverlay = true;
+    pendingJumpValue = newValue;
+  }
 }
