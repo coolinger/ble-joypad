@@ -23,8 +23,8 @@ using namespace websockets;
 #define BUZZER_PIN 5
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
-#define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 30)
-uint32_t buf[LVGL_BUFFER_SIZE / 4];
+#define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10)  // Larger buffer with PSRAM
+uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define INT_N_PIN 17
 #define RST_N_PIN 18
 
@@ -141,7 +141,7 @@ uint32_t lastBlinkTime = 0;
 WiFiUDP udpReceiver;  // Core 0 - receives messages on UDP_PORT
 WiFiUDP udpSender;    // Core 1 - sends SUMMARY requests
 char* udpBuffer = nullptr;
-const int UDP_BUFFER_SIZE = 2048;
+const int UDP_BUFFER_SIZE = 8192;  // Increased for PSRAM
 int lastEventId = -1;  // Track last event ID for deduplication
 
 // WebSocket variables for Elite Dangerous data
@@ -403,7 +403,7 @@ void create_fighter_ui()
   lv_obj_add_event_cb(btnmatrix, btnmatrix_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
-// Helper function to print heap status
+// Helper function to print heap status including PSRAM
 void printHeapStatus(const char* location) {
 
   //disable it for now, but leave the code here for future debugging
@@ -413,9 +413,14 @@ void printHeapStatus(const char* location) {
   size_t freeHeap = esp_get_free_heap_size();
   size_t minFreeHeap = esp_get_minimum_free_heap_size();
   size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t totalPSRAM = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   
   Serial.printf("[HEAP %s] Free: %d bytes, Min: %d bytes, Largest block: %d bytes\n",
     location, freeHeap, minFreeHeap, largestBlock);
+  Serial.printf("[PSRAM %s] Free: %d / %d bytes (%.1f%%), Internal RAM: %d bytes\n",
+    location, freePSRAM, totalPSRAM, (freePSRAM * 100.0 / totalPSRAM), freeInternal);
 }
 
 void updateCargoBar() {
@@ -540,7 +545,7 @@ void updateHeader() {
 }
 
 static char* logText = nullptr;  // Allocated on heap
-static const int LOG_TEXT_SIZE = 600;  // Increased buffer size for 9 entries
+static const int LOG_TEXT_SIZE = 2048;  // Large buffer with PSRAM for more log entries
 
 void updateLogDisplay() {
   if (!log_label || !logText) return;  // Check logText is allocated
@@ -909,6 +914,9 @@ void updateSystemInfo() {
     size_t freeHeap = esp_get_free_heap_size();
     size_t minFreeHeap = esp_get_minimum_free_heap_size();
     size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t freePSRAM = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t totalPSRAM = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     
     // Get CPU utilization (approximate via task runtime)
     UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
@@ -930,8 +938,8 @@ void updateSystemInfo() {
     snprintf(buf, sizeof(buf),
       "SYSTEM INFORMATION\n\n"
       "Memory:\n"
-      "  Free: %d KB\n"
-      "  Min Free: %d KB\n"
+      "  Internal RAM: %d KB\n"
+      "  PSRAM: %d / %d KB (%.0f%%)\n"
       "  Largest Block: %d KB\n\n"
       "WiFi: %s\n"
       "  IP: %s\n"
@@ -940,7 +948,9 @@ void updateSystemInfo() {
       "  Server: %s:%d\n\n"
       "Task Stack Free: %d bytes\n\n"
       "Uptime: %lu sec",
-      freeHeap / 1024, minFreeHeap / 1024, largestBlock / 1024,
+      freeInternal / 1024,
+      freePSRAM / 1024, totalPSRAM / 1024, (freePSRAM * 100.0 / totalPSRAM),
+      largestBlock / 1024,
       wifiStatus.c_str(), wifiIP.c_str(), rssi,
       wsStatus.c_str(), serverIP.c_str(), websocketPort,
       stackHighWater * 4,
@@ -1943,12 +1953,23 @@ void WifiConnect()
 void setup()
 {
   Serial.begin(115200);
-  udpBuffer = (char*)malloc(UDP_BUFFER_SIZE);  // Allocates from HEAP
-  logText = (char*)malloc(LOG_TEXT_SIZE);  // Allocates from HEAP
-  if (!udpBuffer || !logText) {
-    Serial.println("ERROR: Failed to allocate buffers!");
+  
+  // Allocate large buffers from PSRAM
+  buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  
+  if (!buf || !udpBuffer || !logText) {
+    Serial.println("ERROR: Failed to allocate PSRAM buffers!");
+    Serial.printf("buf: %p, udpBuffer: %p, logText: %p\n", buf, udpBuffer, logText);
+    Serial.printf("Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     while(1);
   }
+  
+  Serial.printf("[PSRAM] Allocated buffers - LVGL: %d, UDP: %d, Log: %d bytes\n", 
+                LVGL_BUFFER_SIZE, UDP_BUFFER_SIZE, LOG_TEXT_SIZE);
+  Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   delay(500);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
@@ -1987,7 +2008,7 @@ void setup()
   xTaskCreatePinnedToCore(
     loop2,              // Task function
     "MSG_Handler",      // Task name
-    16384,              // Stack size (16KB - increased for WebSocket + JSON parsing)
+    32768,              // Stack size (32KB - increased with PSRAM for WebSocket + JSON parsing)
     NULL,               // Parameters
     2,                  // Priority (2 = higher than default)
     &udpTaskHandle,     // Task handle
