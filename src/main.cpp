@@ -254,51 +254,40 @@ static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
                                   "Position", "Formation", "Befehle", ""};
 
-// Buzzer helper functions
+// Buzzer helper functions - DISABLED on ESP32S3 (tone() uses LEDC which conflicts)
 void beepShort() {
-  tone(BUZZER_PIN, 2000, 50);  // 2kHz for 50ms
+  // tone() disabled - uses LEDC
 }
 
 void beepClick() {
-  tone(BUZZER_PIN, 3000, 30);  // 3kHz for 30ms (short click)
+  // tone() disabled - uses LEDC
 }
 
 void beepConnect() {
-  tone(BUZZER_PIN, 1500, 100);  // 1.5kHz for 100ms
-  delay(120);
-  tone(BUZZER_PIN, 2000, 100);  // 2kHz for 100ms (rising tone)
+  // tone() disabled - uses LEDC
 }
 
 void beepDisconnect() {
-  tone(BUZZER_PIN, 2000, 100);  // 2kHz for 100ms
-  delay(120);
-  tone(BUZZER_PIN, 1500, 100);  // 1.5kHz for 100ms (falling tone)
+  // tone() disabled - uses LEDC
 }
 
 void beepMotherlode() {
-  for (int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, 3000, 100);  // 3kHz urgent beeps
-    delay(150);
-  }
+  // tone() disabled - uses LEDC
 }
 
 void beepBootup() {
-  tone(BUZZER_PIN, 1000, 100);
-  delay(120);
-  tone(BUZZER_PIN, 1500, 100);
-  delay(120);
-  tone(BUZZER_PIN, 2000, 100);
+  // tone() disabled - uses LEDC
 }
 
 void setDisplayPower(bool on)
 {
   if (on && !displayOn) {
-    digitalWrite(27, HIGH); // Turn on backlight
+    digitalWrite(45, HIGH); // Turn on backlight
     displayOn = true;
     beepShort();  // Beep when display wakes up
     Serial.println("Display ON");
   } else if (!on && displayOn) {
-    digitalWrite(27, LOW); // Turn off backlight
+    digitalWrite(45, LOW); // Turn off backlight
     displayOn = false;
     Serial.println("Display OFF");
   }
@@ -1116,7 +1105,7 @@ void init_display()
   tft.setRotation(3);
   tft.initDMA();
   tft.fillScreen(TFT_BLACK);*/
-  digitalWrite(27, HIGH);
+  digitalWrite(45, HIGH);
 
   initTouch();
 
@@ -1953,9 +1942,9 @@ void setup()
   Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   delay(500);
-  pinMode(BUZZER_PIN, OUTPUT);
+  // pinMode(BUZZER_PIN, OUTPUT);  // Disabled - buzzer uses LEDC on ESP32S3
   
-  beepBootup();  // Play three startup tones
+  // beepBootup();  // Disabled - tone() uses LEDC
   delay(200);
   
   WifiConnect();
@@ -2110,10 +2099,10 @@ void loop()
   if (blinkScreen && blinkCount > 0) {
     if (millis() - lastBlinkTime > 200) {  // Blink every 200ms
       if (displayOn) {
-        digitalWrite(27, LOW);
+        digitalWrite(45, LOW);
         displayOn = false;
       } else {
-        digitalWrite(27, HIGH);
+        digitalWrite(45, HIGH);
         displayOn = true;
       }
       blinkCount--;
@@ -2121,7 +2110,7 @@ void loop()
       
       if (blinkCount == 0) {
         blinkScreen = false;
-        digitalWrite(27, HIGH);
+        digitalWrite(45, HIGH);
         displayOn = true;
       }
     }
