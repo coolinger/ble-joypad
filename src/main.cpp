@@ -9,13 +9,14 @@
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
 #include <esp_heap_caps.h>
+#include <FT6336U.h>
 
 using namespace websockets;
 
 
 #define PCF8575_ADDR 0x20
-#define I2C_SDA 21
-#define I2C_SCL 22
+#define I2C_SDA 16
+#define I2C_SCL 15
 #define LED_R 4
 #define LED_G 16
 #define LED_B 17
@@ -24,9 +25,8 @@ using namespace websockets;
 #define SCREEN_HEIGHT 240
 #define LVGL_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 30)
 uint32_t buf[LVGL_BUFFER_SIZE / 4];
-#define TOUCH_SDA 33
-#define TOUCH_SCL 32
-#define CST820_I2C_ADDR 0x15
+#define INT_N_PIN 17
+#define RST_N_PIN 18
 
 
 
@@ -344,18 +344,14 @@ static void btnmatrix_event_handler(lv_event_t * e)
 }
 
 
+FT6336U ft6336u(I2C_SDA, I2C_SCL, RST_N_PIN, INT_N_PIN);
+FT6336U_TouchPointType tp;
+
 void initTouch()
 {
   Serial.println("Init Touch");
-  Wire1.begin(TOUCH_SDA, TOUCH_SCL);
-  Wire1.beginTransmission(CST820_I2C_ADDR);
-  uint8_t error = Wire1.endTransmission();
-  if (error == 0) {
-    Serial.println("CST820 found on I2C bus");
-  } else {
-    Serial.printf("CST820 NOT found! Error: %d\n", error);
-  }
-  Wire1.end();
+  ft6336u.begin();
+  Serial.println("FT6336U touch initialized");
 }
 
 /*void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, unsigned char *color_p)
@@ -1072,21 +1068,9 @@ void switchToPage(int page) {
 }
 
 static void touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
-
-  int x, y;
-
-  uint8_t touchdata[5];
-  Wire1.begin(TOUCH_SDA, TOUCH_SCL);
-  Wire1.beginTransmission(CST820_I2C_ADDR);
-  Wire1.write(0x02);
-  Wire1.endTransmission(false);
-  Wire1.requestFrom(CST820_I2C_ADDR, 5);
-  for (int i = 0; i < 5; i++) {
-    touchdata[i] = Wire1.read();
-  }
-  Wire1.end();
+  tp = ft6336u.scan();
   
-  if (touchdata[0] == 0 || touchdata[0] == 0xFF) {
+  if (tp.touch_count == 0) {
     data->state = LV_INDEV_STATE_RELEASED;
     return;
   }
@@ -1101,27 +1085,18 @@ static void touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
     return;
   }
   
-  // Read raw touch coordinates
-  int raw_x = ((touchdata[1] & 0x0f) << 8) | touchdata[2];
-  int raw_y = ((touchdata[3] & 0x0f) << 8) | touchdata[4];
+  // Read touch coordinates from FT6336U
+  int x = tp.tp[0].x;
+  int y = tp.tp[0].y;
   
-  // Correct for orientation.
-  // (Mostly done by LVGL, it just has the axes inverted in landscape somehow.)
-  lv_display_rotation_t rotation = lv_display_get_rotation(disp);
-  if (rotation == LV_DISPLAY_ROTATION_90 || rotation == LV_DISPLAY_ROTATION_270) {
-    x = SCREEN_HEIGHT - raw_x;
-    y = SCREEN_WIDTH - raw_y;
+  // Verify coordinates are within screen bounds
+  if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = x;
+    data->point.y = y;
   } else {
-    x = raw_x;
-    y = raw_y;
+    data->state = LV_INDEV_STATE_RELEASED;
   }
-
-  data->point.x = x;
-  data->point.y = y;
-  data->state = LV_INDEV_STATE_PRESSED;
-
-  //Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", raw_x, raw_y, x, y);
-
 }
 
 // LVGL logging callback
