@@ -1,0 +1,22 @@
+GPIO Pinout Table
+To learn what each GPIO corresponds to, please refer to the following table.
+The functions of the pins are allocated as follows:
+ESP32-S3 Functions Description
+GPIO42 DIN RGB
+GPIO38 SD_CLK SD Card
+GPIO40 SD_CMD SD Card
+GPIO39 SD_D0 SD Card
+GPIO41 SD_D1 SD Card
+GPIO48 SD_D2 SD Card
+GPIO47 SD_D3 SD Card
+GPIO10 TFT_CS TFT_LCD
+GPIO11 TFT_MOSI TFT_LCD
+GPIO12 TFT_SCK TFT_LCD
+GPIO13 TFT_MISO TFT_LCD
+GPIO45 TFT_BL TFT_LCD
+GPIO46 TFT_DC TFT_LCD
+GPIO19 USB_D USB
+GPIO20 USB_D+ USB
+GPIO43 TXD0
+Serial
+GPIO44 RXD0
