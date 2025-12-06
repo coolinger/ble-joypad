@@ -1098,24 +1098,21 @@ void my_print(lv_log_level_t level, const char * buf)
 
 void init_display()
 {
-
-  
-
-  /*tft.begin();
-  tft.setRotation(3);
-  tft.initDMA();
-  tft.fillScreen(TFT_BLACK);*/
+  Serial.println("[DISPLAY] Setting backlight HIGH...");
   digitalWrite(45, HIGH);
 
+  Serial.println("[DISPLAY] Initializing touch controller...");
   initTouch();
 
+  Serial.println("[LVGL] Initializing LVGL...");
   lv_init();
   lv_tick_set_cb([]() -> uint32_t { return millis(); });
   lv_log_register_print_cb(my_print);
 
-  //disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
-  disp = lv_tft_espi_create(SCREEN_HEIGHT, SCREEN_WIDTH, buf, sizeof(buf));
+  Serial.printf("[LVGL] Creating display with buffer: %p, size: %d bytes\n", buf, LVGL_BUFFER_SIZE);
+  disp = lv_tft_espi_create(SCREEN_HEIGHT, SCREEN_WIDTH, buf, LVGL_BUFFER_SIZE);
   lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+  Serial.println("[LVGL] Display created");
   //lv_display_set_flush_cb(disp, lvgl_flush_cb);
   //lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
@@ -1134,13 +1131,18 @@ void init_display()
 
 
 
+  Serial.println("[LVGL] Creating input device...");
   lv_indev_t* indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, touch_read);
 
+  Serial.println("[UI] Creating fighter UI...");
   create_fighter_ui();
+  Serial.println("[UI] Creating logviewer UI...");
   create_logviewer_ui();
-  lv_scr_load(logviewer_screen);  // Start on page 2 (logviewer)
+  Serial.println("[UI] Loading logviewer screen...");
+  lv_scr_load(logviewer_screen);
+  Serial.println("[DISPLAY] Initialization complete!");
 }
 
 void checkBleConnection()
@@ -1924,45 +1926,80 @@ void WifiConnect()
 void setup()
 {
   Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
   
-  // Allocate large buffers from PSRAM
-  buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  
-  if (!buf || !udpBuffer || !logText) {
-    Serial.println("ERROR: Failed to allocate PSRAM buffers!");
-    Serial.printf("buf: %p, udpBuffer: %p, logText: %p\n", buf, udpBuffer, logText);
-    Serial.printf("Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    while(1);
+  // Check PSRAM availability
+  Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
+  if (psramFound()) {
+    Serial.printf("[PSRAM] Total: %d bytes\n", ESP.getPsramSize());
+    Serial.printf("[PSRAM] Free: %d bytes\n", ESP.getFreePsram());
   }
   
-  Serial.printf("[PSRAM] Allocated buffers - LVGL: %d, UDP: %d, Log: %d bytes\n", 
+  // Allocate large buffers from PSRAM (fallback to internal if PSRAM not available)
+  Serial.println("[MEM] Allocating buffers...");
+  buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) {
+    Serial.println("[MEM] PSRAM allocation failed, trying internal RAM...");
+    buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  
+  udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!udpBuffer) {
+    Serial.println("[MEM] PSRAM allocation failed for UDP buffer, trying internal RAM...");
+    udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  
+  logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!logText) {
+    Serial.println("[MEM] PSRAM allocation failed for log buffer, trying internal RAM...");
+    logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  
+  if (!buf || !udpBuffer || !logText) {
+    Serial.println("ERROR: Failed to allocate buffers!");
+    Serial.printf("buf: %p, udpBuffer: %p, logText: %p\n", buf, udpBuffer, logText);
+    while(1) delay(1000);
+  }
+  
+  Serial.printf("[MEM] Buffers allocated - LVGL: %d, UDP: %d, Log: %d bytes\n", 
                 LVGL_BUFFER_SIZE, UDP_BUFFER_SIZE, LOG_TEXT_SIZE);
-  Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  if (psramFound()) {
+    Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  }
   delay(500);
   // pinMode(BUZZER_PIN, OUTPUT);  // Disabled - buzzer uses LEDC on ESP32S3
   
   // beepBootup();  // Disabled - tone() uses LEDC
   delay(200);
   
+  Serial.println("[WIFI] Connecting...");
   WifiConnect();
   delay(500);
+  
   // Initialize display power management
+  Serial.println("[INIT] Setting up display power management...");
   lastTouchTime = millis();
   lastBleActiveTime = millis();
   bleDisconnectedTime = millis();
 
+  Serial.println("[I2C] Initializing I2C bus...");
   Wire.begin(I2C_SDA, I2C_SCL);
+  
+  Serial.println("[PCF8575] Initializing button controller...");
   pcf.begin();
 
+  Serial.println("[BLE] Configuring gamepad...");
   bleGamepadConfig.setButtonCount(20);
   bleGamepadConfig.setIncludeRxAxis(false);
   bleGamepadConfig.setWhichAxes(false, false, false, false, false, false, false, false);
   bleGamepadConfig.setHatSwitchCount(0);
 
+  Serial.println("[BLE] Starting BLE gamepad...");
   bleGamepad.begin(&bleGamepadConfig);
+  
+  Serial.println("[DISPLAY] Initializing display and LVGL...");
   init_display();
   
   // Create mutex for LVGL thread safety
