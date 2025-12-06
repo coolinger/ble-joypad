@@ -60,8 +60,8 @@ const uint8_t buttonPins[12] = {
     BLACK, WHITE, RED,
     YELLOW, BLUE, GREEN,
     LARGE_YELLOW, LARGE_BLUE, LARGE_GREEN};
-PCF8575 pcf(PCF8575_ADDR);
-BleGamepad bleGamepad("CoolJoyBLE", "leDev", 100);
+PCF8575* pcf = nullptr;
+BleGamepad* bleGamepad = nullptr;
 BleGamepadConfiguration bleGamepadConfig;
 uint16_t lastButtonState = 0;
 bool bleConnected = false;
@@ -305,30 +305,33 @@ static void btnmatrix_event_handler(lv_event_t * e)
         if (cmd_idx == 20) {
             Serial.println("Befehle oeffnen/schliessen");
             beepClick();  // Click sound for button press
-            bleGamepad.press(20);
+            bleGamepad->press(20);
             delay(50);
-            bleGamepad.release(20);
+            bleGamepad->release(20);
         } else if (cmd_idx < 8) {
             FighterCommand cmd;
             memcpy_P(&cmd, &commands[cmd_idx], sizeof(FighterCommand));
             
             Serial.printf("Command: %s (Button %d)\n", cmd.name, cmd.button_id);
             beepClick();  // Click sound for button press
-            bleGamepad.press(cmd.button_id);
+            bleGamepad->press(cmd.button_id);
             delay(50);
-            bleGamepad.release(cmd.button_id);
+            bleGamepad->release(cmd.button_id);
         }
     }
 }
 
 
-FT6336U ft6336u(I2C_SDA, I2C_SCL, RST_N_PIN, INT_N_PIN);
+FT6336U* ft6336u = nullptr;
 FT6336U_TouchPointType tp;
 
 void initTouch()
 {
   Serial.println("Init Touch");
-  ft6336u.begin();
+  if (!ft6336u) {
+    ft6336u = new FT6336U(I2C_SDA, I2C_SCL, RST_N_PIN, INT_N_PIN);
+  }
+  ft6336u->begin();
   Serial.println("FT6336U touch initialized");
 }
 
@@ -511,7 +514,7 @@ void updateHeader() {
   
   // Update Bluetooth icon
   if (bluetooth_icon) {
-    if (bleGamepad.isConnected()) {
+    if (bleGamepad && bleGamepad->isConnected()) {
       lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
     } else {
       lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
@@ -1056,7 +1059,7 @@ void switchToPage(int page) {
 }
 
 static void touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
-  tp = ft6336u.scan();
+  tp = ft6336u->scan();
   
   if (tp.touch_count == 0) {
     data->state = LV_INDEV_STATE_RELEASED;
@@ -1147,7 +1150,7 @@ void init_display()
 
 void checkBleConnection()
 {
-  if (bleGamepad.isConnected())
+  if (bleGamepad && bleGamepad->isConnected())
   {
     if (!bleConnected)
     {
@@ -1987,17 +1990,19 @@ void setup()
   Serial.println("[I2C] Initializing I2C bus...");
   Wire.begin(I2C_SDA, I2C_SCL);
   
-  Serial.println("[PCF8575] Initializing button controller...");
-  pcf.begin();
+  Serial.println("[PCF8575] Creating button controller...");
+  pcf = new PCF8575(PCF8575_ADDR);
+  pcf->begin();
 
-  Serial.println("[BLE] Configuring gamepad...");
+  Serial.println("[BLE] Creating and configuring gamepad...");
+  bleGamepad = new BleGamepad("CoolJoyBLE", "leDev", 100);
   bleGamepadConfig.setButtonCount(20);
   bleGamepadConfig.setIncludeRxAxis(false);
   bleGamepadConfig.setWhichAxes(false, false, false, false, false, false, false, false);
   bleGamepadConfig.setHatSwitchCount(0);
 
   Serial.println("[BLE] Starting BLE gamepad...");
-  bleGamepad.begin(&bleGamepadConfig);
+  bleGamepad->begin(&bleGamepadConfig);
   
   Serial.println("[DISPLAY] Initializing display and LVGL...");
   init_display();
@@ -2154,7 +2159,7 @@ void loop()
   }
   
   // Read PCF8575 state
-  uint16_t pcfState = pcf.read16();
+  uint16_t pcfState = pcf->read16();
   bool anyPressed = false;
   
   // Check SILVER buttons for page switching (first 3 buttons) - always available
@@ -2195,18 +2200,18 @@ void loop()
       
       if (pressed != lastPressed) {
         if (pressed) {
-          bleGamepad.press(i + 1);
+          bleGamepad->press(i + 1);
           Serial.printf("Button %d pressed\n", i + 1);
           anyPressed = true;
           lastButtonState |= (1 << i);
         } else {
-          bleGamepad.release(i + 1);
+          bleGamepad->release(i + 1);
           Serial.printf("Button %d released\n", i + 1);
           lastButtonState &= ~(1 << i);
         }
       }
     }
-    bleGamepad.sendReport();
+    bleGamepad->sendReport();
   }
   
   delay(5);
