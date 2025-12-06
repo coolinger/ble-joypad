@@ -4,6 +4,7 @@
 #include <BleGamepad.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#include <lv_port_disp.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
