@@ -1103,6 +1103,7 @@ void my_print(lv_log_level_t level, const char * buf)
 void init_display()
 {
   Serial.println("[DISPLAY] Setting backlight HIGH...");
+  pinMode(45, OUTPUT);
   digitalWrite(45, HIGH);
 
   Serial.println("[DISPLAY] Initializing touch controller...");
@@ -1113,10 +1114,18 @@ void init_display()
   lv_tick_set_cb([]() -> uint32_t { return millis(); });
   lv_log_register_print_cb(my_print);
 
-  Serial.printf("[LVGL] Creating display with buffer: %p, size: %d bytes (pixels: %d)\n", 
+  Serial.println("[LVGL] Creating TFT_eSPI display driver...");
+  Serial.printf("[LVGL] Buffer: %p, size: %d bytes (pixels: %d)\n", 
                 buf, LVGL_BUFFER_SIZE, LVGL_BUFFER_PIXELS);
-  disp = lv_tft_espi_create(SCREEN_HEIGHT, SCREEN_WIDTH, buf, LVGL_BUFFER_SIZE);
-  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+  
+  // Try with width and height in correct order for the helper function
+  disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, buf, LVGL_BUFFER_SIZE);
+  if (!disp) {
+    Serial.println("[LVGL] ERROR: Failed to create display!");
+    while(1) delay(1000);
+  }
+  
+  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
   Serial.println("[LVGL] Display created");
   //lv_display_set_flush_cb(disp, lvgl_flush_cb);
   //lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
