@@ -4,3 +4,7 @@
 .vscode/launch.json
 .vscode/ipch
 .vscode
+lib/lvgl
+lib/TFT_eSPI
+lib/TFT_eSPI_Setups
+lib/FT6336U_CTP_Controller

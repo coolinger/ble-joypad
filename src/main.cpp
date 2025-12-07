@@ -1,19 +1,40 @@
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <PCF8575.h>
 #include <BleGamepad.h>
-#include <TFT_eSPI.h>
-#include <lvgl.h>
-#include <lv_port_disp.h>
+#include "display.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
 #include <esp_heap_caps.h>
-#include <FT6336U.h>
+#include "es8311.h"
+#ifdef ESP_IDF_VERSION
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+    #define USE_NEW_I2S_API 1
+    #include <ESP_I2S.h>
+#else
+    #define USE_NEW_I2S_API 0
+    #include "driver/i2s.h"
+  #endif
+#else
+  #define USE_NEW_I2S_API 0
+#endif
+
 
 using namespace websockets;
 
+
+
+//AUDIO config
+#define BEEP_BOOT 0
+#define BEEP_ERROR 1
+#define BEEP_CONNECT 0
+#define BEEP_DISCONNECT 0
+#define BEEP_SHORT 1
+#define BEEP_MOTHERLODE 1
+#define BEEP_CLICK 1
 
 #define PCF8575_ADDR 0x20
 #define I2C_SDA 16
@@ -22,24 +43,32 @@ using namespace websockets;
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 #define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 10)  // Buffer in pixels
-#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * sizeof(lv_color_t))  // Buffer in bytes
+//#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * sizeof(lv_color_t))  // Buffer in bytes
+#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * 4)  // Buffer in bytes for ARGB8888
 uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define INT_N_PIN 17
 #define RST_N_PIN 18
 
+#define I2S_MCK 4
+#define I2S_BCK 5
+#define I2S_DINT 6
+#define I2S_DOUT 8
+#define I2S_WS 7
+#define I2C_SPEED 400000
 
+// Audio clocking
+static const int AUDIO_SAMPLE_RATE = 44100;           // match ES8311 config
+static const int AUDIO_MCLK_HZ    = 11289600;         // 44.1k * 256
+
+int AUDIO_TONE_AMPL  = 6000;             // reduce beep loudness
 
 #include "colors.h"
-/*
-//definiere Farben aus HTML Farbcode
-#define COLOR_BG lv_color_hex(0x250700)
-#define COLOR_FG lv_color_hex(0xdc5904)
-#define COLOR_BAR_FG lv_color_hex(0x7e5407)
-#define COLOR_BAR_BG lv_color_hex(0x4a1504)
-#define COLOR_ALERT lv_color_hex(0xff0000)
-*/
 
+// Global flags
+bool i2sInitialized = false;
 
+#define ARDUINO_USB_MODE 1
+#define ARDUINO_USB_CDC_ON_BOOT 1
 // Button mapping (PCF8575 pins)
 enum ButtonIndex
 {
@@ -70,7 +99,8 @@ bool bleConnected = false;
 
 // Display and LVGL objects
 //TFT_eSPI tft = TFT_eSPI();
-static lv_display_t* disp;
+//static lv_display_t* disp;
+Display disp;
 
 // Fighter command structure
 struct FighterCommand
@@ -218,6 +248,8 @@ lv_obj_t *energycell_label;
 lv_obj_t *bioscan_label;
 lv_obj_t *bioscan_data_label;
 lv_obj_t *jump_overlay_label;
+lv_obj_t *amplitude_slider;
+lv_obj_t *amplitude_value_label;
 int currentPage = 1;  // 0 = fighter, 1 = logviewer, 2 = settings (start on page 1)
 bool pendingJumpOverlay = false;
 int pendingJumpValue = 0;
@@ -235,6 +267,17 @@ uint32_t bleDisconnectedTime = 0;
 const uint32_t DISPLAY_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 const uint32_t LED_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 bool ledOn = true;
+
+// Forward declaration for display power control
+void setDisplayPower(bool on);
+
+static void handleTouchActivity()
+{
+  lastTouchTime = millis();
+  if (!displayOn) {
+    setDisplayPower(true);
+  }
+}
 
 // WiFi reconnection management
 uint32_t lastWifiCheck = 0;
@@ -256,29 +299,71 @@ static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
                                   "Position", "Formation", "Befehle", ""};
 
-// Buzzer helper functions - DISABLED on ESP32S3 (tone() uses LEDC which conflicts)
+// Audio helper functions using I2S
+void playTone(uint16_t frequency, uint16_t duration_ms) {
+  // Safety check: don't play if I2S not initialized
+  if (!i2sInitialized) {
+    Serial.println("I2S not initialized, cannot play tone");
+    return;
+  }
+  
+  size_t bytes_written = 0;
+
+  // Generate a simple sine wave tone (stereo L+R same sample)
+  const int sampleRate = AUDIO_SAMPLE_RATE;
+  const int samples = (sampleRate * duration_ms) / 1000;
+  int16_t* buffer = (int16_t*)malloc(samples * 2 * sizeof(int16_t)); // stereo buffer
+  
+  if (buffer) {
+    for (int i = 0; i < samples; i++) {
+      float t = (float)i / sampleRate;
+      int16_t s = (int16_t)(sin(2.0 * PI * frequency * t) * AUDIO_TONE_AMPL);
+      buffer[i * 2]     = s; // Left
+      buffer[i * 2 + 1] = s; // Right
+    }
+    
+    // Write mono samples to I2S
+    esp_err_t err = i2s_write(I2S_NUM_0, buffer, samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+    Serial.printf("[I2S] write err=%d bytes=%u\n", (int)err, (unsigned)bytes_written);
+    
+    free(buffer);
+  }
+}
+
 void beepShort() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_SHORT)
+  playTone(1000, 50);
+  #endif
 }
 
 void beepClick() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_CLICK)
+  playTone(800, 20);
+  #endif
 }
 
 void beepConnect() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_CONNECT)
+  playTone(1200, 100);
+  #endif
 }
 
 void beepDisconnect() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_DISCONNECT)
+  playTone(600, 100);
+  #endif
 }
 
 void beepMotherlode() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_MOTHERLODE)
+  playTone(1500, 200);
+  #endif
 }
 
 void beepBootup() {
-  // tone() disabled - uses LEDC
+  #if (BEEP_BOOT)
+  playTone(1000, 150);
+  #endif
 }
 
 void setDisplayPower(bool on)
@@ -322,31 +407,6 @@ static void btnmatrix_event_handler(lv_event_t * e)
         }
     }
 }
-
-
-FT6336U* ft6336u = nullptr;
-FT6336U_TouchPointType tp;
-
-void initTouch()
-{
-  Serial.println("Init Touch");
-  if (!ft6336u) {
-    ft6336u = new FT6336U(I2C_SDA, I2C_SCL, RST_N_PIN, INT_N_PIN);
-  }
-  ft6336u->begin();
-  Serial.println("FT6336U touch initialized");
-}
-
-/*void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, unsigned char *color_p)
-{
-  uint32_t w = (area->x2 - area->x1 + 1);
-  uint32_t h = (area->y2 - area->y1 + 1);
-  tft.startWrite();
-  tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushColors((uint16_t *)color_p, w * h, true);
-  tft.endWrite();
-  lv_display_flush_ready(disp);
-}*/
 
 void create_fighter_ui()
 {
@@ -466,6 +526,35 @@ void updateBackpackDisplay() {
     xSemaphoreGive(lvglMutex);
   }
 }
+void update_wifi_icon() {
+    // Update WiFi icon color based on signal quality
+  if (wifi_icon) {
+    if (WiFi.status() == WL_CONNECTED) {
+      int rssi = WiFi.RSSI();
+      if (rssi > -50) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x006400), 0);  // darkgreen - Excellent
+      } else if (rssi > -60) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x9ACD32), 0);  // yellowgreen - Good
+      } else if (rssi > -70) {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFFA500), 0);  // orange - Fair
+      } else {
+        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF0000), 0);  // red - Weak
+      }
+    } else {
+      lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
+    }
+  }
+}
+void update_bluetooth_icon() {
+    // Update Bluetooth icon
+  if (bluetooth_icon) {
+    if (bleGamepad && bleGamepad->isConnected()) {
+      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
+    } else {
+      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
+    }
+  }
+}
 
 void updateHeader() {
   if (!header_label) return;
@@ -487,24 +576,7 @@ void updateHeader() {
     lv_bar_set_value(hull_bar, (int)(hullInfo.hullHealth * 100.0f), LV_ANIM_OFF);
   }
   
-  // Update WiFi icon color based on signal quality
-  if (wifi_icon) {
-    if (WiFi.status() == WL_CONNECTED) {
-      int rssi = WiFi.RSSI();
-      if (rssi > -50) {
-        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x006400), 0);  // darkgreen - Excellent
-      } else if (rssi > -60) {
-        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x9ACD32), 0);  // yellowgreen - Good
-      } else if (rssi > -70) {
-        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFFA500), 0);  // orange - Fair
-      } else {
-        lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF0000), 0);  // red - Weak
-      }
-    } else {
-      lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
-    }
-  }
-  
+  update_wifi_icon();  
   // Update WebSocket icon
   if (websocket_icon) {
     if (useWebSocket && wsClient.available()) {
@@ -513,15 +585,8 @@ void updateHeader() {
       lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // black - not connected
     }
   }
+  update_bluetooth_icon();
   
-  // Update Bluetooth icon
-  if (bluetooth_icon) {
-    if (bleGamepad && bleGamepad->isConnected()) {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
-    } else {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
-    }
-  }
     
     xSemaphoreGive(lvglMutex);
   }
@@ -889,6 +954,27 @@ static void reboot_handler(lv_event_t * e) {
   delay(500);
   ESP.restart();
 }
+static void updateAmplitudeDisplay(int amplitude) {
+  if (!amplitude_value_label) return;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Tone amplitude: %d", amplitude);
+  lv_label_set_text(amplitude_value_label, buf);
+}
+static void amplitude_slider_handler(lv_event_t * e) {
+  lv_obj_t* slider = lv_event_get_target(e);
+  if (!slider) return;
+  int raw = lv_slider_get_value(slider);
+  // Round to nearest 500 to avoid tiny steps and clipping
+  const int step = 500;
+  int rounded = ((raw + step / 2) / step) * step;
+  if (rounded < 500) rounded = 500;
+  if (rounded > 12000) rounded = 12000;
+  lv_slider_set_value(slider, rounded, LV_ANIM_OFF);
+  AUDIO_TONE_AMPL = rounded;
+  updateAmplitudeDisplay(rounded);
+  Serial.printf("[AUDIO] Tone amplitude set to %d\n", rounded);
+  beepClick();
+}
 
 void updateSystemInfo() {
   if (!sys_info_label) return;
@@ -956,7 +1042,7 @@ void create_settings_ui() {
   
   // System info display area
   lv_obj_t* info_area = lv_obj_create(settings_screen);
-  lv_obj_set_size(info_area, SCREEN_WIDTH - 20, 120);
+  lv_obj_set_size(info_area, SCREEN_WIDTH - 20, 90);
   lv_obj_set_pos(info_area, 10, 35);
   lv_obj_set_style_bg_color(info_area, LV_COLOR_GAUGE_BG, 0);
   lv_obj_set_style_border_width(info_area, 1, 0);
@@ -987,10 +1073,24 @@ void create_settings_ui() {
   lv_style_set_bg_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_BG);
   lv_style_set_text_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_FG);
   
+  // Tone amplitude slider
+  amplitude_value_label = lv_label_create(settings_screen);
+  lv_label_set_text(amplitude_value_label, "Tone amplitude: 2000");
+  lv_obj_set_style_text_color(amplitude_value_label, LV_COLOR_FG, 0);
+  lv_obj_set_pos(amplitude_value_label, 10, 130);
+
+  amplitude_slider = lv_slider_create(settings_screen);
+  lv_obj_set_size(amplitude_slider, SCREEN_WIDTH - 20, 12);
+  lv_obj_set_pos(amplitude_slider, 10, 150);
+  lv_slider_set_range(amplitude_slider, 500, 12000);
+  lv_slider_set_value(amplitude_slider, AUDIO_TONE_AMPL, LV_ANIM_OFF);
+  lv_obj_add_event_cb(amplitude_slider, amplitude_slider_handler, LV_EVENT_VALUE_CHANGED, NULL);
+  updateAmplitudeDisplay(AUDIO_TONE_AMPL);
+
   // Restart WiFi button
   lv_obj_t* btn_wifi = lv_btn_create(settings_screen);
   lv_obj_set_size(btn_wifi, 145, 35);
-  lv_obj_set_pos(btn_wifi, 10, 165);
+  lv_obj_set_pos(btn_wifi, 10, 175);
   lv_obj_add_style(btn_wifi, &btn_style, 0);
   lv_obj_add_style(btn_wifi, &btn_pressed_style, LV_STATE_PRESSED);
   lv_obj_add_event_cb(btn_wifi, restart_wifi_handler, LV_EVENT_CLICKED, NULL);
@@ -1002,7 +1102,7 @@ void create_settings_ui() {
   // Restart WebSocket button
   lv_obj_t* btn_ws = lv_btn_create(settings_screen);
   lv_obj_set_size(btn_ws, 145, 35);
-  lv_obj_set_pos(btn_ws, 165, 165);
+  lv_obj_set_pos(btn_ws, 165, 175);
   lv_obj_add_style(btn_ws, &btn_style, 0);
   lv_obj_add_style(btn_ws, &btn_pressed_style, LV_STATE_PRESSED);
   lv_obj_add_event_cb(btn_ws, restart_websocket_handler, LV_EVENT_CLICKED, NULL);
@@ -1014,7 +1114,7 @@ void create_settings_ui() {
   // Reboot button
   lv_obj_t* btn_reboot = lv_btn_create(settings_screen);
   lv_obj_set_size(btn_reboot, 300, 35);
-  lv_obj_set_pos(btn_reboot, 10, 205);
+  lv_obj_set_pos(btn_reboot, 10, 215);
   lv_obj_add_style(btn_reboot, &btn_style, 0);
   lv_obj_add_style(btn_reboot, &btn_pressed_style, LV_STATE_PRESSED);
   lv_obj_add_event_cb(btn_reboot, reboot_handler, LV_EVENT_CLICKED, NULL);
@@ -1030,6 +1130,9 @@ void create_settings_ui() {
 void switchToPage(int page) {
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     if (page == 0) {
+      if (!fighter_screen) {
+        create_fighter_ui();
+      }
       lv_scr_load(fighter_screen);
       currentPage = 0;
     } else if (page == 1) {
@@ -1060,38 +1163,6 @@ void switchToPage(int page) {
   }
 }
 
-static void touch_read(lv_indev_t * indev, lv_indev_data_t * data) {
-  tp = ft6336u->scan();
-  
-  if (tp.touch_count == 0) {
-    data->state = LV_INDEV_STATE_RELEASED;
-    return;
-  }
-  
-  // Touch detected - update last touch time
-  lastTouchTime = millis();
-  
-  // If display is off, turn it on but don't process the touch as a button press
-  if (!displayOn) {
-    setDisplayPower(true);
-    data->state = LV_INDEV_STATE_RELEASED; // Ignore this touch for button processing
-    return;
-  }
-  
-  // Read touch coordinates from FT6336U
-  int x = tp.tp[0].x;
-  int y = tp.tp[0].y;
-  
-  // Verify coordinates are within screen bounds
-  if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT) {
-    data->state = LV_INDEV_STATE_PRESSED;
-    data->point.x = x;
-    data->point.y = y;
-  } else {
-    data->state = LV_INDEV_STATE_RELEASED;
-  }
-}
-
 // LVGL logging callback
 void my_print(lv_log_level_t level, const char * buf)
 {
@@ -1101,64 +1172,6 @@ void my_print(lv_log_level_t level, const char * buf)
   Serial.flush();
 }
 
-void init_display()
-{
-  Serial.println("[DISPLAY] Setting backlight HIGH...");
-  pinMode(45, OUTPUT);
-  digitalWrite(45, HIGH);
-
-  Serial.println("[DISPLAY] Initializing touch controller...");
-  initTouch();
-
-  Serial.println("[LVGL] Initializing LVGL...");
-  lv_init();
-  lv_tick_set_cb([]() -> uint32_t { return millis(); });
-  lv_log_register_print_cb(my_print);
-
-  Serial.println("[LVGL] Creating TFT_eSPI display driver...");
-  Serial.printf("[LVGL] Buffer: %p, size: %d bytes (pixels: %d)\n", 
-                buf, LVGL_BUFFER_SIZE, LVGL_BUFFER_PIXELS);
-  
-  // Try with width and height in correct order for the helper function
-  disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, buf, LVGL_BUFFER_SIZE);
-  if (!disp) {
-    Serial.println("[LVGL] ERROR: Failed to create display!");
-    while(1) delay(1000);
-  }
-  
-  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
-  Serial.println("[LVGL] Display created");
-  //lv_display_set_flush_cb(disp, lvgl_flush_cb);
-  //lv_display_set_buffers(disp, buf, NULL, LVGL_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
-
-  /*TFT_eSPI *tft = (TFT_eSPI *) lv_display_get_driver_data(disp);
-
-    // ST7789 needs to be inverted
-    tft->invertDisplay(true);
-
-    // gamma fix for ST7789
-    tft->writecommand(0x26); //Gamma curve selected
-    tft->writedata(2);
-    delay(120);
-    tft->writecommand(0x26); //Gamma curve selected
-    tft->writedata(1);
-  */
-
-
-
-  Serial.println("[LVGL] Creating input device...");
-  lv_indev_t* indev = lv_indev_create();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_read_cb(indev, touch_read);
-
-  Serial.println("[UI] Creating fighter UI...");
-  create_fighter_ui();
-  Serial.println("[UI] Creating logviewer UI...");
-  create_logviewer_ui();
-  Serial.println("[UI] Loading logviewer screen...");
-  lv_scr_load(logviewer_screen);
-  Serial.println("[DISPLAY] Initialization complete!");
-}
 
 void checkBleConnection()
 {
@@ -1171,6 +1184,7 @@ void checkBleConnection()
       bleConnected = true;
       ledOn = true;
       setDisplayPower(true);
+      update_bluetooth_icon();
     }
     lastBleActiveTime = millis();
   }
@@ -1183,7 +1197,7 @@ void checkBleConnection()
       bleConnected = false;
       ledOn = true;
       bleDisconnectedTime = millis();
-      setDisplayPower(false);
+      update_bluetooth_icon();
     }
     
     // LED timeout tracking (LED removed on ESP32S3)
@@ -1778,6 +1792,11 @@ void checkMessages() {
     }
   }
   // Check for UDP messages (only when TCP is not enabled)
+  // Only process UDP if WiFi is connected
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  
   int packetSize = udpReceiver.parsePacket();
   
   if (packetSize > 0) {
@@ -1893,25 +1912,9 @@ void requestSummary() {
   }
 }
 
-void WifiConnect()
+
+void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
 {
-  
-  // Configure WiFi with auto-reconnect
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
-  // Set hostname
-  WiFi.setHostname(HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  Serial.print("Connecting to WiFi");
-  uint8_t retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) { // 10 seconds timeout
-    delay(500);
-    Serial.print(".");
-    retries++;
-  }
-  
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected!");
     Serial.print("IP: ");
@@ -1926,6 +1929,7 @@ void WifiConnect()
     } else {
       Serial.println("ERROR: Failed to start UDP receiver!");
     }
+    update_wifi_icon();
     
     // Initialize UDP sender (Core 1 will use this)
     Serial.println("UDP sender initialized for outgoing packets");
@@ -1938,10 +1942,38 @@ void WifiConnect()
   }
 }
 
+void WifiConnect()
+{
+  
+  // Configure WiFi with auto-reconnect
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  // Set hostname
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  WiFi.onEvent(onWifiConnect, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent([](const WiFiEvent_t event, const WiFiEventInfo_t info) {
+    Serial.println("\nWiFi disconnected");
+    wifiWasConnected = false;
+    beepDisconnect();  // Falling tone for WiFi disconnection
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  
+  Serial.print("Connecting to WiFi");
+  uint8_t retries = 0;
+  /*while (WiFi.status() != WL_CONNECTED && retries < 20) { // 10 seconds timeout
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }*/
+  
+}
+
 void setup()
 {
   Serial.begin(115200);
-  delay(1000);
+  delay(100);
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
   
   // Check PSRAM availability
@@ -1983,15 +2015,13 @@ void setup()
   if (psramFound()) {
     Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   }
-  delay(500);
+  delay(100);
   // pinMode(BUZZER_PIN, OUTPUT);  // Disabled - buzzer uses LEDC on ESP32S3
   
   // beepBootup();  // Disabled - tone() uses LEDC
-  delay(200);
   
   Serial.println("[WIFI] Connecting...");
   WifiConnect();
-  delay(500);
   
   // Initialize display power management
   Serial.println("[INIT] Setting up display power management...");
@@ -2000,8 +2030,78 @@ void setup()
   bleDisconnectedTime = millis();
 
   Serial.println("[I2C] Initializing I2C bus...");
-  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.begin(I2C_SDA, I2C_SCL, I2C_SPEED);
+  //Audio pins:
+  //GPIO1: Audio Power amplifier IC enable Pin, low level enable
+  //GPIO4: Audio I2S bus master clock signal
+  //GPIO5: Audio I2S bus bit clock signal
+  //GPIO6: Audio I2S bus bit output data signal
+  //GPIO7: Audio I2S bus left and right channel selection signal. High level: right channel; low level: left channel
+  //GPIO8: I2S bus bit input data signal
+  //GPIO16: I2C bus data signal
+  //GPIO17: I2C bus clock signal
+
+  Serial.println("[I2S] Initializing I2S audio...");
+  // Enable audio amplifier (GPIO1, active LOW)
+  pinMode(1, OUTPUT);
+  digitalWrite(1, LOW);  // Enable amplifier
+  delay(100);  // Wait for amplifier to stabilize
   
+  // Initialize ES8311 codec FIRST
+  Serial.println("[ES8311] Initializing codec...");
+  if (es8311_codec_init() != ESP_OK) {
+    Serial.println("[ES8311] ERROR: Codec initialization failed!");
+  } else {
+    Serial.println("[ES8311] Codec initialized successfully");
+  }
+  
+  // Initialize I2S driver with pin configuration
+  Serial.println("[I2S] Configuring I2S driver...");
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = AUDIO_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // stereo frames
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = true,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = AUDIO_MCLK_HZ
+  };
+
+  i2s_pin_config_t pin_config = {
+    .mck_io_num = I2S_MCK,    // GPIO4
+    .bck_io_num = I2S_BCK,      // GPIO5
+    .ws_io_num = I2S_WS,        // GPIO7
+    .data_out_num = I2S_DOUT,   // GPIO6
+    .data_in_num = -1            // unused (playback only)
+  };
+
+  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  if (i2s_err != ESP_OK) {
+    Serial.printf("[I2S] ERROR: Driver install failed: %d\n", i2s_err);
+  } else {
+    if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK) {
+      Serial.println("[I2S] ERROR: Pin configuration failed");
+    } else {
+      Serial.println("[I2S] Driver and pins configured successfully");
+    }
+    if (i2s_set_clk(I2S_NUM_0, AUDIO_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) != ESP_OK) {
+      Serial.println("[I2S] ERROR: Clock configuration failed");
+    } else {
+      Serial.println("[I2S] Clock configured successfully");
+    }
+    if (i2s_zero_dma_buffer(I2S_NUM_0) != ESP_OK) {
+      Serial.println("[I2S] ERROR: DMA buffer zeroing failed");
+    } else {
+      Serial.println("[I2S] DMA buffer zeroed successfully");
+    }
+    i2sInitialized = true;  // Mark I2S as ready
+    Serial.println("[I2S] Audio driver initialized successfully");
+  }
+
   Serial.println("[PCF8575] Creating button controller...");
   pcf = new PCF8575(PCF8575_ADDR);
   pcf->begin();
@@ -2017,7 +2117,22 @@ void setup()
   bleGamepad->begin(&bleGamepadConfig);
   
   Serial.println("[DISPLAY] Initializing display and LVGL...");
-  init_display();
+  //init_display();
+  disp.init();
+  disp.setTouchCallback(handleTouchActivity);
+
+  Serial.println("[UI] Creating fighter UI...");
+  create_fighter_ui();
+  Serial.println("[UI] Creating logviewer UI...");
+  create_logviewer_ui();
+  Serial.println("[UI] Loading logviewer screen...");
+  lv_scr_load(logviewer_screen);
+  Serial.println("[UI] Initialization complete!");
+  
+  // Play startup tone
+  Serial.println("[AUDIO] Playing startup tone...");
+  beepBootup();
+  delay(200);
   
   // Create mutex for LVGL thread safety
   lvglMutex = xSemaphoreCreateMutex();
@@ -2053,51 +2168,13 @@ void loop()
   // Protect LVGL rendering with mutex
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     lv_timer_handler();
-    
-    // Process pending jump overlay from main loop to avoid mutex contention
-    if (pendingJumpOverlay) {
-      pendingJumpOverlay = false;
-      if (jump_overlay_label) {
-        lv_obj_del(jump_overlay_label);
-        jump_overlay_label = nullptr;
-      }
-      lv_obj_t* parent = lv_scr_act();
-      if (parent) {
-        jump_overlay_label = lv_label_create(parent);
-        lv_label_set_text_fmt(jump_overlay_label, "%d", pendingJumpValue);
-        lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
-        lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
-        lv_obj_center(jump_overlay_label);
-        lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
-        lv_obj_set_style_transform_zoom(jump_overlay_label, 768, LV_PART_MAIN);
-        lv_obj_update_layout(jump_overlay_label);
-        lv_coord_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
-        lv_coord_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
-        lv_obj_set_style_transform_pivot_x(jump_overlay_label, pivotX, LV_PART_MAIN);
-        lv_obj_set_style_transform_pivot_y(jump_overlay_label, pivotY, LV_PART_MAIN);
-
-        lv_anim_t zoom_anim;
-        lv_anim_init(&zoom_anim);
-        lv_anim_set_var(&zoom_anim, jump_overlay_label);
-        lv_anim_set_values(&zoom_anim, 768, 0);
-        lv_anim_set_time(&zoom_anim, 1000);
-        lv_anim_set_path_cb(&zoom_anim, lv_anim_path_ease_out);
-        lv_anim_set_exec_cb(&zoom_anim, jump_overlay_zoom_exec);
-        lv_anim_set_ready_cb(&zoom_anim, jump_overlay_anim_ready);
-        lv_anim_start(&zoom_anim);
-
-        lv_anim_t fade_anim;
-        lv_anim_init(&fade_anim);
-        lv_anim_set_var(&fade_anim, jump_overlay_label);
-        lv_anim_set_values(&fade_anim, LV_OPA_COVER, LV_OPA_TRANSP);
-        lv_anim_set_time(&fade_anim, 1000);
-        lv_anim_set_path_cb(&fade_anim, lv_anim_path_ease_out);
-        lv_anim_set_exec_cb(&fade_anim, jump_overlay_opa_exec);
-        lv_anim_start(&fade_anim);
-      }
-    }
-    
     xSemaphoreGive(lvglMutex);
+  }
+  
+  // Process pending jump overlay
+  if (pendingJumpOverlay) {
+    pendingJumpOverlay = false;
+    showJumpOverlay(pendingJumpValue);
   }
   checkBleConnection();
   checkDisplayTimeout();
@@ -2248,7 +2325,6 @@ static void jump_overlay_anim_ready(lv_anim_t* anim) {
 }
 
 void showJumpOverlay(int jumps) {
-  return; // Disabled for now, battle the freezing issue
   if (!lvglMutex) return;
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     if (jump_overlay_label) {
