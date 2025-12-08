@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <vector>
 
 // Game data structures used across the app. These used to be in main.cpp.
 struct CargoInfo {
@@ -17,6 +18,7 @@ struct FuelInfo {
 
 struct HullInfo {
   float hullHealth = 1.0f;
+  String hullType;
 };
 
 struct NavRouteInfo {
@@ -38,20 +40,47 @@ struct EventLogEntry {
   int count;
 };
 
-// Extern instances accessible from other translation units
-extern CargoInfo cargoInfo;
-extern FuelInfo fuelInfo;
-extern HullInfo hullInfo;
-extern NavRouteInfo navRouteInfo;
-extern BackpackInfo backpackInfo;
-extern BioscanInfo bioscanInfo;
+struct CommunityGoal {
+  String title;
+  int percentile = -1;
+  int tier = -1;
+  int contributors = -1;
+};
+
+struct StatusModel {
+  CargoInfo cargo;
+  FuelInfo fuel;
+  HullInfo hull;
+  NavRouteInfo nav;
+  BackpackInfo backpack;
+  BioscanInfo bioscan;
+  float shieldsPercent = 0.0f;
+
+  String currentSystem;
+  String currentStation;
+  String destinationName;
+  String legalState;
+  bool onFoot = false;
+  bool inShip = true;
+  bool docked = false;
+  bool inSpace = false;
+  bool landed = false;
+  bool inSrv = false;
+  bool inTaxi = false;
+  bool inMulticrew = false;
+  long credits = 0;
+  std::vector<CommunityGoal> communityGoals;
+};
+
+// Global status instance
+extern StatusModel status;
 
 // Event log
 extern EventLogEntry eventLog[9];
 extern int eventLogIndex;
 extern int eventLogCount;
 
-// Other global status
+// Other global status flags
 extern char motherlodeMaterial[32];
 extern bool blinkScreen;
 extern int blinkCount;
@@ -60,3 +89,11 @@ extern uint32_t lastBlinkTime;
 // Small API helpers
 void updateJumpsRemaining(int newValue);
 void addLogEntry(const char* text);
+
+// Legacy compatibility aliases to ease migration while consolidating usage
+#define cargoInfo (status.cargo)
+#define fuelInfo (status.fuel)
+#define hullInfo (status.hull)
+#define navRouteInfo (status.nav)
+#define backpackInfo (status.backpack)
+#define bioscanInfo (status.bioscan)

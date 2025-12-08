@@ -5,12 +5,17 @@
 #include <BleGamepad.h>
 #include "display.h"
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
 #include <esp_heap_caps.h>
 #include "es8311.h"
+#include "sound.h"
+#include "config.h"
+#include "gamedata.h"
+#include "screens/fighter.h"
+#include "screens/info.h"
+#include "screens/system.h"
 #ifdef ESP_IDF_VERSION
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
     #define USE_NEW_I2S_API 1
@@ -28,24 +33,10 @@ using namespace websockets;
 
 
 
-//AUDIO config
-#define BEEP_BOOT 0
-#define BEEP_ERROR 1
-#define BEEP_CONNECT 0
-#define BEEP_DISCONNECT 0
-#define BEEP_SHORT 1
-#define BEEP_MOTHERLODE 1
-#define BEEP_CLICK 1
-
 #define PCF8575_ADDR 0x20
 #define I2C_SDA 16
 #define I2C_SCL 15
 #define BUZZER_PIN 5
-#define SCREEN_WIDTH 320
-#define SCREEN_HEIGHT 240
-#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 10)  // Buffer in pixels
-//#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * sizeof(lv_color_t))  // Buffer in bytes
-#define LVGL_BUFFER_SIZE (LVGL_BUFFER_PIXELS * 4)  // Buffer in bytes for ARGB8888
 uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define INT_N_PIN 17
 #define RST_N_PIN 18
@@ -57,19 +48,12 @@ uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define I2S_WS 7
 #define I2C_SPEED 400000
 
-// Audio clocking
-static const int AUDIO_SAMPLE_RATE = 44100;           // match ES8311 config
-static const int AUDIO_MCLK_HZ    = 11289600;         // 44.1k * 256
-
-int AUDIO_TONE_AMPL  = 6000;             // reduce beep loudness
+// Audio clocking constants now in sound.h
 
 #include "colors.h"
 
 // Global flags
-bool i2sInitialized = false;
 
-#define ARDUINO_USB_MODE 1
-#define ARDUINO_USB_CDC_ON_BOOT 1
 // Button mapping (PCF8575 pins)
 enum ButtonIndex
 {
@@ -103,90 +87,20 @@ bool bleConnected = false;
 //static lv_display_t* disp;
 Display disp;
 
-// Fighter command structure
-struct FighterCommand
-{
-  const char *name;
-  uint8_t button_id;
-};
-
-
-#define WIFI_SSID "0619562e-bcbf-4bfc-97a8"
-#define WIFI_PASSWORD "3869212721440634"
-#define HOSTNAME "FighterController"
-#define UDP_PORT 12345
+#include "config.h"
+#include "gamedata.h"
 
 WiFiMulti wifiMulti;
 
-
-// Elite Dangerous data structures
-struct CargoInfo {
-  int totalCapacity = 256;
-  int usedSpace = 0;
-  int dronesCount = 0;
-  int cargoCount = 0;  // non-drones cargo
-};
-
-struct FuelInfo {
-  float fuelMain = 0.0f;
-  float fuelCapacity = 32.0f;
-};
-
-struct HullInfo {
-  float hullHealth = 1.0f;
-};
-
-struct NavRouteInfo {
-  int jumpsRemaining = 0;
-};
-
-struct BackpackInfo {
-  int healthpack = 0;
-  int energycell = 0;
-};
-
-struct BioscanInfo {
-  int totalScans = 0;
-};
-
-struct EventLogEntry {
-  char text[55];  // Reduced to fit 8 entries in memory
-  uint32_t timestamp;
-  int count;  // For consolidating repeated entries
-};
-
-// Global Elite data
-CargoInfo cargoInfo;
-FuelInfo fuelInfo;
-HullInfo hullInfo;
-NavRouteInfo navRouteInfo;
-BackpackInfo backpackInfo;
-BioscanInfo bioscanInfo;
-EventLogEntry eventLog[9] = {};  // Show last 9 events, initialized to zero
-int eventLogIndex = 0;
-int eventLogCount = 0;  // Track how many events we actually have
-char motherlodeMaterial[32] = "";
-bool blinkScreen = false;
-int blinkCount = 0;
-uint32_t lastBlinkTime = 0;
-
-// UDP - Separate sockets for receiving (Core 0) and sending (Core 1)
-WiFiUDP udpReceiver;  // Core 0 - receives messages on UDP_PORT
-WiFiUDP udpSender;    // Core 1 - sends SUMMARY requests
-char* udpBuffer = nullptr;
-const int UDP_BUFFER_SIZE = 8192;  // Increased for PSRAM
-int lastEventId = -1;  // Track last event ID for deduplication
-
 // WebSocket variables for Elite Dangerous data
 // If not discovered via KEEPALIVE, fallback to configured server IP
-String serverIP = "192.168.178.85";
-int websocketPort = 3300;  // Icarus terminal WS port
-int udpControlPort = 0;
+String serverIP = DEFAULT_SERVER_IP;
+int websocketPort = DEFAULT_WEBSOCKET_PORT;  // Icarus terminal WS port
 bool useWebSocket = false;
 WebsocketsClient wsClient;
 
 // Task handle for Core 0
-TaskHandle_t udpTaskHandle = NULL;
+TaskHandle_t msgTaskHandle = NULL;
 SemaphoreHandle_t lvglMutex = NULL;
 
 // List of journal events to ignore - Store in Flash to save DRAM
@@ -223,38 +137,6 @@ const char* const hideJournalEvents[] PROGMEM = {
 };
 const int hideJournalEventsCount = sizeof(hideJournalEvents) / sizeof(hideJournalEvents[0]);
 
-// Fighter commands - Store in Flash
-const FighterCommand PROGMEM commands[8] = {
-    {"Fighter Zurueckordern", 13},
-    {"Verteidigen", 14},
-    {"Feuer Frei", 15},
-    {"Mein Ziel angreifen", 16},
-    {"Formation halten", 17},
-    {"Position halten", 18},
-    {"Mir folgen", 19},
-    {"Befehle oeffnen", 20}};
-
-// UI objects
-lv_obj_t *fighter_screen;
-lv_obj_t *btnmatrix;
-lv_obj_t *logviewer_screen;
-lv_obj_t *log_label;
-lv_obj_t *cargo_bar;
-lv_obj_t *header_label;
-lv_obj_t *fuel_bar;
-lv_obj_t *hull_bar;
-lv_obj_t *wifi_icon;
-lv_obj_t *websocket_icon;
-lv_obj_t *bluetooth_icon;
-lv_obj_t *settings_screen;
-lv_obj_t *sys_info_label;
-lv_obj_t *medpack_label;
-lv_obj_t *energycell_label;
-lv_obj_t *bioscan_label;
-lv_obj_t *bioscan_data_label;
-lv_obj_t *jump_overlay_label;
-lv_obj_t *amplitude_slider;
-lv_obj_t *amplitude_value_label;
 int currentPage = 1;  // 0 = fighter, 1 = logviewer, 2 = settings (start on page 1)
 bool pendingJumpOverlay = false;
 int pendingJumpValue = 0;
@@ -300,77 +182,6 @@ bool summaryReceived = false;
 uint32_t lastSummaryRequest = 0;
 const uint32_t SUMMARY_REQUEST_INTERVAL = 10000; // Request every 10 seconds until first received
 
-static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
-                                  "Folgen", "Center", "Angriff", "\n",
-                                  "Position", "Formation", "Befehle", ""};
-
-// Audio helper functions using I2S
-void playTone(uint16_t frequency, uint16_t duration_ms) {
-  // Safety check: don't play if I2S not initialized
-  if (!i2sInitialized) {
-    Serial.println("I2S not initialized, cannot play tone");
-    return;
-  }
-  
-  size_t bytes_written = 0;
-
-  // Generate a simple sine wave tone (stereo L+R same sample)
-  const int sampleRate = AUDIO_SAMPLE_RATE;
-  const int samples = (sampleRate * duration_ms) / 1000;
-  int16_t* buffer = (int16_t*)malloc(samples * 2 * sizeof(int16_t)); // stereo buffer
-  
-  if (buffer) {
-    for (int i = 0; i < samples; i++) {
-      float t = (float)i / sampleRate;
-      int16_t s = (int16_t)(sin(2.0 * PI * frequency * t) * AUDIO_TONE_AMPL);
-      buffer[i * 2]     = s; // Left
-      buffer[i * 2 + 1] = s; // Right
-    }
-    
-    // Write mono samples to I2S
-    esp_err_t err = i2s_write(I2S_NUM_0, buffer, samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-    Serial.printf("[I2S] write err=%d bytes=%u\n", (int)err, (unsigned)bytes_written);
-    
-    free(buffer);
-  }
-}
-
-void beepShort() {
-  #if (BEEP_SHORT)
-  playTone(1000, 50);
-  #endif
-}
-
-void beepClick() {
-  #if (BEEP_CLICK)
-  playTone(800, 20);
-  #endif
-}
-
-void beepConnect() {
-  #if (BEEP_CONNECT)
-  playTone(1200, 100);
-  #endif
-}
-
-void beepDisconnect() {
-  #if (BEEP_DISCONNECT)
-  playTone(600, 100);
-  #endif
-}
-
-void beepMotherlode() {
-  #if (BEEP_MOTHERLODE)
-  playTone(1500, 200);
-  #endif
-}
-
-void beepBootup() {
-  #if (BEEP_BOOT)
-  playTone(1000, 150);
-  #endif
-}
-
 void setDisplayPower(bool on)
 {
   if (on && !displayOn) {
@@ -383,72 +194,6 @@ void setDisplayPower(bool on)
     displayOn = false;
     Serial.println("Display OFF");
   }
-}
-
-static void btnmatrix_event_handler(lv_event_t * e)
-{
-    lv_obj_t * obj = (lv_obj_t*)lv_event_get_target(e);
-    uint32_t id = lv_btnmatrix_get_selected_btn(obj);
-    const uint8_t btn_to_cmd[] = {0, 1, 2, 7, 20, 3, 5, 4, 6};
-    
-    if (id < 9) {
-        uint8_t cmd_idx = btn_to_cmd[id];
-        
-        if (cmd_idx == 20) {
-            Serial.println("Befehle oeffnen/schliessen");
-            beepClick();  // Click sound for button press
-            bleGamepad->press(20);
-            delay(50);
-            bleGamepad->release(20);
-        } else if (cmd_idx < 8) {
-            FighterCommand cmd;
-            memcpy_P(&cmd, &commands[cmd_idx], sizeof(FighterCommand));
-            
-            Serial.printf("Command: %s (Button %d)\n", cmd.name, cmd.button_id);
-            beepClick();  // Click sound for button press
-            bleGamepad->press(cmd.button_id);
-            delay(50);
-            bleGamepad->release(cmd.button_id);
-        }
-    }
-}
-
-void create_fighter_ui()
-{
-  fighter_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(fighter_screen, lv_color_hex(0x121212), 0);
-  lv_scr_load(fighter_screen);
-
-  btnmatrix = lv_btnmatrix_create(fighter_screen);
-  lv_btnmatrix_set_map(btnmatrix, btnm_map);
-      
-  static lv_style_t style_bg;
-    lv_style_init(&style_bg);
-    lv_style_set_pad_all(&style_bg, 0);
-    lv_style_set_pad_gap(&style_bg, 1);
-    lv_style_set_clip_corner(&style_bg, true);
-    lv_style_set_radius(&style_bg, LV_RADIUS_CIRCLE);
-    lv_style_set_border_width(&style_bg, 0);
-
-  // Fill entire screen with 1px padding
-  lv_obj_set_size(btnmatrix, SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2);
-  lv_obj_set_pos(btnmatrix, 1, 1);
-
-  lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0x222222), 0);
-  lv_obj_set_style_border_color(btnmatrix, lv_color_hex(0x555555), 0);
-  lv_obj_set_style_border_width(btnmatrix, 0, 0);
-  lv_obj_set_style_radius(btnmatrix, 10, 0);
-  lv_obj_add_style(btnmatrix, &style_bg, 0);
-
-  lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0x444444), LV_PART_ITEMS);
-  lv_obj_set_style_bg_color(btnmatrix, lv_color_hex(0xff9500), LV_PART_ITEMS | LV_STATE_PRESSED);
-  lv_obj_set_style_text_color(btnmatrix, lv_color_hex(0xffffff), LV_PART_ITEMS);
-  lv_obj_set_style_border_color(btnmatrix, lv_color_hex(0x666666), LV_PART_ITEMS);
-  lv_obj_set_style_border_width(btnmatrix, 1, LV_PART_ITEMS);
-  lv_obj_set_style_radius(btnmatrix, 5, LV_PART_ITEMS);
-  
-  lv_btnmatrix_set_btn_ctrl(btnmatrix, 4, LV_BTNMATRIX_CTRL_NO_REPEAT);
-  lv_obj_add_event_cb(btnmatrix, btnmatrix_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 // Helper function to print heap status including PSRAM
@@ -475,10 +220,10 @@ void updateCargoBar() {
   if (!cargo_bar) return;
   
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    int total = cargoInfo.totalCapacity;
-  int used = cargoInfo.usedSpace;
-  int drones = cargoInfo.dronesCount;
-  int cargo = cargoInfo.cargoCount;
+    int total = status.cargo.totalCapacity;
+  int used = status.cargo.usedSpace;
+  int drones = status.cargo.dronesCount;
+  int cargo = status.cargo.cargoCount;
   int free = total - used;
   
   lv_bar_set_range(cargo_bar, 0, total);
@@ -503,19 +248,19 @@ void updateBackpackDisplay() {
     char buf[8];
     
     // Update medpack count
-    snprintf(buf, sizeof(buf), "%d", backpackInfo.healthpack);
+    snprintf(buf, sizeof(buf), "%d", status.backpack.healthpack);
     lv_label_set_text(medpack_label, buf);
     
     // Update energycell count
-    snprintf(buf, sizeof(buf), "%d", backpackInfo.energycell);
+    snprintf(buf, sizeof(buf), "%d", status.backpack.energycell);
     lv_label_set_text(energycell_label, buf);
     
     // Update bioscan count if available
     if (bioscan_label) {
-      snprintf(buf, sizeof(buf), "%d", bioscanInfo.totalScans);
+      snprintf(buf, sizeof(buf), "%d", status.bioscan.totalScans);
       lv_label_set_text(bioscan_label, buf);
       
-      if (bioscanInfo.totalScans > 0) {
+      if (status.bioscan.totalScans > 0) {
         lv_obj_clear_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
         if (bioscan_data_label) {
           lv_obj_clear_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
@@ -566,19 +311,19 @@ void updateHeader() {
   
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     char buf[64];
-  snprintf(buf, sizeof(buf), "Jumps: %d", navRouteInfo.jumpsRemaining);
+  snprintf(buf, sizeof(buf), "Jumps: %d", status.nav.jumpsRemaining);
   lv_label_set_text(header_label, buf);
   
   // Update fuel bar
   if (fuel_bar) {
     float fuelPercent = (fuelInfo.fuelCapacity > 0) ? 
-      (fuelInfo.fuelMain / fuelInfo.fuelCapacity * 100.0f) : 0.0f;
+      (status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0.0f;
     lv_bar_set_value(fuel_bar, (int)fuelPercent, LV_ANIM_OFF);
   }
   
   // Update hull bar
   if (hull_bar) {
-    lv_bar_set_value(hull_bar, (int)(hullInfo.hullHealth * 100.0f), LV_ANIM_OFF);
+    lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
   }
   
   update_wifi_icon();  
@@ -593,6 +338,35 @@ void updateHeader() {
   update_bluetooth_icon();
   
     
+    xSemaphoreGive(lvglMutex);
+  }
+}
+
+void updateStatusLine() {
+  if (!status_label) return;
+
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    const char* system = status.currentSystem.length() ? status.currentSystem.c_str() : "--";
+    const char* station = status.currentStation.length() ? status.currentStation.c_str() : "--";
+    const char* dest = status.destinationName.length() ? status.destinationName.c_str() : "--";
+    const char* legal = status.legalState.length() ? status.legalState.c_str() : "--";
+
+    const char* mode = "--";
+    if (status.onFoot) {
+      mode = "On Foot";
+    } else if (status.inSrv) {
+      mode = "SRV";
+    } else if (status.inTaxi) {
+      mode = "Taxi";
+    } else if (status.inShip) {
+      mode = "In Ship";
+    }
+
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+      "System: %s | Station: %s | Dest: %s | Legal: %s | Shields: %.0f%% | Mode: %s",
+      system, station, dest, legal, status.shieldsPercent, mode);
+    lv_label_set_text(status_label, buf);
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -737,249 +511,6 @@ void addLogEntry(const char* text) {
   updateLogDisplay();
 }
 
-void create_logviewer_ui() {
-  logviewer_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(logviewer_screen, LV_COLOR_BG, 0);
-  
-  // Header with jumps, fuel, hull (reduced height to 22px to fit bars)
-  lv_obj_t* header = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(header, SCREEN_WIDTH, 25);
-  lv_obj_set_pos(header, 0, 0);
-  lv_obj_set_style_bg_color(header, LV_COLOR_GAUGE_BG, 0);
-  lv_obj_set_style_border_width(header, 0, 0);
-  lv_obj_set_style_radius(header, 0, 0);
-  lv_obj_set_style_pad_all(header, 2, 0);
-  lv_obj_set_scrollbar_mode(header, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_set_scroll_dir(header, LV_DIR_NONE);
-  
-  // Jumps label
-  header_label = lv_label_create(header);
-  lv_label_set_text(header_label, "Jumps: 0");
-  lv_obj_set_style_text_color(header_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(header_label, 5, 3);
-  
-  // Fuel label
-  lv_obj_t* fuel_label = lv_label_create(header);
-  lv_label_set_text(fuel_label, "F");
-  lv_obj_set_style_text_color(fuel_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(fuel_label, 100, 3);
-  
-  // Fuel bar (reduced size)
-  fuel_bar = lv_bar_create(header);
-  lv_obj_set_size(fuel_bar, 55, 15);
-  lv_obj_set_pos(fuel_bar, 115, 3);
-  lv_bar_set_range(fuel_bar, 0, 100);
-  lv_bar_set_value(fuel_bar, 100, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(fuel_bar, LV_COLOR_BG, LV_PART_MAIN);
-  //lv_obj_set_style_bg_opa(fuel_bar, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(fuel_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
-  
-  // Hull label
-  lv_obj_t* hull_label = lv_label_create(header);
-  lv_label_set_text(hull_label, "H");
-  lv_obj_set_style_text_color(hull_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(hull_label, 180, 3);
-  
-  // Hull bar (reduced size)
-  hull_bar = lv_bar_create(header);
-  lv_obj_set_size(hull_bar, 55, 15);
-  lv_obj_set_pos(hull_bar, 195, 3);
-  lv_bar_set_range(hull_bar, 0, 100);
-  lv_bar_set_value(hull_bar, 100, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(hull_bar, LV_COLOR_BG, LV_PART_MAIN);
-  //lv_obj_set_style_bg_opa(hull_bar, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(hull_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
-  
-  // Status icons (right side of header)
-  // WiFi icon (rightmost)
-  wifi_icon = lv_label_create(header);
-  lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
-  lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // Start with black (no connection)
-  lv_obj_set_pos(wifi_icon, 300, 2);
-  
-  // WebSocket icon (middle)
-  websocket_icon = lv_label_create(header);
-  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
-  lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // Start with black (not connected)
-  lv_obj_set_pos(websocket_icon, 280, 2);
-  
-  // Bluetooth icon (left of websocket)
-  bluetooth_icon = lv_label_create(header);
-  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
-  lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // Start with black (not connected)
-  lv_obj_set_pos(bluetooth_icon, 260, 2);
-  
-  // Log area (adjusted for smaller header)
-  lv_obj_t* log_area = lv_obj_create(logviewer_screen);
-  lv_obj_set_size(log_area, SCREEN_WIDTH, SCREEN_HEIGHT - 25 - 40);  // Leave space for header and footer
-  lv_obj_set_pos(log_area, 0, 25);
-  lv_obj_set_style_bg_color(log_area, LV_COLOR_BG, 0);
-  lv_obj_set_style_border_width(log_area, 0, 0);
-  lv_obj_set_style_radius(log_area, 0, 0);
-  lv_obj_set_scrollbar_mode(log_area, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_set_scroll_dir(log_area, LV_DIR_NONE);  // Disable all scrolling
-  lv_obj_set_style_border_color(log_area, LV_COLOR_GAUGE_FG, 0);
-  lv_obj_set_style_border_width(log_area, 1, 0);
-  //kein padding oben und unten
-  lv_obj_set_style_pad_top(log_area, 1, 0);
-  lv_obj_set_style_pad_bottom(log_area, 1, 0);
-  lv_obj_set_style_pad_left(log_area, 0, 0);
-  lv_obj_set_style_pad_right(log_area, 0, 0);
-  lv_obj_set_style_border_width(log_area, 0, 0);
-
-  log_label = lv_label_create(log_area);
-  lv_obj_set_pos(log_label, 5, 5);
-  lv_label_set_text(log_label, "Waiting for events...");
-  lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
-  lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(log_label, SCREEN_WIDTH - 75);  // Reduced width to make room for backpack panel
-  
-  // Backpack panel (right side of log area) - styled like settings panel
-  lv_obj_t* backpack_panel = lv_obj_create(log_area);
-  lv_obj_set_size(backpack_panel, 40, SCREEN_HEIGHT - 62);  // Full height minus padding
-  lv_obj_set_pos(backpack_panel, SCREEN_WIDTH - 40, 0);
-  lv_obj_set_style_bg_color(backpack_panel, LV_COLOR_BG, 0);
-  lv_obj_set_style_border_width(backpack_panel, 0, 0);
-  lv_obj_set_scrollbar_mode(backpack_panel, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_set_scroll_dir(backpack_panel, LV_DIR_NONE);
-  //remove round corners
-  lv_obj_set_style_radius(backpack_panel, 0, 0);
-  //remove top, bottom and right borders
-  lv_obj_set_style_border_side(backpack_panel, LV_BORDER_SIDE_LEFT, 0);
-  lv_obj_set_style_pad_all(backpack_panel, 0, 0);
-  
-  // Panel title
-  lv_obj_t* backpack_title = lv_label_create(backpack_panel);
-  lv_label_set_text(backpack_title, "PACK");
-  lv_obj_set_style_text_color(backpack_title, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(backpack_title, &lv_font_montserrat_10, 0);
-  lv_obj_align(backpack_title, LV_ALIGN_TOP_MID, 0, 0);
-  
-  
-  // Decorative line under title
-  lv_obj_t* title_line = lv_obj_create(backpack_panel);
-  lv_obj_set_size(title_line, 30, 1);
-  lv_obj_set_pos(title_line, 5, 20);
-  lv_obj_set_style_bg_color(title_line, LV_COLOR_GAUGE_FG, 0);
-  lv_obj_set_style_border_width(title_line, 0, 0);
-  lv_obj_set_scrollbar_mode(title_line, LV_SCROLLBAR_MODE_OFF);
-  
-  // Medpack section
-  lv_obj_t* medpack_m_label = lv_label_create(backpack_panel);
-  lv_label_set_text(medpack_m_label, "M");
-  lv_obj_set_style_text_color(medpack_m_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(medpack_m_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(medpack_m_label, LV_ALIGN_TOP_LEFT, 2, 25);
-  
-  medpack_label = lv_label_create(backpack_panel);
-  lv_label_set_text(medpack_label, "m");
-  lv_obj_set_style_text_color(medpack_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(medpack_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(medpack_label, LV_ALIGN_TOP_LEFT, 18, 25);
-  
-  // Divider line
-  lv_obj_t* divider_line = lv_obj_create(backpack_panel);
-  lv_obj_set_size(divider_line, 30, 1);
-  lv_obj_set_pos(divider_line, 5, 45);
-  lv_obj_set_style_bg_color(divider_line, LV_COLOR_GAUGE_FG, 0);
-  lv_obj_set_style_border_width(divider_line, 0, 0);
-  lv_obj_set_scrollbar_mode(divider_line, LV_SCROLLBAR_MODE_OFF);
-  
-  // Energycell section
-  lv_obj_t* energycell_e_label = lv_label_create(backpack_panel);
-  lv_label_set_text(energycell_e_label, "E");
-  lv_obj_set_style_text_color(energycell_e_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(energycell_e_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_pos(energycell_e_label, 2, 50);
-    
-  energycell_label = lv_label_create(backpack_panel);
-  lv_label_set_text(energycell_label, "e");
-  lv_obj_set_style_text_color(energycell_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(energycell_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_pos(energycell_label, 18, 50);
-  
-  // Bioscan DATA section (initially hidden if no scans)
-  bioscan_data_label = lv_label_create(backpack_panel);
-  lv_label_set_text(bioscan_data_label, "DATA");
-  lv_obj_set_style_text_color(bioscan_data_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(bioscan_data_label, &lv_font_montserrat_10, 0);
-  lv_obj_align(bioscan_data_label, LV_ALIGN_TOP_MID, 0, 75);
-  
-  bioscan_label = lv_label_create(backpack_panel);
-  lv_label_set_text(bioscan_label, "0");
-  lv_obj_set_style_text_color(bioscan_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(bioscan_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(bioscan_label, LV_ALIGN_TOP_MID, 0, 95);
-  // Start hidden if no scans
-  if (bioscanInfo.totalScans == 0) {
-    lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
-  }
-
-  // Cargo bar at bottom
-  cargo_bar = lv_bar_create(logviewer_screen);
-  lv_obj_set_size(cargo_bar, SCREEN_WIDTH, 40);
-  lv_obj_set_pos(cargo_bar, 0, SCREEN_HEIGHT - 40);
-  lv_bar_set_range(cargo_bar, 0, 256);
-  lv_bar_set_value(cargo_bar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(cargo_bar, LV_COLOR_GAUGE_BG, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(cargo_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
-  
-  lv_obj_t* cargo_label = lv_label_create(cargo_bar);
-  lv_label_set_text(cargo_label, "Cargo: 0/256");
-  lv_obj_set_style_text_color(cargo_label, LV_COLOR_FG, 0);
-  lv_obj_center(cargo_label);
-}
-
-// Forward declaration for settings handlers
-void connectWebSocket();
-
-// System settings button handlers
-static void restart_wifi_handler(lv_event_t * e) {
-  Serial.println("[SETTINGS] Restarting WiFi...");
-  beepClick();
-  WiFi.disconnect();
-  delay(500);
-  wifiMulti.run();
-}
-
-static void restart_websocket_handler(lv_event_t * e) {
-  Serial.println("[SETTINGS] Restarting WebSocket...");
-  beepClick();
-  if (wsClient.available()) {
-    wsClient.close();
-  }
-  delay(500);
-  connectWebSocket();
-}
-
-static void reboot_handler(lv_event_t * e) {
-  Serial.println("[SETTINGS] Rebooting system...");
-  beepDisconnect();
-  delay(500);
-  ESP.restart();
-}
-static void updateAmplitudeDisplay(int amplitude) {
-  if (!amplitude_value_label) return;
-  char buf[48];
-  snprintf(buf, sizeof(buf), "Tone amplitude: %d", amplitude);
-  lv_label_set_text(amplitude_value_label, buf);
-}
-static void amplitude_slider_handler(lv_event_t * e) {
-  lv_obj_t* slider = lv_event_get_target(e);
-  if (!slider) return;
-  int raw = lv_slider_get_value(slider);
-  // Round to nearest 500 to avoid tiny steps and clipping
-  const int step = 500;
-  int rounded = ((raw + step / 2) / step) * step;
-  if (rounded < 500) rounded = 500;
-  if (rounded > 12000) rounded = 12000;
-  lv_slider_set_value(slider, rounded, LV_ANIM_OFF);
-  AUDIO_TONE_AMPL = rounded;
-  updateAmplitudeDisplay(rounded);
-  Serial.printf("[AUDIO] Tone amplitude set to %d\n", rounded);
-  beepClick();
-}
 
 void updateSystemInfo() {
   if (!sys_info_label) return;
@@ -993,7 +524,7 @@ void updateSystemInfo() {
     size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     
     // Get CPU utilization (approximate via task runtime)
-    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
+    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(msgTaskHandle);
     
     // Get WiFi info
     String wifiStatus = "Disconnected";
@@ -1007,6 +538,22 @@ void updateSystemInfo() {
     
     // Get WebSocket status
     String wsStatus = useWebSocket && wsClient.available() ? "Connected" : "Disconnected";
+
+    const char* system = status.currentSystem.length() ? status.currentSystem.c_str() : "--";
+    const char* station = status.currentStation.length() ? status.currentStation.c_str() : "--";
+    const char* dest = status.destinationName.length() ? status.destinationName.c_str() : "--";
+    const char* legal = status.legalState.length() ? status.legalState.c_str() : "--";
+
+    const char* mode = "--";
+    if (status.onFoot) {
+      mode = "On Foot";
+    } else if (status.inSrv) {
+      mode = "SRV";
+    } else if (status.inTaxi) {
+      mode = "Taxi";
+    } else if (status.inShip) {
+      mode = "In Ship";
+    }
     
     char buf[512];
     snprintf(buf, sizeof(buf),
@@ -1020,6 +567,18 @@ void updateSystemInfo() {
       "  RSSI: %d dBm\n\n"
       "WebSocket: %s\n"
       "  Server: %s:%d\n\n"
+      "Status:\n"
+      "  Mode: %s\n"
+      "  System: %s\n"
+      "  Station: %s\n"
+      "  Destination: %s\n"
+      "  Legal: %s\n"
+      "  Shields: %.0f%%\n"
+      "  Jumps: %d\n"
+      "  Fuel: %.1f / %.1f\n"
+      "  Cargo: %d/%d (Drones: %d)\n"
+      "  Backpack: H%d E%d\n"
+      "  Bioscans: %d\n\n"
       "Task Stack Free: %d bytes\n\n"
       "Uptime: %lu sec",
       freeInternal / 1024,
@@ -1027,109 +586,23 @@ void updateSystemInfo() {
       largestBlock / 1024,
       wifiStatus.c_str(), wifiIP.c_str(), rssi,
       wsStatus.c_str(), serverIP.c_str(), websocketPort,
+      mode,
+      system,
+      station,
+      dest,
+      legal,
+      status.shieldsPercent,
+      status.nav.jumpsRemaining,
+      status.fuel.fuelMain, status.fuel.fuelCapacity,
+      status.cargo.usedSpace, status.cargo.totalCapacity, status.cargo.dronesCount,
+      status.backpack.healthpack, status.backpack.energycell,
+      status.bioscan.totalScans,
       stackHighWater * 4,
       millis() / 1000);
     
     lv_label_set_text(sys_info_label, buf);
     xSemaphoreGive(lvglMutex);
   }
-}
-
-void create_settings_ui() {
-  settings_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(settings_screen, LV_COLOR_BG, 0);
-  
-  // Title
-  lv_obj_t* title = lv_label_create(settings_screen);
-  lv_label_set_text(title, "SYSTEM SETTINGS");
-  lv_obj_set_style_text_color(title, LV_COLOR_FG, 0);
-  lv_obj_set_pos(title, 10, 10);
-  
-  // System info display area
-  lv_obj_t* info_area = lv_obj_create(settings_screen);
-  lv_obj_set_size(info_area, SCREEN_WIDTH - 20, 90);
-  lv_obj_set_pos(info_area, 10, 35);
-  lv_obj_set_style_bg_color(info_area, LV_COLOR_GAUGE_BG, 0);
-  lv_obj_set_style_border_width(info_area, 1, 0);
-  lv_obj_set_style_border_color(info_area, LV_COLOR_GAUGE_FG, 0);
-  lv_obj_set_style_radius(info_area, 5, 0);
-  lv_obj_set_scrollbar_mode(info_area, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_set_scroll_dir(info_area, LV_DIR_NONE);
-  
-  sys_info_label = lv_label_create(info_area);
-  lv_label_set_text(sys_info_label, "Loading...");
-  lv_obj_set_style_text_color(sys_info_label, LV_COLOR_FG, 0);
-  lv_label_set_long_mode(sys_info_label, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(sys_info_label, SCREEN_WIDTH - 40);
-  lv_obj_set_pos(sys_info_label, 5, 5);
-  
-  // Button styles
-  static lv_style_t btn_style;
-  lv_style_init(&btn_style);
-  lv_style_set_bg_color(&btn_style, LV_COLOR_GAUGE_BG);
-  lv_style_set_bg_opa(&btn_style, LV_OPA_COVER);
-  lv_style_set_border_color(&btn_style, LV_COLOR_GAUGE_FG);
-  lv_style_set_border_width(&btn_style, 1);
-  lv_style_set_radius(&btn_style, 5);
-  lv_style_set_text_color(&btn_style, LV_COLOR_FG);
-  
-  static lv_style_t btn_pressed_style;
-  lv_style_init(&btn_pressed_style);
-  lv_style_set_bg_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_BG);
-  lv_style_set_text_color(&btn_pressed_style, LV_COLOR_HIGHLIGHT_FG);
-  
-  // Tone amplitude slider
-  amplitude_value_label = lv_label_create(settings_screen);
-  lv_label_set_text(amplitude_value_label, "Tone amplitude: 2000");
-  lv_obj_set_style_text_color(amplitude_value_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(amplitude_value_label, 10, 130);
-
-  amplitude_slider = lv_slider_create(settings_screen);
-  lv_obj_set_size(amplitude_slider, SCREEN_WIDTH - 20, 12);
-  lv_obj_set_pos(amplitude_slider, 10, 150);
-  lv_slider_set_range(amplitude_slider, 500, 12000);
-  lv_slider_set_value(amplitude_slider, AUDIO_TONE_AMPL, LV_ANIM_OFF);
-  lv_obj_add_event_cb(amplitude_slider, amplitude_slider_handler, LV_EVENT_VALUE_CHANGED, NULL);
-  updateAmplitudeDisplay(AUDIO_TONE_AMPL);
-
-  // Restart WiFi button
-  lv_obj_t* btn_wifi = lv_btn_create(settings_screen);
-  lv_obj_set_size(btn_wifi, 145, 35);
-  lv_obj_set_pos(btn_wifi, 10, 175);
-  lv_obj_add_style(btn_wifi, &btn_style, 0);
-  lv_obj_add_style(btn_wifi, &btn_pressed_style, LV_STATE_PRESSED);
-  lv_obj_add_event_cb(btn_wifi, restart_wifi_handler, LV_EVENT_CLICKED, NULL);
-  
-  lv_obj_t* label_wifi = lv_label_create(btn_wifi);
-  lv_label_set_text(label_wifi, "Restart WiFi");
-  lv_obj_center(label_wifi);
-  
-  // Restart WebSocket button
-  lv_obj_t* btn_ws = lv_btn_create(settings_screen);
-  lv_obj_set_size(btn_ws, 145, 35);
-  lv_obj_set_pos(btn_ws, 165, 175);
-  lv_obj_add_style(btn_ws, &btn_style, 0);
-  lv_obj_add_style(btn_ws, &btn_pressed_style, LV_STATE_PRESSED);
-  lv_obj_add_event_cb(btn_ws, restart_websocket_handler, LV_EVENT_CLICKED, NULL);
-  
-  lv_obj_t* label_ws = lv_label_create(btn_ws);
-  lv_label_set_text(label_ws, "Restart WS");
-  lv_obj_center(label_ws);
-  
-  // Reboot button
-  lv_obj_t* btn_reboot = lv_btn_create(settings_screen);
-  lv_obj_set_size(btn_reboot, 300, 35);
-  lv_obj_set_pos(btn_reboot, 10, 215);
-  lv_obj_add_style(btn_reboot, &btn_style, 0);
-  lv_obj_add_style(btn_reboot, &btn_pressed_style, LV_STATE_PRESSED);
-  lv_obj_add_event_cb(btn_reboot, reboot_handler, LV_EVENT_CLICKED, NULL);
-  
-  lv_obj_t* label_reboot = lv_label_create(btn_reboot);
-  lv_label_set_text(label_reboot, "REBOOT SYSTEM");
-  lv_obj_center(label_reboot);
-  
-  // Update system info
-  updateSystemInfo();
 }
 
 void switchToPage(int page) {
@@ -1149,6 +622,7 @@ void switchToPage(int page) {
       // Don't call updateLogDisplay here - it will update when events arrive
       updateCargoBar();
       updateHeader();
+      updateStatusLine();
       updateBackpackDisplay();
     } else if (page == 2) {
       if (!settings_screen) {
@@ -1246,17 +720,10 @@ void checkWifiConnection() {
       Serial.println(WiFi.localIP());
       beepConnect();
       wifiWasConnected = true;
-      
-      // Restart UDP receiver if it wasn't running
-      udpReceiver.stop();
-      if (udpReceiver.begin(UDP_PORT)) {
-        Serial.print("[WiFi] UDP receiver listening on port: ");
-        Serial.println(UDP_PORT);
-      }
-      
-      // Request summary after UDP is ready
-      delay(500);
-      requestSummary();
+
+      // Connect to Icarus terminal websocket as soon as WiFi is up
+      delay(200);
+      connectWebSocket();
     }
   } else {
     if (wifiWasConnected) {
@@ -1290,6 +757,9 @@ void replaceUmlauts(char* str) {
 void handleEliteEvent(const String& eventType, JsonDocument& doc);
 void requestCmdrStatusWs();
 void requestShipStatusWs();
+void requestCmdrProfileWs();
+void requestNavRouteWs();
+static void requestAllStatusOnce();
 
 // WebSocket event handlers
 void onWebSocketMessage(WebsocketsMessage message) {
@@ -1297,14 +767,10 @@ void onWebSocketMessage(WebsocketsMessage message) {
   printHeapStatus("WS start");
   size_t len = message.length();
   //Serial.printf("[WS] Message length: %d bytes\n", len);
-  const size_t MAX_WS_MESSAGE_SIZE = 200000; // Allow larger journal payloads from Icarus terminal
+  const size_t MAX_WS_MESSAGE_SIZE = 400000; // Allow larger journal payloads from Icarus terminal
 
   if (len > MAX_WS_MESSAGE_SIZE) {
     Serial.printf("[WS] ERROR: Message too large (%d bytes), discarding.\n", len);
-    // We must still read the message to clear the buffer, but we won't process it.
-    // Reading it as a string is the easiest way, even if it temporarily allocates.
-    // The crash happens during JSON parsing, not just allocation of a large string.
-    String temp = message.data(); 
     return;
   }
 
@@ -1314,7 +780,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
   JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, data);
+  DeserializationError error = deserializeJson(doc, data, DeserializationOption::NestingLimit(40));
   
   if (error) {
     Serial.printf("[WS] JSON parse error: %s\n", error.c_str());
@@ -1349,39 +815,67 @@ void onWebSocketMessage(WebsocketsMessage message) {
       // Extract fuel
       if (!msg["fuel"].isNull()) {
         if (msg["fuel"]["FuelMain"].is<float>()) {
-          fuelInfo.fuelMain = msg["fuel"]["FuelMain"].as<float>();
+          status.fuel.fuelMain = msg["fuel"]["FuelMain"].as<float>();
         }
         // FuelReservoir is ignored for now
       }
 
       // Extract used cargo count (capacity unknown in this message)
       if (msg["cargo"].is<int>()) {
-        cargoInfo.usedSpace = msg["cargo"].as<int>();
-        cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
+        status.cargo.usedSpace = msg["cargo"].as<int>();
+        status.cargo.cargoCount = status.cargo.usedSpace - status.cargo.dronesCount;
       }
+
+      // Location and state flags
+      if (msg["system"].is<const char*>()) {
+        status.currentSystem = msg["system"].as<const char*>();
+      }
+      if (msg["station"].is<const char*>()) {
+        status.currentStation = msg["station"].as<const char*>();
+      }
+      if (msg["credits"].is<long>()) {
+        status.credits = msg["credits"].as<long>();
+      }
+      if (msg["docked"].is<bool>()) status.docked = msg["docked"];
+      if (msg["landed"].is<bool>()) status.landed = msg["landed"];
+      if (msg["inSpace"].is<bool>()) status.inSpace = msg["inSpace"];
+      if (msg["onFoot"].is<bool>()) status.onFoot = msg["onFoot"];
+      if (msg["inShip"].is<bool>()) status.inShip = msg["inShip"];
+      if (msg["inSrv"].is<bool>()) status.inSrv = msg["inSrv"];
+      if (msg["inTaxi"].is<bool>()) status.inTaxi = msg["inTaxi"];
+      if (msg["inMulticrew"].is<bool>()) status.inMulticrew = msg["inMulticrew"];
 
       updateHeader();
       updateCargoBar();
+    } else if (name && strcmp(name, "gameStateChange") == 0) {
+      Serial.println("[WS] gameStateChange broadcast received, refreshing state");
+      requestShipStatusWs();
     } else if (name && strcmp(name, "getShipStatus") == 0 && !msg.isNull()) {
       summaryReceived = true;  // Treat as initial state received
       Serial.println("[WS] Received ShipStatus response");
 
       // Fuel levels
       if (msg["fuelLevel"].is<float>()) {
-        fuelInfo.fuelMain = msg["fuelLevel"].as<float>();
+        status.fuel.fuelMain = msg["fuelLevel"].as<float>();
       }
       if (msg["fuelCapacity"].is<float>()) {
-        fuelInfo.fuelCapacity = msg["fuelCapacity"].as<float>();
+        status.fuel.fuelCapacity = msg["fuelCapacity"].as<float>();
+      }
+      if (msg["onBoard"].is<bool>()) {
+        status.inShip = msg["onBoard"];
+      }
+      if (msg["currentSystem"].is<const char*>()) {
+        status.currentSystem = msg["currentSystem"].as<const char*>();
       }
 
       // Cargo and limpet drones
       if (msg["cargo"].is<JsonObject>()) {
         JsonObject cargo = msg["cargo"].as<JsonObject>();
         if (cargo["capacity"].is<int>()) {
-          cargoInfo.totalCapacity = cargo["capacity"].as<int>();
+          status.cargo.totalCapacity = cargo["capacity"].as<int>();
         }
         if (cargo["count"].is<int>()) {
-          cargoInfo.usedSpace = cargo["count"].as<int>();
+          status.cargo.usedSpace = cargo["count"].as<int>();
         }
 
         // Find drones in inventory list (case-insensitive symbol match)
@@ -1396,13 +890,13 @@ void onWebSocketMessage(WebsocketsMessage message) {
             }
           }
         }
-        cargoInfo.dronesCount = drones;
-        cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
-        if (cargoInfo.cargoCount < 0) cargoInfo.cargoCount = 0;
+        status.cargo.dronesCount = drones;
+        status.cargo.cargoCount = status.cargo.usedSpace - status.cargo.dronesCount;
+        if (status.cargo.cargoCount < 0) status.cargo.cargoCount = 0;
       }
 
       // Hull health from armour module (health is 0-1, but guard percent inputs)
-      float hull = hullInfo.hullHealth;
+      float hull = status.hull.hullHealth;
       if (msg["modules"].is<JsonObject>()) {
         JsonObject mods = msg["modules"].as<JsonObject>();
         JsonVariant armour = mods["Armour"];
@@ -1413,10 +907,29 @@ void onWebSocketMessage(WebsocketsMessage message) {
       if (hull > 1.0f) {
         hull /= 100.0f;
       }
-      hullInfo.hullHealth = hull;
+      status.hull.hullHealth = hull;
+
+      if (msg["type"].is<const char*>()) {
+        status.hull.hullType = msg["type"].as<const char*>();
+      }
 
       updateHeader();
       updateCargoBar();
+    } else if (name && strcmp(name, "getNavRoute") == 0 && !msg.isNull()) {
+      Serial.println("[WS] Received NavRoute response");
+      if (msg["jumpsToDestination"].is<int>()) {
+        updateJumpsRemaining(msg["jumpsToDestination"].as<int>());
+      } else if (msg["route"].is<JsonArray>()) {
+        JsonArray route = msg["route"].as<JsonArray>();
+        updateJumpsRemaining(route.size());
+      }
+      updateHeader();
+    } else if (name && strcmp(name, "getCmdr") == 0 && !msg.isNull()) {
+      Serial.println("[WS] Received Cmdr response");
+      if (msg["credits"].is<long>()) {
+        status.credits = msg["credits"].as<long>();
+      }
+      // Commander info (name/rank) could be parsed here if needed
     } else {
       Serial.printf("[WS] Unhandled name message: %s\n", name ? name : "(null)");
       Serial.println(data);
@@ -1467,13 +980,12 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
     case WebsocketsEvent::ConnectionOpened:
       Serial.println("[WS] Connected to server");
       useWebSocket = true;
-      // Request initial commander status from Icarus terminal
-      requestCmdrStatusWs();
+      // Request initial ship status from Icarus terminal
       requestShipStatusWs();
       break;
       
     case WebsocketsEvent::ConnectionClosed:
-      Serial.println("[WS] Disconnected from server");
+      Serial.printf("[WS] Disconnected from server (info: %s)\n", data.c_str());
       useWebSocket = false;
       break;
       
@@ -1513,10 +1025,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
   static char tempBuf[60];
   
   if (eventType == "KEEPALIVE") {
-    // Parse KEEPALIVE packet: KEEPALIVE|0|{"ip": "x.x.x.x", "websocket_port": 12347, "udp_control_port": 12346, "current_message_id": 1}
+    // Parse KEEPALIVE packet: KEEPALIVE|0|{"ip": "x.x.x.x", "websocket_port": 12347, "current_message_id": 1}
     const char* ip = doc["ip"];
     int ws_port = doc["websocket_port"] | 0;
-    int udp_ctrl_port = doc["udp_control_port"] | 0;
     
     if (ip && ws_port > 0) {
       // Check if server changed
@@ -1524,10 +1035,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       
       serverIP = String(ip);
       websocketPort = ws_port;
-      udpControlPort = udp_ctrl_port;
       
-      Serial.printf("[KEEPALIVE] WebSocket server: %s:%d, UDP Control: %d\n", 
-        serverIP.c_str(), websocketPort, udpControlPort);
+      Serial.printf("[KEEPALIVE] WebSocket server: %s:%d\n", 
+        serverIP.c_str(), websocketPort);
       
       // If server changed or not connected, reconnect WebSocket
       if (serverChanged || !wsClient.available()) {
@@ -1547,8 +1057,8 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       JsonArray consumables = doc["Consumables"];
       
       // Reset counts
-      backpackInfo.healthpack = 0;
-      backpackInfo.energycell = 0;
+      status.backpack.healthpack = 0;
+      status.backpack.energycell = 0;
       
       for (JsonObject item : consumables) {
         const char* name = item["Name"];
@@ -1558,7 +1068,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
           backpackInfo.healthpack = count;
           Serial.printf("[BACKPACK] Healthpack: %d\n", count);
         } else if (strcmp(name, "energycell") == 0) {
-          backpackInfo.energycell = count;
+          status.backpack.energycell = count;
           Serial.printf("[BACKPACK] Energycell: %d\n", count);
         }
       }
@@ -1575,8 +1085,8 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     
     if (count > 0) {
       // Just track total count, ignore variants
-      bioscanInfo.totalScans = count;
-      Serial.printf("[BIOSCAN] Total scans: %d\n", bioscanInfo.totalScans);
+      status.bioscan.totalScans = count;
+      Serial.printf("[BIOSCAN] Total scans: %d\n", status.bioscan.totalScans);
       updateBackpackDisplay();
     }
     return;
@@ -1588,33 +1098,44 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update fuel (now has percent, current, and capacity)
     if (!doc["fuel"].isNull()) {
       if (doc["fuel"]["current"].is<float>()) {
-        fuelInfo.fuelMain = doc["fuel"]["current"];
+        status.fuel.fuelMain = doc["fuel"]["current"];
       }
       if (doc["fuel"]["capacity"].is<float>()) {
-        fuelInfo.fuelCapacity = doc["fuel"]["capacity"];
+        status.fuel.fuelCapacity = doc["fuel"]["capacity"];
       }
     }
     
     // Update cargo
     if (!doc["cargo"].isNull()) {
-      cargoInfo.totalCapacity = doc["cargo"]["capacity"];
-      cargoInfo.usedSpace = doc["cargo"]["count"].as<int>();
-      cargoInfo.dronesCount = doc["cargo"]["drones"].as<int>();
+      status.cargo.totalCapacity = doc["cargo"]["capacity"];
+      status.cargo.usedSpace = doc["cargo"]["count"].as<int>();
+      status.cargo.dronesCount = doc["cargo"]["drones"].as<int>();
       // Calculate cargo without drones
-      cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
+      status.cargo.cargoCount = status.cargo.usedSpace - status.cargo.dronesCount;
     }
     
     // Update hull
     if (!doc["hull"].isNull()) {
-      hullInfo.hullHealth = doc["hull"].as<float>() / 100.0f;
+      status.hull.hullHealth = doc["hull"].as<float>() / 100.0f;
     }
     
     // Update shields
     if (!doc["shields"].isNull()) {
       // shields is a percentage (0-100)
       float shieldsPercent = doc["shields"].as<float>();
+      status.shieldsPercent = shieldsPercent;
       Serial.printf("[SHIELDS] %.1f%%\n", shieldsPercent);
     }
+
+    // Update commander/ship state flags if present
+    if (doc["onFoot"].is<bool>()) status.onFoot = doc["onFoot"];
+    if (doc["inShip"].is<bool>()) status.inShip = doc["inShip"];
+    if (doc["docked"].is<bool>()) status.docked = doc["docked"];
+    if (doc["inSpace"].is<bool>()) status.inSpace = doc["inSpace"];
+    if (doc["landed"].is<bool>()) status.landed = doc["landed"];
+    if (doc["inSrv"].is<bool>()) status.inSrv = doc["inSrv"];
+    if (doc["inTaxi"].is<bool>()) status.inTaxi = doc["inTaxi"];
+    if (doc["inMulticrew"].is<bool>()) status.inMulticrew = doc["inMulticrew"];
     
     // Update route jumps (now a single integer, not an object)
     if (!doc["route"].isNull()) {
@@ -1624,12 +1145,14 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update balance
     if (!doc["balance"].is<nullptr_t>()) {
       long balance = doc["balance"];
+      status.credits = balance;
       Serial.printf("[BALANCE] Credits: %ld\n", balance);
     }
     
     // Update legal state
     if (doc["legal_state"].is<const char*>()) {
       const char* legalState = doc["legal_state"];
+      status.legalState = legalState;
       Serial.printf("[LEGAL] State: %s\n", legalState);
     }
     
@@ -1638,8 +1161,10 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       const char* system = doc["location"]["system"];
       const char* station = doc["location"]["station"];
       if (system) {
+        status.currentSystem = system;
         Serial.printf("[LOCATION] System: %s", system);
         if (station) {
+          status.currentStation = station;
           Serial.printf(", Station: %s\n", station);
         } else {
           Serial.println();
@@ -1651,6 +1176,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     if (!doc["destination"].isNull() && !doc["destination"].is<nullptr_t>()) {
       const char* destName = doc["destination"]["Name"];
       if (destName) {
+        status.destinationName = destName;
         Serial.printf("[DESTINATION] %s\n", destName);
       }
     }
@@ -1658,41 +1184,43 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update backpack from summary if available
     if (!doc["backpack"].isNull()) {
       if (doc["backpack"]["healthpack"].is<int>()) {
-        backpackInfo.healthpack = doc["backpack"]["healthpack"];
+        status.backpack.healthpack = doc["backpack"]["healthpack"];
       }
       if (doc["backpack"]["energycell"].is<int>()) {
-        backpackInfo.energycell = doc["backpack"]["energycell"];
+        status.backpack.energycell = doc["backpack"]["energycell"];
       }
       Serial.printf("[BACKPACK] Healthpack: %d, Energycell: %d\n",
-        backpackInfo.healthpack, backpackInfo.energycell);
+        status.backpack.healthpack, status.backpack.energycell);
     }
     
     // Update bioscans from summary if available
     if (!doc["bioscans"].isNull()) {
       JsonObject bioscans = doc["bioscans"];
       bioscanInfo.totalScans = 0;
+      status.bioscan.totalScans = 0;
       
       // Sum all bioscan counts across all variants
       for (JsonPair kv : bioscans) {
         int count = kv.value().as<int>();
-        bioscanInfo.totalScans += count;
+        status.bioscan.totalScans += count;
       }
       
-      Serial.printf("[BIOSCAN] Total scans from summary: %d\n", bioscanInfo.totalScans);
+      Serial.printf("[BIOSCAN] Total scans from summary: %d\n", status.bioscan.totalScans);
     }
     
     // Update all displays
     updateHeader();
+    updateStatusLine();
     updateCargoBar();
     updateBackpackDisplay();
     
     Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
-      fuelInfo.fuelMain, fuelInfo.fuelCapacity,
-      (fuelInfo.fuelCapacity > 0) ? (fuelInfo.fuelMain / fuelInfo.fuelCapacity * 100.0f) : 0.0f,
-      cargoInfo.usedSpace, cargoInfo.totalCapacity,
-      cargoInfo.dronesCount,
-      hullInfo.hullHealth * 100.0f,
-      navRouteInfo.jumpsRemaining);
+      status.fuel.fuelMain, status.fuel.fuelCapacity,
+      (status.fuel.fuelCapacity > 0) ? (status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0.0f,
+      status.cargo.usedSpace, status.cargo.totalCapacity,
+      status.cargo.dronesCount,
+      status.hull.hullHealth * 100.0f,
+      status.nav.jumpsRemaining);
   } else if (eventType == "JOURNAL") {
     String event = doc["event"].as<String>();
     
@@ -1723,7 +1251,24 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Show player's percentile band for community goals
       if (!doc["CurrentGoals"].isNull()) {
         JsonArray goals = doc["CurrentGoals"];
+        status.communityGoals.clear();
         for (JsonObject goal : goals) {
+          CommunityGoal cg;
+          if (goal["Title"].is<const char*>()) {
+            cg.title = goal["Title"].as<const char*>();
+          } else if (goal["Name"].is<const char*>()) {
+            cg.title = goal["Name"].as<const char*>();
+          }
+          if (goal["PlayerPercentileBand"].is<int>()) {
+            cg.percentile = goal["PlayerPercentileBand"];
+          }
+          if (goal["TierReached"].is<int>()) {
+            cg.tier = goal["TierReached"];
+          }
+          if (goal["Contributors"].is<int>()) {
+            cg.contributors = goal["Contributors"];
+          }
+          status.communityGoals.push_back(cg);
           if (!goal["PlayerPercentileBand"].isNull()) {
             int percentile = goal["PlayerPercentileBand"];
             snprintf(logBuf, sizeof(logBuf), "CommunityGoal: Top %d%%", percentile);
@@ -1737,14 +1282,14 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       if (doc["RemainingJumpsInRoute"].is<int>()) {
         updateJumpsRemaining(doc["RemainingJumpsInRoute"].as<int>());
         updateHeader();
-        Serial.printf("[NAV] Jumps remaining: %d\n", navRouteInfo.jumpsRemaining);
+        Serial.printf("[NAV] Jumps remaining: %d\n", status.nav.jumpsRemaining);
       }
     } else if (event == "FSDJump") {
       // Update fuel level after a jump
       if (doc["FuelLevel"].is<float>()) {
-        fuelInfo.fuelMain = doc["FuelLevel"].as<float>();
+        status.fuel.fuelMain = doc["FuelLevel"].as<float>();
         updateHeader();
-        Serial.printf("[FUEL] FSDJump FuelLevel: %.2f\n", fuelInfo.fuelMain);
+        Serial.printf("[FUEL] FSDJump FuelLevel: %.2f\n", status.fuel.fuelMain);
       }
     } else if (event == "NavRouteClear") {
       // Journal event when route is cleared
@@ -1758,9 +1303,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     } else if (event == "HullDamage") {
       // Update hull health from damage event
       if (!doc["Health"].isNull()) {
-        hullInfo.hullHealth = doc["Health"];
+        status.hull.hullHealth = doc["Health"];
         updateHeader();
-        Serial.printf("[HULL] Health: %.1f%%\n", hullInfo.hullHealth * 100.0f);
+        Serial.printf("[HULL] Health: %.1f%%\n", status.hull.hullHealth * 100.0f);
       }
     } else if (event == "ProspectedAsteroid") {
       // Check for motherlode material
@@ -1842,7 +1387,30 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update balance
     if (!doc["Balance"].is<nullptr_t>()) {
       long balance = doc["Balance"];
+      status.credits = balance;
       // Balance updated, but not displayed currently
+    }
+
+    // Update state flags if present
+    if (doc["OnFoot"].is<bool>()) status.onFoot = doc["OnFoot"];
+    if (doc["InShip"].is<bool>()) status.inShip = doc["InShip"];
+    if (doc["Docked"].is<bool>()) status.docked = doc["Docked"];
+    if (doc["InSpace"].is<bool>()) status.inSpace = doc["InSpace"];
+    if (doc["Landed"].is<bool>()) status.landed = doc["Landed"];
+    if (doc["InSRV"].is<bool>()) status.inSrv = doc["InSRV"];
+    if (doc["InTaxi"].is<bool>()) status.inTaxi = doc["InTaxi"];
+    if (doc["InMulticrew"].is<bool>()) status.inMulticrew = doc["InMulticrew"];
+
+    if (doc["Flags"].is<JsonObject>()) {
+      JsonObject flags = doc["Flags"].as<JsonObject>();
+      if (flags["onFoot"].is<bool>()) status.onFoot = flags["onFoot"];
+      if (flags["inShip"].is<bool>()) status.inShip = flags["inShip"];
+      if (flags["docked"].is<bool>()) status.docked = flags["docked"];
+      if (flags["inSpace"].is<bool>()) status.inSpace = flags["inSpace"];
+      if (flags["landed"].is<bool>()) status.landed = flags["landed"];
+      if (flags["inSrv"].is<bool>()) status.inSrv = flags["inSrv"];
+      if (flags["inTaxi"].is<bool>()) status.inTaxi = flags["inTaxi"];
+      if (flags["inMulticrew"].is<bool>()) status.inMulticrew = flags["inMulticrew"];
     }
     
     // Update legal state
@@ -1902,7 +1470,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       Serial.printf("[MISSION] Missions in system: %d\n", missionsInSystem);
     }
   } else {
-    Serial.print("[UDP] Unhandled event type: ");
+    Serial.print("[WS] Unhandled event type: ");
     Serial.println(eventType);
   }
 }
@@ -1924,131 +1492,44 @@ void checkMessages() {
     // Poll WebSocket for incoming messages
     if (wsClient.available()) {
       wsClient.poll();
-      // Skip UDP when WebSocket is active
-      return;
-    }
-  }
-  // Check for UDP messages (only when TCP is not enabled)
-  // Only process UDP if WiFi is connected
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  
-  int packetSize = udpReceiver.parsePacket();
-  
-  if (packetSize > 0) {
-    Serial.printf("[UDP] Detected packet: %d bytes\n", packetSize);
-    
-    if (packetSize >= UDP_BUFFER_SIZE) {
-      Serial.printf("[UDP] ERROR: Packet too large (%d bytes), buffer is %d bytes - DISCARDING\n", 
-        packetSize, UDP_BUFFER_SIZE);
-      udpReceiver.flush();  // Clear the buffer
-      return;
-    }
-    
-    int len = udpReceiver.read(udpBuffer, UDP_BUFFER_SIZE - 1);
-    if (len > 0) {
-      udpBuffer[len] = 0;
-      
-      Serial.print("[UDP Core ");
-      Serial.print(xPortGetCoreID());
-      Serial.print("] Received ");
-      Serial.print(len);
-      Serial.print(" bytes: ");
-      
-      // For large packets, only print first 100 chars
-      if (len > 100) {
-        char preview[101];
-        strncpy(preview, udpBuffer, 100);
-        preview[100] = 0;
-        Serial.print(preview);
-        Serial.println("... (truncated)");
-      } else {
-        Serial.println(udpBuffer);
-      }
-      
-      // Reset timeout and turn on display on message received
-      lastTouchTime = millis();
-      if (!displayOn) {
-        setDisplayPower(true);
-      }
-      
-      String message = String(udpBuffer);
-      
-      // Parse format: EVENTTYPE|ID|{json}
-      int firstSep = message.indexOf('|');
-      if (firstSep > 0) {
-        String eventType = message.substring(0, firstSep);
-        
-        int secondSep = message.indexOf('|', firstSep + 1);
-        if (secondSep > 0) {
-          String eventIdStr = message.substring(firstSep + 1, secondSep);
-          String jsonData = message.substring(secondSep + 1);
-          
-          int eventId = eventIdStr.toInt();
-          
-          // Deduplicate: skip if we've already seen this ID (except KEEPALIVE)
-          if (eventId == lastEventId && eventType != "KEEPALIVE") {
-            Serial.printf("[UDP] Duplicate %s ID %d - skipping\n", eventType.c_str(), eventId);
-            return;
-          }
-          
-          if (eventType != "KEEPALIVE") {
-            lastEventId = eventId;
-          }
-          Serial.printf("[UDP] Processing %s event ID: %d\n", eventType.c_str(), eventId);
-          
-          // Parse JSON with reduced buffer
-          JsonDocument doc;
-          DeserializationError error = deserializeJson(doc, jsonData);
-          
-          if (!error) {
-            handleEliteEvent(eventType, doc);
-          } else {
-            Serial.print("JSON Parse Error: ");
-            Serial.println(error.c_str());
-          }
-        } else {
-          Serial.println("[UDP] ERROR: No second separator found");
-        }
-      } else {
-        Serial.println("[UDP] ERROR: No first separator found");
+      static uint32_t lastPing = 0;
+      uint32_t now = millis();
+      if (now - lastPing > 15000) {  // Send ping every 15s to keep connection alive
+        wsClient.ping();
+        lastPing = now;
       }
     }
   }
 }
 
-// Message handling task running on Core 0 for non-blocking UDP and WebSocket reception
+// Coalesced status requests with a short cooldown to avoid flooding the server
+static void requestAllStatusOnce() {
+  static uint32_t lastRequestBatch = 0;
+  uint32_t now = millis();
+  if (now - lastRequestBatch < 1500) {
+    return;  // too soon, skip this batch
+  }
+  lastRequestBatch = now;
+
+  requestCmdrStatusWs();
+  requestShipStatusWs();
+  requestCmdrProfileWs();
+  requestNavRouteWs();
+}
+
+// Message handling task running on Core 0 for non-blocking WebSocket reception
 void loop2(void* parameter) {
   Serial.print("[MSG] Task started on core: ");
   Serial.println(xPortGetCoreID());
   
   while (1) {
-    // Check messages (WebSocket polling or UDP)
+    // Check messages (WebSocket polling)
     checkMessages();
     
-    // Poll frequently for WebSocket or UDP
+    // Poll frequently for WebSocket
     vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling
   }
 }
-
-void requestSummary() {
-  if (WiFi.status() == WL_CONNECTED) {
-    IPAddress broadcastIP = WiFi.localIP();
-    broadcastIP[3] = 255;  // Change last octet to 255 for broadcast
-    
-    Serial.println("[SUMMARY] Requesting summary data...");
-    
-    // Send to broadcast address using sender socket
-    udpSender.beginPacket(broadcastIP, UDP_PORT + 1);
-    udpSender.write((const uint8_t*)"SUMMARY", 7);
-    udpSender.endPacket();
-    
-    Serial.printf("[SUMMARY] Sent request to %s:%d\n", 
-      broadcastIP.toString().c_str(), UDP_PORT + 1);
-  }
-}
-
 
 void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
 {
@@ -2058,22 +1539,11 @@ void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
     Serial.println(WiFi.localIP());
     wifiWasConnected = true;
     beepConnect();  // Rising tone for WiFi connection
-    
-    // Start UDP receiver (Core 0 will use this)
-    if (udpReceiver.begin(UDP_PORT)) {
-      Serial.print("UDP receiver listening on port: ");
-      Serial.println(UDP_PORT);
-    } else {
-      Serial.println("ERROR: Failed to start UDP receiver!");
-    }
+
     update_wifi_icon();
-    
-    // Initialize UDP sender (Core 1 will use this)
-    Serial.println("UDP sender initialized for outgoing packets");
-    
-    // Request initial summary data
-    delay(500);  // Give UDP stack time to initialize
-    requestSummary();
+
+    // Connect to WebSocket immediately when WiFi comes up
+    connectWebSocket();
   } else {
     Serial.println("\nWiFi connection failed, continuing without WiFi");
   }
@@ -2130,26 +1600,20 @@ void setup()
     buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
   
-  udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!udpBuffer) {
-    Serial.println("[MEM] PSRAM allocation failed for UDP buffer, trying internal RAM...");
-    udpBuffer = (char*)heap_caps_malloc(UDP_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  }
-  
   logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!logText) {
     Serial.println("[MEM] PSRAM allocation failed for log buffer, trying internal RAM...");
     logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
   
-  if (!buf || !udpBuffer || !logText) {
+  if (!buf || !logText) {
     Serial.println("ERROR: Failed to allocate buffers!");
-    Serial.printf("buf: %p, udpBuffer: %p, logText: %p\n", buf, udpBuffer, logText);
+    Serial.printf("buf: %p, logText: %p\n", buf, logText);
     while(1) delay(1000);
   }
   
-  Serial.printf("[MEM] Buffers allocated - LVGL: %d, UDP: %d, Log: %d bytes\n", 
-                LVGL_BUFFER_SIZE, UDP_BUFFER_SIZE, LOG_TEXT_SIZE);
+  Serial.printf("[MEM] Buffers allocated - LVGL: %d, Log: %d bytes\n", 
+                LVGL_BUFFER_SIZE, LOG_TEXT_SIZE);
   Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   if (psramFound()) {
     Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -2237,7 +1701,7 @@ void setup()
     } else {
       Serial.println("[I2S] DMA buffer zeroed successfully");
     }
-    i2sInitialized = true;  // Mark I2S as ready
+    soundSetInitialized(true);  // Mark I2S as ready for tones
     Serial.println("[I2S] Audio driver initialized successfully");
   }
 
@@ -2280,14 +1744,14 @@ void setup()
     while(1);
   }
   
-  // Start message handler task on Core 0 (UDP + WebSocket)
+  // Start message handler task on Core 0 (WebSocket polling)
   xTaskCreatePinnedToCore(
     loop2,              // Task function
     "MSG_Handler",      // Task name
     32768,              // Stack size (32KB - increased with PSRAM for WebSocket + JSON parsing)
     NULL,               // Parameters
     2,                  // Priority (2 = higher than default)
-    &udpTaskHandle,     // Task handle
+    &msgTaskHandle,     // Task handle
     0                   // Core 0 (PRO_CPU)
   );
   
@@ -2327,7 +1791,7 @@ void loop()
     printHeapStatus("main loop");
     
     // Print task stack high water marks
-    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(udpTaskHandle);
+    UBaseType_t stackHighWater = uxTaskGetStackHighWaterMark(msgTaskHandle);
     Serial.printf("[STACK] MSG_Handler high water mark: %d bytes free\n", stackHighWater * 4);
     
     // Update system info if on settings page
@@ -2343,6 +1807,8 @@ void loop()
     if (wsClient.available()) {
       requestCmdrStatusWs();
       requestShipStatusWs();
+      requestCmdrProfileWs();
+      requestNavRouteWs();
     } else {
       // Try to connect WS if not already
       connectWebSocket();
@@ -2518,8 +1984,8 @@ void showJumpOverlay(int jumps) {
 
 void updateJumpsRemaining(int newValue) {
   if (newValue < 0) newValue = 0;
-  bool changed = navRouteInfo.jumpsRemaining != newValue;
-  navRouteInfo.jumpsRemaining = newValue;
+  bool changed = status.nav.jumpsRemaining != newValue;
+  status.nav.jumpsRemaining = newValue;
   if (changed) {
     pendingJumpOverlay = true;
     pendingJumpValue = newValue;
@@ -2532,9 +1998,16 @@ void requestCmdrStatusWs() {
     return;
   }
 
+  static uint32_t lastSent = 0;
+  uint32_t now = millis();
+  if (now - lastSent < 1000) {
+    return; // rate limit: 1 Hz
+  }
+  lastSent = now;
+
   // Build a lightweight request with a simple requestId
   String reqId = String("esp32-") + String(millis());
-  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getCmdrStatus\",\"message\":null}";
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getCmdrStatus\",\"message\":{}}";
   wsClient.send(payload);
   Serial.println("[WS] Sent getCmdrStatus request");
 }
@@ -2546,7 +2019,38 @@ void requestShipStatusWs() {
   }
 
   String reqId = String("esp32-ship-") + String(millis());
-  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getShipStatus\",\"message\":null}";
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getShipStatus\",\"message\":{}}";
   wsClient.send(payload);
   Serial.println("[WS] Sent getShipStatus request");
+}
+
+// Request commander profile (credits, name)
+void requestCmdrProfileWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  String reqId = String("esp32-cmdr-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getCmdr\",\"message\":{}}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getCmdr request");
+}
+
+// Request nav route information (jumps, destination)
+void requestNavRouteWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  static uint32_t lastSent = 0;
+  uint32_t now = millis();
+  if (now - lastSent < 1000) {
+    return; // rate limit: 1 Hz
+  }
+  lastSent = now;
+
+  String reqId = String("esp32-nav-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getNavRoute\",\"message\":{}}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getNavRoute request");
 }
