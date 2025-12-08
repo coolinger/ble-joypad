@@ -50,5 +50,6 @@ Build a desk-friendly, wireless controller that combines tactile buttons with an
 3. Use the extra buttons in your favorite simulator!
 
 ## Future Plans
-- Integrate the onboard 240x320 display to show in-game data.
-- Receive and display data over BLE serial console from the simulator/game.
+- ~Integrate the onboard 240x320 display to show in-game data.~
+- ~Receive and display data over BLE serial console from the simulator/game.~
+- Add battery support for 18650 Li‑ion (charging, fuel gauge, and on-screen status).
