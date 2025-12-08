@@ -6,6 +6,7 @@
 #include "display.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
 #include <esp_heap_caps.h>
@@ -115,6 +116,9 @@ struct FighterCommand
 #define HOSTNAME "FighterController"
 #define UDP_PORT 12345
 
+WiFiMulti wifiMulti;
+
+
 // Elite Dangerous data structures
 struct CargoInfo {
   int totalCapacity = 256;
@@ -174,8 +178,9 @@ const int UDP_BUFFER_SIZE = 8192;  // Increased for PSRAM
 int lastEventId = -1;  // Track last event ID for deduplication
 
 // WebSocket variables for Elite Dangerous data
-String serverIP = "";
-int websocketPort = 0;
+// If not discovered via KEEPALIVE, fallback to configured server IP
+String serverIP = "192.168.178.85";
+int websocketPort = 3300;  // Icarus terminal WS port
 int udpControlPort = 0;
 bool useWebSocket = false;
 WebsocketsClient wsClient;
@@ -935,7 +940,7 @@ static void restart_wifi_handler(lv_event_t * e) {
   beepClick();
   WiFi.disconnect();
   delay(500);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiMulti.run();
 }
 
 static void restart_websocket_handler(lv_event_t * e) {
@@ -1283,6 +1288,8 @@ void replaceUmlauts(char* str) {
 
 // Forward declaration
 void handleEliteEvent(const String& eventType, JsonDocument& doc);
+void requestCmdrStatusWs();
+void requestShipStatusWs();
 
 // WebSocket event handlers
 void onWebSocketMessage(WebsocketsMessage message) {
@@ -1290,7 +1297,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   printHeapStatus("WS start");
   size_t len = message.length();
   //Serial.printf("[WS] Message length: %d bytes\n", len);
-  const size_t MAX_WS_MESSAGE_SIZE = 8000; // 8KB limit
+  const size_t MAX_WS_MESSAGE_SIZE = 200000; // Allow larger journal payloads from Icarus terminal
 
   if (len > MAX_WS_MESSAGE_SIZE) {
     Serial.printf("[WS] ERROR: Message too large (%d bytes), discarding.\n", len);
@@ -1315,6 +1322,111 @@ void onWebSocketMessage(WebsocketsMessage message) {
     return;
   }
   
+  // Icarus Terminal format: {"name":"newLogEntry", "message":{...}}
+  if (doc["name"].is<const char*>()) {
+    const char* name = doc["name"];
+    JsonVariant msg = doc["message"];
+
+    // Reset timeout and wake display on any message
+    lastTouchTime = millis();
+    if (!displayOn) {
+      setDisplayPower(true);
+    }
+
+    if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
+      String eventType = "JOURNAL";  // Reuse existing journal handler
+
+      JsonDocument eventDoc;
+      eventDoc.set(msg);
+
+      printHeapStatus("before handler");
+      handleEliteEvent(eventType, eventDoc);
+      printHeapStatus("after handler");
+    } else if (name && strcmp(name, "getCmdrStatus") == 0 && !msg.isNull()) {
+      summaryReceived = true;  // Treat as initial state received
+      Serial.println("[WS] Received CmdrStatus response");
+
+      // Extract fuel
+      if (!msg["fuel"].isNull()) {
+        if (msg["fuel"]["FuelMain"].is<float>()) {
+          fuelInfo.fuelMain = msg["fuel"]["FuelMain"].as<float>();
+        }
+        // FuelReservoir is ignored for now
+      }
+
+      // Extract used cargo count (capacity unknown in this message)
+      if (msg["cargo"].is<int>()) {
+        cargoInfo.usedSpace = msg["cargo"].as<int>();
+        cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
+      }
+
+      updateHeader();
+      updateCargoBar();
+    } else if (name && strcmp(name, "getShipStatus") == 0 && !msg.isNull()) {
+      summaryReceived = true;  // Treat as initial state received
+      Serial.println("[WS] Received ShipStatus response");
+
+      // Fuel levels
+      if (msg["fuelLevel"].is<float>()) {
+        fuelInfo.fuelMain = msg["fuelLevel"].as<float>();
+      }
+      if (msg["fuelCapacity"].is<float>()) {
+        fuelInfo.fuelCapacity = msg["fuelCapacity"].as<float>();
+      }
+
+      // Cargo and limpet drones
+      if (msg["cargo"].is<JsonObject>()) {
+        JsonObject cargo = msg["cargo"].as<JsonObject>();
+        if (cargo["capacity"].is<int>()) {
+          cargoInfo.totalCapacity = cargo["capacity"].as<int>();
+        }
+        if (cargo["count"].is<int>()) {
+          cargoInfo.usedSpace = cargo["count"].as<int>();
+        }
+
+        // Find drones in inventory list (case-insensitive symbol match)
+        int drones = 0;
+        if (cargo["inventory"].is<JsonArrayConst>() || cargo["inventory"].is<JsonArray>()) {
+          JsonArrayConst inv = cargo["inventory"].as<JsonArrayConst>();
+          for (JsonVariantConst item : inv) {
+            const char* symbol = item["symbol"];
+            if (symbol && (strcmp(symbol, "drones") == 0 || String(symbol).equalsIgnoreCase("drones"))) {
+              drones = item["count"].as<int>();
+              break;
+            }
+          }
+        }
+        cargoInfo.dronesCount = drones;
+        cargoInfo.cargoCount = cargoInfo.usedSpace - cargoInfo.dronesCount;
+        if (cargoInfo.cargoCount < 0) cargoInfo.cargoCount = 0;
+      }
+
+      // Hull health from armour module (health is 0-1, but guard percent inputs)
+      float hull = hullInfo.hullHealth;
+      if (msg["modules"].is<JsonObject>()) {
+        JsonObject mods = msg["modules"].as<JsonObject>();
+        JsonVariant armour = mods["Armour"];
+        if (!armour.isNull() && armour["health"].is<float>()) {
+          hull = armour["health"].as<float>();
+        }
+      }
+      if (hull > 1.0f) {
+        hull /= 100.0f;
+      }
+      hullInfo.hullHealth = hull;
+
+      updateHeader();
+      updateCargoBar();
+    } else {
+      Serial.printf("[WS] Unhandled name message: %s\n", name ? name : "(null)");
+      Serial.println(data);
+    }
+
+    doc.clear();
+    printHeapStatus("WS end");
+    return;
+  }
+
   // Extract message fields
   const char* type = doc["type"];
   int id = doc["id"] | 0;
@@ -1355,8 +1467,9 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
     case WebsocketsEvent::ConnectionOpened:
       Serial.println("[WS] Connected to server");
       useWebSocket = true;
-      // Request initial summary
-      wsClient.send("{\"command\":\"SUMMARY\"}");
+      // Request initial commander status from Icarus terminal
+      requestCmdrStatusWs();
+      requestShipStatusWs();
       break;
       
     case WebsocketsEvent::ConnectionClosed:
@@ -1375,6 +1488,10 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
 }
 
 void connectWebSocket() {
+  if ( WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WS] Cannot connect - WiFi not connected");
+    return;
+  }
   if (serverIP.length() > 0 && websocketPort > 0) {
     String wsUrl = "ws://" + serverIP + ":" + String(websocketPort);
     
@@ -1622,6 +1739,22 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         updateHeader();
         Serial.printf("[NAV] Jumps remaining: %d\n", navRouteInfo.jumpsRemaining);
       }
+    } else if (event == "FSDJump") {
+      // Update fuel level after a jump
+      if (doc["FuelLevel"].is<float>()) {
+        fuelInfo.fuelMain = doc["FuelLevel"].as<float>();
+        updateHeader();
+        Serial.printf("[FUEL] FSDJump FuelLevel: %.2f\n", fuelInfo.fuelMain);
+      }
+    } else if (event == "NavRouteClear") {
+      // Journal event when route is cleared
+      updateJumpsRemaining(0);
+      updateHeader();
+      Serial.println("[NAV] Route cleared -> Jumps set to 0");
+    } else if (event == "BuyDrones") {
+      // After buying limpets, refresh ship status to update cargo/drones
+      Serial.println("[JOURNAL] BuyDrones -> requesting ship status");
+      requestShipStatusWs();
     } else if (event == "HullDamage") {
       // Update hull health from damage event
       if (!doc["Health"].isNull()) {
@@ -1749,6 +1882,10 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     }
     
     updateCargoBar();
+  } else if (eventType == "NavRouteClear") {
+    // Route cleared -> zero out jumps
+    updateJumpsRemaining(0);
+    updateHeader();
   } else if (eventType == "NAVROUTE") {
     // Count route entries
     if (!doc["Route"].isNull()) {
@@ -1951,7 +2088,9 @@ void WifiConnect()
   WiFi.persistent(true);
   // Set hostname
   WiFi.setHostname(HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  //WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+  wifiMulti.run();
 
   WiFi.onEvent(onWifiConnect, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent([](const WiFiEvent_t event, const WiFiEventInfo_t info) {
@@ -2199,10 +2338,15 @@ void loop()
     lastHeapPrint = currentTime;
   }
   
-  // Request SUMMARY every 10 seconds until first one is received
-  if (!summaryReceived && WiFi.status() == WL_CONNECTED && 
-      (currentTime - lastSummaryRequest) > SUMMARY_REQUEST_INTERVAL) {
-    requestSummary();
+  // Request initial state every 10 seconds until first one is received
+  if (!summaryReceived && (currentTime - lastSummaryRequest) > SUMMARY_REQUEST_INTERVAL) {
+    if (wsClient.available()) {
+      requestCmdrStatusWs();
+      requestShipStatusWs();
+    } else {
+      // Try to connect WS if not already
+      connectWebSocket();
+    }
     lastSummaryRequest = currentTime;
   }
   
@@ -2380,4 +2524,29 @@ void updateJumpsRemaining(int newValue) {
     pendingJumpOverlay = true;
     pendingJumpValue = newValue;
   }
+}
+
+// Request commander status via WebSocket (Icarus terminal)
+void requestCmdrStatusWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  // Build a lightweight request with a simple requestId
+  String reqId = String("esp32-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getCmdrStatus\",\"message\":null}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getCmdrStatus request");
+}
+
+// Request ship status via WebSocket (Icarus terminal)
+void requestShipStatusWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  String reqId = String("esp32-ship-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getShipStatus\",\"message\":null}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getShipStatus request");
 }
