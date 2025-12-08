@@ -1,31 +1,31 @@
-# BLE Joypad
+# Elite Dangerous Controller
 
-A compact ESP32-based Bluetooth gamepad with 12 physical buttons, designed for use as an auxiliary input device for simulators like Elite Dangerous.
+An ESP32-S3 touchscreen controller for Elite Dangerous: receives live telemetry from Icarus Terminal, shows ship/commander state on a 2.8" capacitive display, plays alerts over I2S audio, and exposes 12 physical buttons over BLE HID.
 
 ## Motivation
-I wanted a small box with extra buttons to enhance my simulator experience, especially for games like Elite Dangerous. This project provides a simple, wireless solution for additional controls.
+Build a desk-friendly, wireless controller that combines tactile buttons with an always-on glanceable display for Elite Dangerous, fed by the community Icarus Terminal data source.
 
 ## Features
-- **Bluetooth Gamepad**: Uses ESP32-BLE-Gamepad library for seamless BLE HID connectivity.
-- **12 Buttons**: All buttons are read via a PCF8575 I/O expander over I2C (SDA: 21, SCL: 22).
-- **Button Layout**:
+- **Icarus Terminal feed**: Live Elite Dangerous telemetry over WebSocket from [Icarus Terminal](https://github.com/iaincollins/icarus) for ship/commander state.
+- **Multi-screen LVGL UI**: Log viewer, fighter command pad, and system/settings pages on the 2.8" capacitive display.
+- **Central status model**: Fuel, cargo, hull, shields, jumps, location, backpack, bioscans, credits, legal state all flow into one model that drives every screen.
+- **Audio cues**: I2S speaker beeps/alerts for connection and events.
+- **BLE HID buttons**: ESP32-BLE-Gamepad with 12 buttons via PCF8575 expander.
+- **Button layout**:
   - Top Row (Silver): SILVER_LEFT (13), SILVER_MID (14), SILVER_RIGHT (15)
   - Second Row (Small Colored): BLACK (1), WHITE (0), RED (5)
   - Third Row (Small Colored): YELLOW (2), BLUE (3), GREEN (4)
   - Bottom Row (Large): LARGE_YELLOW (12), LARGE_BLUE (11), LARGE_GREEN (10)
-- **RGB LED Status**:
-  - Red: No BLE connection
-  - Blue: BLE connected
-  - Green: Keypress detected
-- **Serial Output**: Keypresses and BLE connection events are logged to serial for debugging.
-- **Customizable BLE Name**: Device advertises as "CoolJoyBLE".
+- **Status indicators**: Wi‑Fi, WebSocket, BLE icons; cargo/fuel/hull bars; backpack/bioscan counts.
+- **Customizable BLE Name**: Advertises as "CoolJoyBLE".
 
 ## Hardware
-- CYD clone JC2432W328 (ESP32-based)
-  - Onboard RGB LED (Red: GPIO 4, Green: GPIO 16, Blue: GPIO 17)
-  - External connector for I2C pins (SDA: 21, SCL: 22)
-  - 240x320 display (planned for future use)
-- PCF8575 I/O expander
+- Freenove ESP32-S3 Display (FNK0104B)
+  - 2.8" 240x320 IPS, capacitive touch
+  - ESP32-S3 with 16 MB PSRAM
+  - I2S speaker amp for audio output
+  - I2C touch controller wired via onboard flex
+- PCF8575 I/O expander for 12 push buttons
 - 12 push buttons
 
 ## Wiring
@@ -36,9 +36,13 @@ I wanted a small box with extra buttons to enhance my simulator experience, espe
 
 ## Software
 - PlatformIO project (Arduino framework)
+- Data source: [Icarus Terminal](https://github.com/iaincollins/icarus) WebSocket feed
 - Libraries:
   - [ESP32-BLE-Gamepad](https://github.com/lemmingDev/ESP32-BLE-Gamepad)
   - [PCF8575](https://github.com/xreef/PCF8575)
+  - [ArduinoJson](https://arduinojson.org/)
+  - [ArduinoWebsockets](https://github.com/gilmaimon/ArduinoWebsockets)
+  - [lvgl](https://github.com/lvgl/lvgl)
 
 ## Usage
 1. Build and upload the firmware using PlatformIO.
