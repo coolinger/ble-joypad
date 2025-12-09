@@ -29,10 +29,10 @@ Build a desk-friendly, wireless controller that combines tactile buttons with an
 - 12 push buttons
 
 ## Wiring
-- I2C: External connector (SDA to GPIO 21, SCL to GPIO 22)
+- I2C: External connector (SDA to GPIO 16, SCL to GPIO 15)
 - Buttons: Connect to PCF8575 pins as per layout above
 - RGB LED: Onboard, connected to GPIOs 4, 16, 17 (active-low)
-- Display: 240x320 (future use)
+- Display: 240x320
 
 ## Software
 - PlatformIO project (Arduino framework)
