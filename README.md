@@ -22,7 +22,7 @@ Build a desk-friendly, wireless controller that combines tactile buttons with an
 ## Hardware
 - Freenove ESP32-S3 Display (FNK0104B)
   - 2.8" 240x320 IPS, capacitive touch
-  - ESP32-S3 with 16 MB PSRAM
+  - ESP32-S3 with 8 MB PSRAM
   - I2S speaker amp for audio output
   - I2C touch controller wired via onboard flex
 - PCF8575 I/O expander for 12 push buttons
