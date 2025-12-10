@@ -2054,3 +2054,16 @@ void requestNavRouteWs() {
   wsClient.send(payload);
   Serial.println("[WS] Sent getNavRoute request");
 }
+
+#if defined(ESP_IDF_VERSION)
+// ESP-IDF entry point that boots the Arduino runtime and forwards into the existing sketch
+extern "C" void app_main(void) {
+  initArduino();
+  setup();
+
+  while (true) {
+    loop();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+#endif
