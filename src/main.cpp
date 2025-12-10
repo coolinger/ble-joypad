@@ -8,7 +8,9 @@
 #include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
+#include <ArduinoOTA.h>
 #include <esp_heap_caps.h>
+#include <algorithm>
 #include "es8311.h"
 #include "sound.h"
 #include "config.h"
@@ -46,6 +48,7 @@ uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define I2S_DINT 6
 #define I2S_DOUT 8
 #define I2S_WS 7
+#define BATTERY_ADC_PIN 9
 #define I2C_SPEED 400000
 
 // Audio clocking constants now in sound.h
@@ -98,6 +101,13 @@ String serverIP = DEFAULT_SERVER_IP;
 int websocketPort = DEFAULT_WEBSOCKET_PORT;  // Icarus terminal WS port
 bool useWebSocket = false;
 WebsocketsClient wsClient;
+bool wsConnecting = false;
+uint32_t wsNextReconnect = 0;
+uint32_t wsReconnectDelayMs = 3000;           // start with 3s backoff
+const uint32_t WS_RECONNECT_DELAY_MAX = 60000; // cap at 60s
+uint32_t wsLastPing = 0;
+uint32_t wsLastPong = 0;
+bool otaInitialized = false;
 
 // Task handle for Core 0
 TaskHandle_t msgTaskHandle = NULL;
@@ -151,9 +161,13 @@ bool displayOn = true;
 uint32_t lastTouchTime = 0;
 uint32_t lastBleActiveTime = 0;
 uint32_t bleDisconnectedTime = 0;
-const uint32_t DISPLAY_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 const uint32_t LED_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 bool ledOn = true;
+
+// Display timeout adapts to power source
+const uint32_t DISPLAY_TIMEOUT_USB_MS = 5 * 60 * 1000;  // 5 minutes when on USB
+const uint32_t DISPLAY_TIMEOUT_BATT_MS = 30 * 1000;     // 30 seconds on battery
+uint32_t displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS;
 
 // Forward declaration for display power control
 void setDisplayPower(bool on);
@@ -172,6 +186,15 @@ const uint32_t WIFI_CHECK_INTERVAL = 10000; // Check every 10 seconds
 bool wifiWasConnected = false;
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
+
+// Battery monitoring
+const uint32_t BATTERY_SAMPLE_INTERVAL = 30000; // Sample battery divider every 30 seconds
+uint32_t lastBatterySample = 0;
+const int BATTERY_USB_THRESH_HIGH = 2550;
+const int BATTERY_USB_THRESH_LOW = 2500;
+bool usbPowered = false;
+int batteryRaw = 0;
+int batteryLevel = 5;
 
 // Heap monitoring
 uint32_t lastHeapPrint = 0;
@@ -324,6 +347,24 @@ void updateHeader() {
   // Update hull bar
   if (hull_bar) {
     lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
+  }
+
+  // Battery/USB indicator
+  if (battery_icon) {
+    const char* icon = LV_SYMBOL_BATTERY_EMPTY;
+    if (usbPowered) {
+      icon = LV_SYMBOL_USB;
+    } else {
+      switch (batteryLevel) {
+        case 5: icon = LV_SYMBOL_BATTERY_FULL; break;
+        case 4: icon = LV_SYMBOL_BATTERY_3; break;
+        case 3: icon = LV_SYMBOL_BATTERY_2; break;
+        case 2: icon = LV_SYMBOL_BATTERY_1; break;
+        case 1: icon = LV_SYMBOL_BATTERY_EMPTY; break;
+        default: icon = LV_SYMBOL_BATTERY_EMPTY; break;
+      }
+    }
+    lv_label_set_text(battery_icon, icon);
   }
   
   update_wifi_icon();  
@@ -511,6 +552,49 @@ void addLogEntry(const char* text) {
   updateLogDisplay();
 }
 
+static void sampleBatteryAdc() {
+  int raw = analogRead(BATTERY_ADC_PIN);
+  batteryRaw = raw;
+
+  // Determine USB/battery with hysteresis
+  bool prevUsb = usbPowered;
+  if (raw >= BATTERY_USB_THRESH_HIGH) {
+    usbPowered = true;
+  } else if (raw <= BATTERY_USB_THRESH_LOW) {
+    usbPowered = false;
+  }
+
+  // Map raw ADC to coarse level for icon
+  if (usbPowered) {
+    batteryLevel = 5;
+  } else if (raw >= 2480) {
+    batteryLevel = 5;
+  } else if (raw >= 2380) {
+    batteryLevel = 4;
+  } else if (raw >= 2280) {
+    batteryLevel = 3;
+  } else if (raw >= 2180) {
+    batteryLevel = 2;
+  } else if (raw >= 1980) {
+    batteryLevel = 1;
+  } else {
+    batteryLevel = 0;
+  }
+
+  // Adjust display timeout on power source change
+  if (usbPowered != prevUsb) {
+    displayTimeoutMs = usbPowered ? DISPLAY_TIMEOUT_USB_MS : DISPLAY_TIMEOUT_BATT_MS;
+    lastTouchTime = millis(); // reset timer to avoid immediate sleep when switching
+    addLogEntry(usbPowered ? "Power: USB" : "Power: Battery");
+  }
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "Battery ADC: %d", raw);
+  Serial.println(buf);  // keep in serial only; do not log to display
+
+  updateHeader();
+}
+
 
 void updateSystemInfo() {
   if (!sys_info_label) return;
@@ -692,13 +776,14 @@ void requestSummary();
 void connectWebSocket();
 void updateJumpsRemaining(int newValue);
 void showJumpOverlay(int jumps);
+static void startOtaIfNeeded();
 
 void checkDisplayTimeout()
 {
   uint32_t currentTime = millis();
   
   // Turn off display after timeout regardless of BLE connection
-  if (displayOn && (currentTime - lastTouchTime) > DISPLAY_TIMEOUT) {
+  if (displayOn && (currentTime - lastTouchTime) > displayTimeoutMs) {
     setDisplayPower(false);
   }
 }
@@ -721,6 +806,8 @@ void checkWifiConnection() {
       beepConnect();
       wifiWasConnected = true;
 
+      startOtaIfNeeded();
+
       // Connect to Icarus terminal websocket as soon as WiFi is up
       delay(200);
       connectWebSocket();
@@ -737,6 +824,66 @@ void checkWifiConnection() {
       WiFi.reconnect();
     }
   }
+}
+
+static const char* wifiStatusToString(wl_status_t st) {
+  switch (st) {
+    case WL_IDLE_STATUS: return "IDLE";
+    case WL_NO_SSID_AVAIL: return "NO_SSID";
+    case WL_SCAN_COMPLETED: return "SCAN_DONE";
+    case WL_CONNECTED: return "CONNECTED";
+    case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    default: return "UNKNOWN";
+  }
+}
+
+static void logWsDiagnostics(const char* tag) {
+  wl_status_t st = WiFi.status();
+  int rssi = (st == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  size_t heapFree = esp_get_free_heap_size();
+  size_t heapInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t heapPsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  Serial.printf("[WS][diag] %s | wifi=%s rssi=%d dBm heap=%u int=%u psram=%u\n",
+                tag, wifiStatusToString(st), rssi, (unsigned)heapFree,
+                (unsigned)heapInternal, (unsigned)heapPsram);
+}
+
+static bool cargoHasSymbol(const char* symbol) {
+  if (!symbol || !*symbol) return false;
+  for (const auto& entry : status.cargo.inventory) {
+    if (entry.name.equalsIgnoreCase(symbol)) return true;
+  }
+  return false;
+}
+
+static void startOtaIfNeeded() {
+  if (otaInitialized) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.onStart([]() {
+    Serial.println("[OTA] Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] End");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static unsigned int lastPct = 0;
+    unsigned int pct = (progress * 100U) / total;
+    if (pct != lastPct) {
+      Serial.printf("[OTA] %u%%\n", pct);
+      lastPct = pct;
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error %u\n", error);
+  });
+
+  ArduinoOTA.begin();
+  otaInitialized = true;
+  Serial.println("[OTA] Ready (use WiFi IP above)");
 }
 
 // Helper function to replace umlauts with double vowels
@@ -878,21 +1025,31 @@ void onWebSocketMessage(WebsocketsMessage message) {
           status.cargo.usedSpace = cargo["count"].as<int>();
         }
 
+        status.cargo.inventory.clear();
+
         // Find drones in inventory list (case-insensitive symbol match)
         int drones = 0;
+        int cargoNonDrone = 0;
         if (cargo["inventory"].is<JsonArrayConst>() || cargo["inventory"].is<JsonArray>()) {
           JsonArrayConst inv = cargo["inventory"].as<JsonArrayConst>();
           for (JsonVariantConst item : inv) {
             const char* symbol = item["symbol"];
-            if (symbol && (strcmp(symbol, "drones") == 0 || String(symbol).equalsIgnoreCase("drones"))) {
-              drones = item["count"].as<int>();
-              break;
+            int count = item["count"].is<int>() ? item["count"].as<int>() : 0;
+            if (symbol) {
+              CargoEntry entry;
+              entry.name = symbol;
+              entry.count = count;
+              status.cargo.inventory.push_back(entry);
+              if (String(symbol).equalsIgnoreCase("drones")) {
+                drones = count;
+              } else {
+                cargoNonDrone += count;
+              }
             }
           }
         }
         status.cargo.dronesCount = drones;
-        status.cargo.cargoCount = status.cargo.usedSpace - status.cargo.dronesCount;
-        if (status.cargo.cargoCount < 0) status.cargo.cargoCount = 0;
+        status.cargo.cargoCount = cargoNonDrone;
       }
 
       // Hull health from armour module (health is 0-1, but guard percent inputs)
@@ -980,13 +1137,24 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
     case WebsocketsEvent::ConnectionOpened:
       Serial.println("[WS] Connected to server");
       useWebSocket = true;
+      wsConnecting = false;
+      wsReconnectDelayMs = 3000;   // reset backoff
+      wsNextReconnect = 0;
+      wsLastPong = millis();      // initialize pong timer on connect
+      wsLastPing = wsLastPong;    // sync ping timer
       // Request initial ship status from Icarus terminal
       requestShipStatusWs();
       break;
       
     case WebsocketsEvent::ConnectionClosed:
       Serial.printf("[WS] Disconnected from server (info: %s)\n", data.c_str());
+      logWsDiagnostics("closed");
       useWebSocket = false;
+      wsConnecting = false;
+      wsLastPong = 0;
+      wsLastPing = 0;
+      wsNextReconnect = millis() + wsReconnectDelayMs;
+      wsReconnectDelayMs = std::min(WS_RECONNECT_DELAY_MAX, wsReconnectDelayMs * 2);
       break;
       
     case WebsocketsEvent::GotPing:
@@ -995,11 +1163,18 @@ void onWebSocketEvent(WebsocketsEvent event, String data) {
       
     case WebsocketsEvent::GotPong:
       Serial.println("[WS] Got pong");
+      wsLastPong = millis();
       break;
   }
 }
 
 void connectWebSocket() {
+  if (wsConnecting) {
+    return; // already trying
+  }
+  if (wsClient.available()) {
+    return; // already connected
+  }
   if ( WiFi.status() != WL_CONNECTED) {
     Serial.println("[WS] Cannot connect - WiFi not connected");
     return;
@@ -1011,11 +1186,20 @@ void connectWebSocket() {
     
     wsClient.onMessage(onWebSocketMessage);
     wsClient.onEvent(onWebSocketEvent);
-    
+        wsConnecting = true;
+        wsLastPing = 0;
+        wsLastPong = millis(); // start fresh timer at connect attempt
+        logWsDiagnostics("connect");
     if (wsClient.connect(wsUrl)) {
       Serial.println("[WS] Connection initiated");
+          // Wait for onEvent to clear wsConnecting
     } else {
       Serial.println("[WS] Connection failed");
+          wsConnecting = false;
+          wsLastPong = 0;
+          wsLastPing = 0;
+          wsNextReconnect = millis() + wsReconnectDelayMs;
+          wsReconnectDelayMs = std::min(WS_RECONNECT_DELAY_MAX, wsReconnectDelayMs * 2);
     }
   }
 }
@@ -1344,11 +1528,19 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
           int count = 0;
           for (JsonObject mat : mats) {
             if (count > 0) materials += ", ";
+            const char* symbol = mat["Name"].is<const char*>() ? mat["Name"].as<const char*>() : "";
             const char* matName = mat["Name_Localised"].is<const char*>() ? 
               mat["Name_Localised"].as<const char*>() : mat["Name"].as<const char*>();
             strncpy(tempBuf, matName, sizeof(tempBuf) - 1);
             replaceUmlauts(tempBuf);
-            materials += String(tempBuf);
+            String display = String(tempBuf);
+
+            // Highlight if already in cargo
+            if (cargoHasSymbol(symbol)) {
+              materials += String("#c6e6dc ") + display + "#"; // LV_COLOR_OK_FG
+            } else {
+              materials += display;
+            }
             count++;
             if (count >= 3) break;  // Limit to 3 materials
           }
@@ -1434,14 +1626,19 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     cargoInfo.usedSpace = doc["Count"];
     cargoInfo.dronesCount = 0;
     cargoInfo.cargoCount = 0;
+    status.cargo.inventory.clear();
     
     if (!doc["Inventory"].isNull()) {
       JsonArray inventory = doc["Inventory"];
       for (JsonObject item : inventory) {
         String name = item["Name"].as<String>();
         int count = item["Count"];
-        
-        if (name == "drones") {
+        CargoEntry entry;
+        entry.name = name;
+        entry.count = count;
+        status.cargo.inventory.push_back(entry);
+
+        if (name.equalsIgnoreCase("drones")) {
           cargoInfo.dronesCount = count;
         } else {
           cargoInfo.cargoCount += count;
@@ -1478,25 +1675,33 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
 void checkMessages() {
   // Check WebSocket connection and handle messages
   if (serverIP.length() > 0 && websocketPort > 0) {
-    // Try to connect if not connected
-    if (!wsClient.available()) {
-      static uint32_t lastConnectAttempt = 0;
-      uint32_t currentTime = millis();
-      
-      if (currentTime - lastConnectAttempt > 5000) {  // Try every 5 seconds
-        connectWebSocket();
-        lastConnectAttempt = currentTime;
-      }
+    uint32_t now = millis();
+
+    // Trigger reconnect if allowed by backoff and WiFi is up
+    if (!wsClient.available() && !wsConnecting && now >= wsNextReconnect && WiFi.status() == WL_CONNECTED) {
+      connectWebSocket();
     }
-    
+
     // Poll WebSocket for incoming messages
     if (wsClient.available()) {
       wsClient.poll();
-      static uint32_t lastPing = 0;
-      uint32_t now = millis();
-      if (now - lastPing > 15000) {  // Send ping every 15s to keep connection alive
+
+      // Ping every 20s to keep connection alive; reset pong timer when sending
+      if (now - wsLastPing > 20000) {
         wsClient.ping();
-        lastPing = now;
+        wsLastPing = now;
+        if (wsLastPong == 0) wsLastPong = now; // start grace window on first ping
+      }
+
+      // Require both a sent ping and a pong gap before timing out to avoid immediate disconnect after first pong
+      if (wsLastPing > 0 && wsLastPong > 0 && (now - wsLastPong > 90000) && (now - wsLastPing > 90000)) {
+        Serial.println("[WS] No pong in 90s, forcing reconnect");
+        logWsDiagnostics("pong-timeout");
+        wsClient.close();
+        useWebSocket = false;
+        wsConnecting = false;
+        wsNextReconnect = now + wsReconnectDelayMs;
+        wsReconnectDelayMs = std::min(WS_RECONNECT_DELAY_MAX, wsReconnectDelayMs * 2);
       }
     }
   }
@@ -1542,6 +1747,9 @@ void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
 
     update_wifi_icon();
 
+    // Bring up OTA once WiFi is ready
+    startOtaIfNeeded();
+
     // Connect to WebSocket immediately when WiFi comes up
     connectWebSocket();
   } else {
@@ -1584,6 +1792,10 @@ void setup()
   Serial.begin(115200);
   delay(100);
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS; // default to USB timeout until first sample
   
   // Check PSRAM availability
   Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
@@ -1750,9 +1962,9 @@ void setup()
     "MSG_Handler",      // Task name
     32768,              // Stack size (32KB - increased with PSRAM for WebSocket + JSON parsing)
     NULL,               // Parameters
-    2,                  // Priority (2 = higher than default)
+    1,                  // Priority (align with loop task to avoid starving idle)
     &msgTaskHandle,     // Task handle
-    0                   // Core 0 (PRO_CPU)
+    1                   // Core 1 (APP_CPU) to keep core0 idle/WiFi happy
   );
   
   Serial.print("[MAIN] Loop running on core: ");
@@ -1834,6 +2046,20 @@ void loop()
     }
     
     lastWifiStatusPrint = currentTime;
+  }
+
+  // Sample battery ADC divider
+  if ((currentTime - lastBatterySample) >= BATTERY_SAMPLE_INTERVAL || lastBatterySample == 0) {
+    sampleBatteryAdc();
+    lastBatterySample = currentTime;
+  }
+
+  // Handle OTA updates
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!otaInitialized) {
+      startOtaIfNeeded();
+    }
+    ArduinoOTA.handle();
   }
   
   // Handle screen blinking for motherlode detection
@@ -1917,6 +2143,8 @@ void loop()
 }
 
 static void jump_overlay_zoom_exec(void* obj, int32_t value) {
+  // Avoid zero zoom which triggers divide-by-zero in LVGL transform math
+  if (value < 1) value = 1;
   lv_obj_set_style_transform_zoom(static_cast<lv_obj_t*>(obj), value, LV_PART_MAIN);
 }
 

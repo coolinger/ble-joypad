@@ -25,7 +25,7 @@
 #define EXAMPLE_SAMPLE_RATE     (44100)
 #define EXAMPLE_MCLK_MULTIPLE   (256)
 #define EXAMPLE_MCLK_FREQ_HZ    (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
-#define EXAMPLE_VOICE_VOLUME    (60)
+#define EXAMPLE_VOICE_VOLUME    (70)
 
 #ifdef __cplusplus
 extern "C" {

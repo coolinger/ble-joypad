@@ -4,11 +4,17 @@
 #include <vector>
 
 // Game data structures used across the app. These used to be in main.cpp.
+struct CargoEntry {
+  String name;  // cargo symbol
+  int count = 0;
+};
+
 struct CargoInfo {
   int totalCapacity = 256;
   int usedSpace = 0;
   int dronesCount = 0;
   int cargoCount = 0;  // non-drones cargo
+  std::vector<CargoEntry> inventory;  // full inventory (symbol + count)
 };
 
 struct FuelInfo {

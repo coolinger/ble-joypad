@@ -13,6 +13,7 @@ lv_obj_t *hull_bar = nullptr;
 lv_obj_t *wifi_icon = nullptr;
 lv_obj_t *websocket_icon = nullptr;
 lv_obj_t *bluetooth_icon = nullptr;
+lv_obj_t *battery_icon = nullptr;
 lv_obj_t *medpack_label = nullptr;
 lv_obj_t *energycell_label = nullptr;
 lv_obj_t *bioscan_label = nullptr;
@@ -45,12 +46,12 @@ void create_logviewer_ui() {
   lv_obj_t* fuel_label = lv_label_create(header);
   lv_label_set_text(fuel_label, "F");
   lv_obj_set_style_text_color(fuel_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(fuel_label, 100, 3);
+  lv_obj_set_pos(fuel_label, 90, 3);
   
-  // Fuel bar (reduced size)
+  // Fuel bar (further reduced)
   fuel_bar = lv_bar_create(header);
-  lv_obj_set_size(fuel_bar, 55, 15);
-  lv_obj_set_pos(fuel_bar, 115, 3);
+  lv_obj_set_size(fuel_bar, 45, 15);
+  lv_obj_set_pos(fuel_bar, 105, 3);
   lv_bar_set_range(fuel_bar, 0, 100);
   lv_bar_set_value(fuel_bar, 100, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(fuel_bar, LV_COLOR_BG, LV_PART_MAIN);
@@ -60,35 +61,41 @@ void create_logviewer_ui() {
   lv_obj_t* hull_label = lv_label_create(header);
   lv_label_set_text(hull_label, "H");
   lv_obj_set_style_text_color(hull_label, LV_COLOR_FG, 0);
-  lv_obj_set_pos(hull_label, 180, 3);
+  lv_obj_set_pos(hull_label, 155, 3);
   
-  // Hull bar (reduced size)
+  // Hull bar (further reduced)
   hull_bar = lv_bar_create(header);
-  lv_obj_set_size(hull_bar, 55, 15);
-  lv_obj_set_pos(hull_bar, 195, 3);
+  lv_obj_set_size(hull_bar, 45, 15);
+  lv_obj_set_pos(hull_bar, 170, 3);
   lv_bar_set_range(hull_bar, 0, 100);
   lv_bar_set_value(hull_bar, 100, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(hull_bar, LV_COLOR_BG, LV_PART_MAIN);
   lv_obj_set_style_bg_color(hull_bar, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
   
   // Status icons (right side of header)
+  // Battery/USB icon
+  battery_icon = lv_label_create(header);
+  lv_label_set_text(battery_icon, LV_SYMBOL_BATTERY_FULL);
+  lv_obj_set_style_text_color(battery_icon, lv_color_hex(0x000000), 0);
+  lv_obj_set_pos(battery_icon, 230, 2);
+
+  // Bluetooth icon
+  bluetooth_icon = lv_label_create(header);
+  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
+  lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);
+  lv_obj_set_pos(bluetooth_icon, 250, 2);
+  
+  // WebSocket icon
+  websocket_icon = lv_label_create(header);
+  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);
+  lv_obj_set_pos(websocket_icon, 270, 2);
+  
   // WiFi icon (rightmost)
   wifi_icon = lv_label_create(header);
   lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);
-  lv_obj_set_pos(wifi_icon, 300, 2);
-  
-  // WebSocket icon (middle)
-  websocket_icon = lv_label_create(header);
-  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
-  lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);
-  lv_obj_set_pos(websocket_icon, 280, 2);
-  
-  // Bluetooth icon (left of websocket)
-  bluetooth_icon = lv_label_create(header);
-  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
-  lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);
-  lv_obj_set_pos(bluetooth_icon, 260, 2);
+  lv_obj_set_pos(wifi_icon, 290, 2);
   
   // Log area (adjusted for smaller header)
   lv_obj_t* log_area = lv_obj_create(logviewer_screen);
@@ -118,6 +125,7 @@ void create_logviewer_ui() {
   log_label = lv_label_create(log_area);
   lv_obj_set_pos(log_label, 5, 20);
   lv_label_set_text(log_label, " ");
+  lv_label_set_recolor(log_label, true); // allow inline color for highlights
   lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
   lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(log_label, SCREEN_WIDTH - 75);

@@ -18,7 +18,7 @@
 #define LV_COLOR_WARNING_FG lv_color_hex(0xf30000)
 #define LV_COLOR_WARNING_BG lv_color_hex(0x471711)
 
-#define LV_COLOR_OK_FG lv_color_hex(0x471711)
+#define LV_COLOR_OK_FG lv_color_hex(0xc6e6dc)
 
 #define LV_COLOR_WHITE lv_color_hex(0x471711)
 
