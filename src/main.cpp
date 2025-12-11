@@ -218,6 +218,11 @@ void setDisplayPower(bool on)
     Serial.println("Display OFF");
   }
 }
+bool is_plugged_usb(void){
+uint32_t USB_SERIAL_JTAG_FRAM_NUM_REG = (DR_REG_USB_SERIAL_JTAG_BASE + 0x24);
+uint32_t *aa = (uint32_t*)USB_SERIAL_JTAG_FRAM_NUM_REG;
+return (*aa) != 0;
+}
 
 // Helper function to print heap status including PSRAM
 void printHeapStatus(const char* location) {
