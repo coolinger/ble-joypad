@@ -27,30 +27,44 @@ static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
                                   "Folgen", "Center", "Angriff", "\n",
                                   "Position", "Formation", "Befehle", ""};
 
+// One-shot timer callback: releases the gamepad button ~50 ms after the press,
+// without blocking the LVGL/render thread the way delay() did.
+static void release_btn_cb(lv_timer_t * timer)
+{
+    uint8_t btn = (uint8_t)(uintptr_t)timer->user_data;
+    if (bleGamepad) bleGamepad->release(btn);
+}
+
+// Emulate a momentary press: press now, schedule the release. The timer is
+// created with repeat count 1 so LVGL auto-deletes it after it fires once.
+static void pressMomentary(uint8_t btn)
+{
+    if (!bleGamepad) return;
+    bleGamepad->press(btn);
+    lv_timer_t * t = lv_timer_create(release_btn_cb, 50, (void*)(uintptr_t)btn);
+    lv_timer_set_repeat_count(t, 1);
+}
+
 static void btnmatrix_event_handler(lv_event_t * e)
 {
     lv_obj_t * obj = (lv_obj_t*)lv_event_get_target(e);
     uint32_t id = lv_btnmatrix_get_selected_btn(obj);
     const uint8_t btn_to_cmd[] = {0, 1, 2, 7, 20, 3, 5, 4, 6};
-    
+
     if (id < 9) {
         uint8_t cmd_idx = btn_to_cmd[id];
-        
+
         if (cmd_idx == 20) {
             Serial.println("Befehle oeffnen/schliessen");
             beepClick();
-            bleGamepad->press(20);
-            delay(50);
-            bleGamepad->release(20);
+            pressMomentary(20);
         } else if (cmd_idx < 8) {
             FighterCommand cmd;
             memcpy_P(&cmd, &commands[cmd_idx], sizeof(FighterCommand));
-            
+
             Serial.printf("Command: %s (Button %d)\n", cmd.name, cmd.button_id);
             beepClick();
-            bleGamepad->press(cmd.button_id);
-            delay(50);
-            bleGamepad->release(cmd.button_id);
+            pressMomentary(cmd.button_id);
         }
     }
 }

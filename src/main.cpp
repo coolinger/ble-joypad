@@ -182,6 +182,11 @@ static void handleTouchActivity()
 uint32_t lastWifiCheck = 0;
 const uint32_t WIFI_CHECK_INTERVAL = 10000; // Check every 10 seconds
 bool wifiWasConnected = false;
+// Deferred requests from the settings UI. Set in LVGL event callbacks (which run
+// under the lvglMutex) and serviced in loop() outside the mutex, so the blocking
+// WiFi/WebSocket calls never stall rendering or the core-0 message task.
+bool reqRestartWifi = false;
+bool reqRestartWebSocket = false;
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
 
@@ -1996,7 +2001,24 @@ void loop()
   checkDisplayTimeout();
   checkWifiConnection();
   // checkMessages();  // Now handled by loop2 on Core 0
-  
+
+  // Service deferred settings-UI requests here (outside the LVGL mutex)
+  if (reqRestartWifi) {
+    reqRestartWifi = false;
+    Serial.println("[SETTINGS] Restarting WiFi...");
+    WiFi.disconnect();
+    wifiWasConnected = false;  // let checkWifiConnection re-establish WS after reconnect
+    wifiMulti.run();
+  }
+  if (reqRestartWebSocket) {
+    reqRestartWebSocket = false;
+    Serial.println("[SETTINGS] Restarting WebSocket...");
+    if (wsClient.available()) {
+      wsClient.close();
+    }
+    connectWebSocket();
+  }
+
   uint32_t currentTime = millis();
   
   // Print heap status periodically

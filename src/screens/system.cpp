@@ -12,6 +12,8 @@ using namespace websockets;
 // externs from main
 extern WiFiMulti wifiMulti;
 extern WebsocketsClient wsClient;
+extern bool reqRestartWifi;
+extern bool reqRestartWebSocket;
 void connectWebSocket();
 void updateSystemInfo();
 
@@ -21,21 +23,13 @@ lv_obj_t *amplitude_slider = nullptr;
 lv_obj_t *amplitude_value_label = nullptr;
 
 static void restart_wifi_handler(lv_event_t * e) {
-  Serial.println("[SETTINGS] Restarting WiFi...");
   beepClick();
-  WiFi.disconnect();
-  delay(500);
-  wifiMulti.run();
+  reqRestartWifi = true;  // deferred to loop() so the UI doesn't block
 }
 
 static void restart_websocket_handler(lv_event_t * e) {
-  Serial.println("[SETTINGS] Restarting WebSocket...");
   beepClick();
-  if (wsClient.available()) {
-    wsClient.close();
-  }
-  delay(500);
-  connectWebSocket();
+  reqRestartWebSocket = true;  // deferred to loop() so the UI doesn't block
 }
 
 static void reboot_handler(lv_event_t * e) {
