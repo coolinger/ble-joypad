@@ -1,5 +1,32 @@
 # BLE Joypad - Changelog
 
+## Toolchain Migration - pioarduino / ESP-IDF 5.5 (June 2026)
+
+Moved off the now-frozen stock `espressif32` platform (Arduino core 2.0.x / ESP-IDF 4.4)
+onto the maintained **pioarduino** fork. This bumped the underlying SDK from ESP-IDF 4.4
+to **5.5.4** (Arduino-Core 3.3.9), which required several source-level fixes.
+
+### Platform / build
+- `platform` in `platformio.ini` now points at the pioarduino release zip
+  (`55.03.39` → Arduino-Core 3.3.9 / ESP-IDF 5.5.4) instead of `espressif32`.
+- Added `src/idf_component.yml` declaring `idf: '>=5.1'`.
+- Unpinned `earlephilhower/ESP8266Audio` (was `@2.2.0`, incompatible with the new core).
+- USB CDC is forced via build flags (`ARDUINO_USB_MODE=1`, `ARDUINO_USB_CDC_ON_BOOT=1`).
+
+### Source fixes forced by the SDK bump
+- **I2S**: ESP-IDF 5.x no longer auto-selects the legacy driver. Removed the half-finished
+  `USE_NEW_I2S_API` switch in `main.cpp` and always include the legacy `driver/i2s.h`
+  (still shipped under `driver/deprecated/`, still functional). Matches `sound.cpp`.
+- **USB power detection**: the old `is_plugged_usb()` peeked the USB-Serial-JTAG frame
+  register via `DR_REG_USB_SERIAL_JTAG_BASE`, which the new core no longer exposes. Replaced
+  with TP4056 CHRG-pin sensing on GPIO2 (`BATPIN`) plus an ADC threshold fallback. Battery
+  sampling interval shortened 30 s → 5 s.
+- **ESP32-BLE-Gamepad / NimBLE 2.x**: NimBLE 1.x used to include `Arduino.h` transitively;
+  2.x does not, so the library's `BleNUS` fails to compile (`delay`/`Serial`/`ltoa`/`dtostrf`
+  undeclared). Fixed by adding `#include <Arduino.h>` to `BleNUS.h`. *(Initially patched in
+  the throwaway `.pio/` dir; subsequently made durable by vendoring the library into `lib/` —
+  see the following commit.)*
+
 ## Version 2.0.0 - Major Update (November 2025)
 
 ### New Features

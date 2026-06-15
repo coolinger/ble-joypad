@@ -18,17 +18,12 @@
 #include "screens/fighter.h"
 #include "screens/info.h"
 #include "screens/system.h"
-#ifdef ESP_IDF_VERSION
-#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
-    #define USE_NEW_I2S_API 1
-    #include <ESP_I2S.h>
-#else
-    #define USE_NEW_I2S_API 0
-    #include "driver/i2s.h"
-  #endif
-#else
-  #define USE_NEW_I2S_API 0
-#endif
+// I2S: use the legacy driver/i2s.h throughout (matches sound.cpp).
+// On ESP-IDF >= 5.x this header still ships under driver/deprecated/ and
+// remains functional (just emits deprecation warnings). The new ESP_I2S /
+// I2SClass API was never actually wired up here, so we stick with legacy.
+#define USE_NEW_I2S_API 0
+#include "driver/i2s.h"
 
 
 using namespace websockets;
@@ -50,6 +45,10 @@ uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define I2S_WS 7
 #define BATTERY_ADC_PIN 9
 #define I2C_SPEED 400000
+
+#define BATPIN 2
+
+#define DR_REG_USB_SERIAL_JTAG_BASE             0x60038000
 
 // Audio clocking constants now in sound.h
 
@@ -188,7 +187,7 @@ uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
 
 // Battery monitoring
-const uint32_t BATTERY_SAMPLE_INTERVAL = 30000; // Sample battery divider every 30 seconds
+const uint32_t BATTERY_SAMPLE_INTERVAL = 5000; // Sample battery divider every 5 seconds
 uint32_t lastBatterySample = 0;
 const int BATTERY_USB_THRESH_HIGH = 2550;
 const int BATTERY_USB_THRESH_LOW = 2500;
@@ -219,9 +218,11 @@ void setDisplayPower(bool on)
   }
 }
 bool is_plugged_usb(void){
-uint32_t USB_SERIAL_JTAG_FRAM_NUM_REG = (DR_REG_USB_SERIAL_JTAG_BASE + 0x24);
-uint32_t *aa = (uint32_t*)USB_SERIAL_JTAG_FRAM_NUM_REG;
-return (*aa) != 0;
+//CHRG pin of TP4056 is connected to GPIO2
+//PIN is low when charging, high when on battery
+return digitalRead(BATPIN)==HIGH ||  analogRead(BATTERY_ADC_PIN) > BATTERY_USB_THRESH_HIGH;
+
+
 }
 
 // Helper function to print heap status including PSRAM
@@ -357,7 +358,7 @@ void updateHeader() {
   // Battery/USB indicator
   if (battery_icon) {
     const char* icon = LV_SYMBOL_BATTERY_EMPTY;
-    if (usbPowered) {
+    if (is_plugged_usb()) {
       icon = LV_SYMBOL_USB;
     } else {
       switch (batteryLevel) {
@@ -563,14 +564,14 @@ static void sampleBatteryAdc() {
 
   // Determine USB/battery with hysteresis
   bool prevUsb = usbPowered;
-  if (raw >= BATTERY_USB_THRESH_HIGH) {
+  if (is_plugged_usb()) {
     usbPowered = true;
-  } else if (raw <= BATTERY_USB_THRESH_LOW) {
+  } else {
     usbPowered = false;
   }
 
   // Map raw ADC to coarse level for icon
-  if (usbPowered) {
+  if (is_plugged_usb()) {
     batteryLevel = 5;
   } else if (raw >= 2480) {
     batteryLevel = 5;
@@ -590,7 +591,7 @@ static void sampleBatteryAdc() {
   if (usbPowered != prevUsb) {
     displayTimeoutMs = usbPowered ? DISPLAY_TIMEOUT_USB_MS : DISPLAY_TIMEOUT_BATT_MS;
     lastTouchTime = millis(); // reset timer to avoid immediate sleep when switching
-    addLogEntry(usbPowered ? "Power: USB" : "Power: Battery");
+    //addLogEntry(usbPowered ? "Power: USB" : "Power: Battery");
   }
 
   char buf[64];
@@ -1802,6 +1803,9 @@ void setup()
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
   displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS; // default to USB timeout until first sample
   
+  //set batpin  pullup high
+  pinMode(BATTERY_ADC_PIN, INPUT_PULLUP);
+
   // Check PSRAM availability
   Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
   if (psramFound()) {
