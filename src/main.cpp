@@ -34,7 +34,6 @@ using namespace websockets;
 #define I2C_SDA 16
 #define I2C_SCL 15
 #define BUZZER_PIN 5
-uint32_t* buf = nullptr;  // Will be allocated from PSRAM
 #define INT_N_PIN 17
 #define RST_N_PIN 18
 
@@ -1804,7 +1803,7 @@ void setup()
   displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS; // default to USB timeout until first sample
   
   //set batpin  pullup high
-  pinMode(BATTERY_ADC_PIN, INPUT_PULLUP);
+  pinMode(BATPIN, INPUT_PULLUP);
 
   // Check PSRAM availability
   Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
@@ -1813,28 +1812,21 @@ void setup()
     Serial.printf("[PSRAM] Free: %d bytes\n", ESP.getFreePsram());
   }
   
-  // Allocate large buffers from PSRAM (fallback to internal if PSRAM not available)
+  // Allocate the log buffer from PSRAM (fallback to internal if unavailable).
+  // The LVGL draw buffers are owned and allocated by Display::init() (see display.cpp).
   Serial.println("[MEM] Allocating buffers...");
-  buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!buf) {
-    Serial.println("[MEM] PSRAM allocation failed, trying internal RAM...");
-    buf = (uint32_t*)heap_caps_malloc(LVGL_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  }
-  
   logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!logText) {
     Serial.println("[MEM] PSRAM allocation failed for log buffer, trying internal RAM...");
     logText = (char*)heap_caps_malloc(LOG_TEXT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
-  
-  if (!buf || !logText) {
-    Serial.println("ERROR: Failed to allocate buffers!");
-    Serial.printf("buf: %p, logText: %p\n", buf, logText);
+
+  if (!logText) {
+    Serial.println("ERROR: Failed to allocate log buffer!");
     while(1) delay(1000);
   }
-  
-  Serial.printf("[MEM] Buffers allocated - LVGL: %d, Log: %d bytes\n", 
-                LVGL_BUFFER_SIZE, LOG_TEXT_SIZE);
+
+  Serial.printf("[MEM] Log buffer allocated: %d bytes\n", LOG_TEXT_SIZE);
   Serial.printf("[HEAP] Free internal RAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   if (psramFound()) {
     Serial.printf("[PSRAM] Free PSRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
