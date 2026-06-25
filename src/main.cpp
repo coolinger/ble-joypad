@@ -167,15 +167,22 @@ const uint32_t DISPLAY_TIMEOUT_USB_MS = 5 * 60 * 1000;  // 5 minutes when on USB
 const uint32_t DISPLAY_TIMEOUT_BATT_MS = 30 * 1000;     // 30 seconds on battery
 uint32_t displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS;
 
-// Forward declaration for display power control
+// Backlight (GPIO45) is driven by LEDC PWM so we can dim it. Two-stage timeout:
+// full brightness while active, 30% for the last DISPLAY_DIM_LEAD_MS, then off.
+#define BL_PIN 45
+const uint8_t  BL_DUTY_FULL = 255;          // 100%
+const uint8_t  BL_DUTY_DIM  = 77;           // ~30%
+const uint32_t DISPLAY_DIM_LEAD_MS = 15000; // dim this long before the final off
+bool displayDimmed = false;                 // true while at BL_DUTY_DIM
+
+// Forward declarations for display power control
 void setDisplayPower(bool on);
+void setDisplayDim();
+void wakeDisplay();
 
 static void handleTouchActivity()
 {
-  lastTouchTime = millis();
-  if (!displayOn) {
-    setDisplayPower(true);
-  }
+  wakeDisplay();
 }
 
 // WiFi reconnection management
@@ -210,16 +217,42 @@ const uint32_t SUMMARY_REQUEST_INTERVAL = 10000; // Request every 10 seconds unt
 
 void setDisplayPower(bool on)
 {
-  if (on && !displayOn) {
-    digitalWrite(45, HIGH); // Turn on backlight
-    displayOn = true;
-    beepShort();  // Beep when display wakes up
-    Serial.println("Display ON");
-  } else if (!on && displayOn) {
-    digitalWrite(45, LOW); // Turn off backlight
+  if (on) {
+    // Wake from full-off OR restore from the dimmed stage.
+    if (!displayOn || displayDimmed) {
+      bool wasOff = !displayOn;
+      ledcWrite(BL_PIN, BL_DUTY_FULL);
+      displayOn = true;
+      displayDimmed = false;
+      if (wasOff) {
+        beepShort();  // beep only on a real wake from off, not on un-dim
+        Serial.println("Display ON");
+      }
+    }
+  } else if (displayOn) {
+    ledcWrite(BL_PIN, 0); // Turn off backlight
     displayOn = false;
+    displayDimmed = false;
     Serial.println("Display OFF");
   }
+}
+
+// Stage 1 of the timeout: drop to 30% brightness (display stays on).
+void setDisplayDim()
+{
+  if (displayOn && !displayDimmed) {
+    ledcWrite(BL_PIN, BL_DUTY_DIM);
+    displayDimmed = true;
+    Serial.println("Display DIM (30%)");
+  }
+}
+
+// Any user/system activity: reset the idle timer and bring the backlight back
+// to full from either the dimmed stage or full-off. Idempotent when already on.
+void wakeDisplay()
+{
+  lastTouchTime = millis();
+  setDisplayPower(true);
 }
 bool is_plugged_usb(void){
 //CHRG pin of TP4056 is connected to GPIO2
@@ -730,10 +763,7 @@ void switchToPage(int page) {
     xSemaphoreGive(lvglMutex);
   }
   // Reset timeout and turn on display on page switch
-  lastTouchTime = millis();
-  if (!displayOn) {
-    setDisplayPower(true);
-  }
+  wakeDisplay();
 }
 
 // LVGL logging callback
@@ -790,11 +820,18 @@ static void startOtaIfNeeded();
 
 void checkDisplayTimeout()
 {
-  uint32_t currentTime = millis();
-  
-  // Turn off display after timeout regardless of BLE connection
-  if (displayOn && (currentTime - lastTouchTime) > displayTimeoutMs) {
-    setDisplayPower(false);
+  if (!displayOn) return;
+
+  uint32_t idle = millis() - lastTouchTime;
+  bool inDimWindow = displayTimeoutMs > DISPLAY_DIM_LEAD_MS &&
+                     idle > (displayTimeoutMs - DISPLAY_DIM_LEAD_MS);
+
+  if (idle > displayTimeoutMs) {
+    setDisplayPower(false);      // stage 2: fully off
+  } else if (inDimWindow && !displayDimmed) {
+    setDisplayDim();             // stage 1: 30% for the final DISPLAY_DIM_LEAD_MS
+  } else if (!inDimWindow && displayDimmed) {
+    setDisplayPower(true);       // idle timer reset below the window → restore full
   }
 }
 
@@ -951,10 +988,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
     JsonVariant msg = doc["message"];
 
     // Reset timeout and wake display on any message
-    lastTouchTime = millis();
-    if (!displayOn) {
-      setDisplayPower(true);
-    }
+    wakeDisplay();
 
     if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
       String eventType = "JOURNAL";  // Reuse existing journal handler
@@ -1122,10 +1156,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   Serial.printf("[WS] Processing %s event ID: %d\n", eventType.c_str(), id);
   
   // Reset display timeout on message
-  lastTouchTime = millis();
-  if (!displayOn) {
-    setDisplayPower(true);
-  }
+  wakeDisplay();
   
   // Process event - reuse the doc to avoid extra allocations
   JsonDocument eventDoc;
@@ -1810,6 +1841,10 @@ void setup()
   //set batpin  pullup high
   pinMode(BATPIN, INPUT_PULLUP);
 
+  // Backlight on LEDC PWM so brightness can be dimmed (5 kHz, 8-bit). Start full on.
+  ledcAttach(BL_PIN, 5000, 8);
+  ledcWrite(BL_PIN, BL_DUTY_FULL);
+
   // Check PSRAM availability
   Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
   if (psramFound()) {
@@ -2089,19 +2124,20 @@ void loop()
   if (blinkScreen && blinkCount > 0) {
     if (millis() - lastBlinkTime > 200) {  // Blink every 200ms
       if (displayOn) {
-        digitalWrite(45, LOW);
+        ledcWrite(BL_PIN, 0);
         displayOn = false;
       } else {
-        digitalWrite(45, HIGH);
+        ledcWrite(BL_PIN, BL_DUTY_FULL);
         displayOn = true;
       }
       blinkCount--;
       lastBlinkTime = millis();
-      
+
       if (blinkCount == 0) {
         blinkScreen = false;
-        digitalWrite(45, HIGH);
+        ledcWrite(BL_PIN, BL_DUTY_FULL);
         displayOn = true;
+        displayDimmed = false;
       }
     }
   }
