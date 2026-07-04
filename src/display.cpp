@@ -3,6 +3,7 @@
 #include "TFT_eSPI.h"
 #include "FT6336U.h"
 #include <esp_heap_caps.h>
+#include "ed_logo.h"
 
 // Screen dimensions after rotation (swapped for 90° rotation)
 static const uint16_t screenWidth  = 240;
@@ -97,6 +98,14 @@ lv_disp_t* Display::init(void)
     lv_init();
     tft.begin();          /* TFT init */
     tft.setRotation( TFT_DIRECTION ); /* No rotation at TFT level - LVGL handles rotation */
+    tft.fillScreen(TFT_BLACK); /* clear stale panel GRAM surviving from before reset */
+
+    /* Boot splash (Elite Dangerous logo), centered. Stays visible while the
+       rest of setup() runs, until the first LVGL frame replaces it. */
+    tft.setSwapBytes(true);
+    tft.pushImage((tft.width()  - ED_LOGO_W) / 2,
+                  (tft.height() - ED_LOGO_H) / 2,
+                  ED_LOGO_W, ED_LOGO_H, ed_logo_map);
 #if DISPLAY_FLUSH_DMA
     bool dma_ok = tft.initDMA();   /* attach the SPI DMA engine to the bus */
     Serial.printf("[TFT] initDMA: %s\n", dma_ok ? "OK" : "FAILED (or already enabled)");

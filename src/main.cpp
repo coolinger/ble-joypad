@@ -168,6 +168,8 @@ bool ledOn = true;
 // Display timeout adapts to power source
 const uint32_t DISPLAY_TIMEOUT_USB_MS = 5 * 60 * 1000;  // 5 minutes when on USB
 const uint32_t DISPLAY_TIMEOUT_BATT_MS = 30 * 1000;     // 30 seconds on battery
+// Without a BLE host the controller is not in use: short timeout, even on USB.
+const uint32_t DISPLAY_TIMEOUT_NO_BLE_MS = 5 * 1000;
 uint32_t displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS;
 
 // Backlight (GPIO45) is driven by LEDC PWM so we can dim it. Two-stage timeout:
@@ -177,6 +179,14 @@ const uint8_t  BL_DUTY_FULL = 255;          // 100%
 const uint8_t  BL_DUTY_DIM  = 77;           // ~30%
 const uint32_t DISPLAY_DIM_LEAD_MS = 15000; // dim this long before the final off
 bool displayDimmed = false;                 // true while at BL_DUTY_DIM
+// Set when the display is switched off via the BLACK button: suppresses the
+// WS-message auto-wake so the screen stays dark until a deliberate action
+// (touch / page button / BLE reconnect) wakes it through wakeDisplay().
+bool displayManualOff = false;
+
+// FSSBodySignals: one short beep per detected signal. Incremented by the WS
+// task (handleEliteEvent), drained evenly spaced by loop() on core 1.
+volatile int pendingSignalBeeps = 0;
 
 // Forward declarations for display power control
 void setDisplayPower(bool on);
@@ -255,14 +265,19 @@ void setDisplayDim()
 void wakeDisplay()
 {
   lastTouchTime = millis();
+  displayManualOff = false;
   setDisplayPower(true);
 }
 bool is_plugged_usb(void){
-//CHRG pin of TP4056 is connected to GPIO2
-//PIN is low when charging, high when on battery
-return digitalRead(BATPIN)==HIGH ||  analogRead(BATTERY_ADC_PIN) > BATTERY_USB_THRESH_HIGH;
-
-
+  // TP4056 CHRG pin (GPIO2, open-drain + pull-up): LOW = actively charging, so
+  // USB is definitely present. HIGH is ambiguous (battery-only OR charge
+  // complete on USB), so then the ADC divider decides, with hysteresis so the
+  // state doesn't flap inside the threshold band.
+  if (digitalRead(BATPIN) == LOW) return true;
+  int raw = analogRead(BATTERY_ADC_PIN);
+  if (raw >= BATTERY_USB_THRESH_HIGH) return true;
+  if (raw <= BATTERY_USB_THRESH_LOW) return false;
+  return usbPowered;  // inside hysteresis band: keep previous state
 }
 
 // Helper function to print heap status including PSRAM
@@ -398,7 +413,7 @@ void updateHeader() {
   // Battery/USB indicator
   if (battery_icon) {
     const char* icon = LV_SYMBOL_BATTERY_EMPTY;
-    if (is_plugged_usb()) {
+    if (usbPowered) {  // sampled state from sampleBatteryAdc, no extra ADC read
       icon = LV_SYMBOL_USB;
     } else {
       switch (batteryLevel) {
@@ -602,16 +617,12 @@ static void sampleBatteryAdc() {
   int raw = analogRead(BATTERY_ADC_PIN);
   batteryRaw = raw;
 
-  // Determine USB/battery with hysteresis
+  // Determine USB/battery (hysteresis lives in is_plugged_usb)
   bool prevUsb = usbPowered;
-  if (is_plugged_usb()) {
-    usbPowered = true;
-  } else {
-    usbPowered = false;
-  }
+  usbPowered = is_plugged_usb();
 
   // Map raw ADC to coarse level for icon
-  if (is_plugged_usb()) {
+  if (usbPowered) {
     batteryLevel = 5;
   } else if (raw >= 2480) {
     batteryLevel = 5;
@@ -789,7 +800,7 @@ void checkBleConnection()
       beepConnect();  // Rising tone for connection
       bleConnected = true;
       ledOn = true;
-      setDisplayPower(true);
+      wakeDisplay();  // wake AND reset the idle timer
       update_bluetooth_icon();
     }
     lastBleActiveTime = millis();
@@ -803,6 +814,7 @@ void checkBleConnection()
       bleConnected = false;
       ledOn = true;
       bleDisconnectedTime = millis();
+      lastTouchTime = millis();  // start the short no-BLE display grace period
       update_bluetooth_icon();
     }
     
@@ -825,11 +837,15 @@ void checkDisplayTimeout()
 {
   if (!displayOn) return;
 
-  uint32_t idle = millis() - lastTouchTime;
-  bool inDimWindow = displayTimeoutMs > DISPLAY_DIM_LEAD_MS &&
-                     idle > (displayTimeoutMs - DISPLAY_DIM_LEAD_MS);
+  // No BLE host connected -> nothing to control, allow only a short on-time
+  // (grace starts at the disconnect: checkBleConnection resets lastTouchTime).
+  uint32_t limit = bleConnected ? displayTimeoutMs : DISPLAY_TIMEOUT_NO_BLE_MS;
 
-  if (idle > displayTimeoutMs) {
+  uint32_t idle = millis() - lastTouchTime;
+  bool inDimWindow = limit > DISPLAY_DIM_LEAD_MS &&
+                     idle > (limit - DISPLAY_DIM_LEAD_MS);
+
+  if (idle > limit) {
     setDisplayPower(false);      // stage 2: fully off
   } else if (inDimWindow && !displayDimmed) {
     setDisplayDim();             // stage 1: 30% for the final DISPLAY_DIM_LEAD_MS
@@ -990,8 +1006,10 @@ void onWebSocketMessage(WebsocketsMessage message) {
     const char* name = doc["name"];
     JsonVariant msg = doc["message"];
 
-    // Reset timeout and wake display on any message
-    wakeDisplay();
+    // Reset timeout and wake display on game traffic — but only while a BLE
+    // host is connected (otherwise WS chatter keeps the display alive all
+    // night) and not manually switched off via the BLACK button.
+    if (bleConnected && !displayManualOff) wakeDisplay();
 
     if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
       String eventType = "JOURNAL";  // Reuse existing journal handler
@@ -1158,8 +1176,9 @@ void onWebSocketMessage(WebsocketsMessage message) {
   String eventType = String(type);
   Serial.printf("[WS] Processing %s event ID: %d\n", eventType.c_str(), id);
   
-  // Reset display timeout on message
-  wakeDisplay();
+  // Reset display timeout on message (only while a BLE host is connected and
+  // the display wasn't manually switched off)
+  if (bleConnected && !displayManualOff) wakeDisplay();
   
   // Process event - reuse the doc to avoid extra allocations
   JsonDocument eventDoc;
@@ -1601,9 +1620,11 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Append signal counts per type, e.g. "FSSBodySignals Bi:1 Ge:2"
       // Label = first two chars of the type name ("$SAA_SignalType_Xxx;" -> "Xx")
       int len = snprintf(logBuf, sizeof(logBuf), "FSSBodySignals");
+      int totalSignals = 0;
       for (JsonObject sig : doc["Signals"].as<JsonArray>()) {
         int count = sig["Count"] | 0;
         if (count <= 0) continue;
+        totalSignals += count;
         const char* type = sig["Type"] | "";
         const char* p = strstr(type, "SignalType_");
         const char* name = p ? p + 11 : (sig["Type_Localised"] | type);
@@ -1616,6 +1637,10 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       Serial.printf("[BIOSIG] '%s' (Signals is array: %d, size: %d)\n",
         logBuf, doc["Signals"].is<JsonArray>(), (int)doc["Signals"].as<JsonArray>().size());
       addLogEntry(logBuf);
+      // One short beep per detected signal (any category). Queued here and
+      // played evenly spaced by loop() so this WS task never blocks on audio.
+      pendingSignalBeeps += totalSignals;
+      if (pendingSignalBeeps > 12) pendingSignalBeeps = 12;  // cap the serenade
     } else {
       // Generic journal event - only add to display if not hidden
       if (!hideFromDisplay) {
@@ -1864,9 +1889,11 @@ void setup()
   //set batpin  pullup high
   pinMode(BATPIN, INPUT_PULLUP);
 
-  // Backlight on LEDC PWM so brightness can be dimmed (5 kHz, 8-bit). Start full on.
-  ledcAttach(BL_PIN, 5000, 8);
-  ledcWrite(BL_PIN, BL_DUTY_FULL);
+  // Keep the backlight firmly off during early boot (the panel GRAM still
+  // holds the image from before the reset). The LEDC PWM attach happens only
+  // AFTER display init, because tft.begin() reconfigures the pin (see below).
+  pinMode(BL_PIN, OUTPUT);
+  digitalWrite(BL_PIN, LOW);
 
   // Check PSRAM availability
   Serial.printf("[PSRAM] Available: %s\n", psramFound() ? "YES" : "NO");
@@ -1899,9 +1926,6 @@ void setup()
   
   // beepBootup();  // Disabled - tone() uses LEDC
   
-  Serial.println("[WIFI] Connecting...");
-  WifiConnect();
-  
   // Initialize display power management
   Serial.println("[INIT] Setting up display power management...");
   lastTouchTime = millis();
@@ -1910,6 +1934,22 @@ void setup()
 
   Serial.println("[I2C] Initializing I2C bus...");
   Wire.begin(I2C_SDA, I2C_SCL, I2C_SPEED);
+
+  // Display first: clears the stale panel content and shows the boot splash
+  // while the rest of setup() (WiFi, audio, BLE) runs.
+  Serial.println("[DISPLAY] Initializing display and LVGL...");
+  disp.init();
+  disp.setTouchCallback(handleTouchActivity);
+  // The FNK0104B TFT_eSPI setup defines TFT_BL 45, so tft.begin() just
+  // reconfigured GPIO45 as a plain GPIO output — which detaches it from any
+  // earlier LEDC routing and would make every later ledcWrite() (dim, display
+  // off) silently do nothing. Attach the LEDC PWM only now, after TFT init.
+  ledcAttach(BL_PIN, 5000, 8);
+  ledcWrite(BL_PIN, BL_DUTY_FULL);  // reveal the splash
+
+  Serial.println("[WIFI] Connecting...");
+  WifiConnect();
+
   //Audio pins:
   //GPIO1: Audio Power amplifier IC enable Pin, low level enable
   //GPIO4: Audio I2S bus master clock signal
@@ -1985,17 +2025,15 @@ void setup()
   Serial.println("[BLE] Starting BLE gamepad...");
   bleGamepad->begin(&bleGamepadConfig);
   
-  Serial.println("[DISPLAY] Initializing display and LVGL...");
-  //init_display();
-  disp.init();
-  disp.setTouchCallback(handleTouchActivity);
-
   Serial.println("[UI] Creating fighter UI...");
   create_fighter_ui();
   Serial.println("[UI] Creating logviewer UI...");
   create_logviewer_ui();
   Serial.println("[UI] Loading logviewer screen...");
   lv_scr_load(logviewer_screen);
+
+  // Replace the boot splash with the first full UI frame.
+  lv_refr_now(NULL);
   Serial.println("[UI] Initialization complete!");
   
   // Play startup tone
@@ -2045,6 +2083,16 @@ void loop()
     pendingJumpOverlay = false;
     showJumpOverlay(pendingJumpValue);
   }
+
+  // Drain queued FSSBodySignals beeps, evenly spaced so they read as one
+  // beep per signal instead of a continuous tone.
+  static uint32_t lastSignalBeepTime = 0;
+  if (pendingSignalBeeps > 0 && millis() - lastSignalBeepTime >= 150) {
+    beepSignal();
+    pendingSignalBeeps--;
+    lastSignalBeepTime = millis();
+  }
+
   checkBleConnection();
   checkDisplayTimeout();
   checkWifiConnection();
@@ -2199,6 +2247,12 @@ void loop()
         if (pressed) {
           bleGamepad->press(i + 1);
           Serial.printf("Button %d pressed\n", i + 1);
+          // BLACK button (BLE button 4) doubles as "display off"; waking is
+          // done by touch / page buttons / BLE reconnect via wakeDisplay().
+          if (i == 3) {
+            setDisplayPower(false);
+            displayManualOff = true;
+          }
           anyPressed = true;
           lastButtonState |= (1 << i);
         } else {
