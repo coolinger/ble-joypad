@@ -1,7 +1,10 @@
 #include "sound.h"
 
 #include <cmath>
-#include "driver/i2s.h"
+#include "driver/i2s_std.h"
+
+// TX channel handle created in main.cpp's setup()
+extern i2s_chan_handle_t i2s_tx_chan;
 
 // Tone feature toggles
 #define BEEP_BOOT 0
@@ -47,8 +50,10 @@ void playTone(uint16_t frequency, uint16_t duration_ms) {
     buffer[i * 2 + 1] = s;
   }
 
-  esp_err_t err = i2s_write(I2S_NUM_0, buffer, samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-  Serial.printf("[I2S] write err=%d bytes=%u\n", (int)err, (unsigned)bytes_written);
+  esp_err_t err = i2s_channel_write(i2s_tx_chan, buffer, samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S] write failed: err=%d bytes=%u\n", (int)err, (unsigned)bytes_written);
+  }
 
   free(buffer);
 }

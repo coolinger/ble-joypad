@@ -18,12 +18,12 @@
 #include "screens/fighter.h"
 #include "screens/info.h"
 #include "screens/system.h"
-// I2S: use the legacy driver/i2s.h throughout (matches sound.cpp).
-// On ESP-IDF >= 5.x this header still ships under driver/deprecated/ and
-// remains functional (just emits deprecation warnings). The new ESP_I2S /
-// I2SClass API was never actually wired up here, so we stick with legacy.
-#define USE_NEW_I2S_API 0
-#include "driver/i2s.h"
+// I2S: new IDF "std" driver (driver/i2s_std.h). Migrated off the legacy
+// driver/i2s.h so the legacy<->new "CONFLICT" runtime error can't occur and the
+// deprecation warnings are gone. The TX channel handle (i2s_tx_chan) is created
+// in setup() and used by sound.cpp for playback.
+#define USE_NEW_I2S_API 1
+#include "driver/i2s_std.h"
 
 
 using namespace websockets;
@@ -42,6 +42,9 @@ using namespace websockets;
 #define I2S_DINT 6
 #define I2S_DOUT 8
 #define I2S_WS 7
+
+// TX channel handle for the new i2s_std driver (created in setup(), used by sound.cpp)
+i2s_chan_handle_t i2s_tx_chan = NULL;
 #define BATTERY_ADC_PIN 9
 #define I2C_SPEED 400000
 
@@ -1594,6 +1597,25 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
           addLogEntry(logBuf);
         }
       }
+    } else if (event == "FSSBodySignals") {
+      // Append signal counts per type, e.g. "FSSBodySignals Bi:1 Ge:2"
+      // Label = first two chars of the type name ("$SAA_SignalType_Xxx;" -> "Xx")
+      int len = snprintf(logBuf, sizeof(logBuf), "FSSBodySignals");
+      for (JsonObject sig : doc["Signals"].as<JsonArray>()) {
+        int count = sig["Count"] | 0;
+        if (count <= 0) continue;
+        const char* type = sig["Type"] | "";
+        const char* p = strstr(type, "SignalType_");
+        const char* name = p ? p + 11 : (sig["Type_Localised"] | type);
+        char label[3] = {0, 0, 0};
+        for (int j = 0; j < 2 && name[j] && name[j] != ';'; j++) label[j] = name[j];
+        if (!label[0]) label[0] = '?';
+        if (len < (int)sizeof(logBuf))
+          len += snprintf(logBuf + len, sizeof(logBuf) - len, " %s:%d", label, count);
+      }
+      Serial.printf("[BIOSIG] '%s' (Signals is array: %d, size: %d)\n",
+        logBuf, doc["Signals"].is<JsonArray>(), (int)doc["Signals"].as<JsonArray>().size());
+      addLogEntry(logBuf);
     } else {
       // Generic journal event - only add to display if not hidden
       if (!hideFromDisplay) {
@@ -1833,6 +1855,7 @@ void setup()
   Serial.begin(115200);
   delay(100);
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
+  Serial.printf("[VERSION] Build: %s %s\n", __DATE__, __TIME__);
 
   analogReadResolution(12);
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
@@ -1911,51 +1934,41 @@ void setup()
     Serial.println("[ES8311] Codec initialized successfully");
   }
   
-  // Initialize I2S driver with pin configuration
-  Serial.println("[I2S] Configuring I2S driver...");
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = AUDIO_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // stereo frames
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 256,
-    .use_apll = true,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = AUDIO_MCLK_HZ
-  };
-
-  i2s_pin_config_t pin_config = {
-    .mck_io_num = I2S_MCK,    // GPIO4
-    .bck_io_num = I2S_BCK,      // GPIO5
-    .ws_io_num = I2S_WS,        // GPIO7
-    .data_out_num = I2S_DOUT,   // GPIO6
-    .data_in_num = -1            // unused (playback only)
-  };
-
-  esp_err_t i2s_err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  // Initialize I2S (new IDF i2s_std driver): create the TX channel, configure
+  // standard Philips slot format + clocking, then enable it.
+  Serial.println("[I2S] Configuring I2S driver (std)...");
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  // Equivalent of the legacy tx_desc_auto_clear=true: send silence once the ring
+  // is drained instead of endlessly replaying the last written samples.
+  chan_cfg.auto_clear = true;
+  esp_err_t i2s_err = i2s_new_channel(&chan_cfg, &i2s_tx_chan, NULL);
   if (i2s_err != ESP_OK) {
-    Serial.printf("[I2S] ERROR: Driver install failed: %d\n", i2s_err);
+    Serial.printf("[I2S] ERROR: new_channel failed: %d\n", i2s_err);
   } else {
-    if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK) {
-      Serial.println("[I2S] ERROR: Pin configuration failed");
+    i2s_std_config_t std_cfg = {
+      .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+      .gpio_cfg = {
+        .mclk = (gpio_num_t)I2S_MCK,   // GPIO4
+        .bclk = (gpio_num_t)I2S_BCK,   // GPIO5
+        .ws   = (gpio_num_t)I2S_WS,    // GPIO7
+        .dout = (gpio_num_t)I2S_DOUT,  // GPIO8 (kept as-is from the legacy config)
+        .din  = I2S_GPIO_UNUSED,
+        .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+      },
+    };
+    // ES8311 needs MCLK = 256 * fs (11.2896 MHz @ 44.1 kHz). The S3 has no APLL for
+    // I2S in this IDF, so the default PLL source + fractional divider is used.
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+
+    if (i2s_channel_init_std_mode(i2s_tx_chan, &std_cfg) != ESP_OK) {
+      Serial.println("[I2S] ERROR: init_std_mode failed");
+    } else if (i2s_channel_enable(i2s_tx_chan) != ESP_OK) {
+      Serial.println("[I2S] ERROR: channel enable failed");
     } else {
-      Serial.println("[I2S] Driver and pins configured successfully");
+      soundSetInitialized(true);  // Mark I2S as ready for tones
+      Serial.println("[I2S] Audio driver initialized successfully (std)");
     }
-    if (i2s_set_clk(I2S_NUM_0, AUDIO_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO) != ESP_OK) {
-      Serial.println("[I2S] ERROR: Clock configuration failed");
-    } else {
-      Serial.println("[I2S] Clock configured successfully");
-    }
-    if (i2s_zero_dma_buffer(I2S_NUM_0) != ESP_OK) {
-      Serial.println("[I2S] ERROR: DMA buffer zeroing failed");
-    } else {
-      Serial.println("[I2S] DMA buffer zeroed successfully");
-    }
-    soundSetInitialized(true);  // Mark I2S as ready for tones
-    Serial.println("[I2S] Audio driver initialized successfully");
   }
 
   Serial.println("[PCF8575] Creating button controller...");

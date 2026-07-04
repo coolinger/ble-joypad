@@ -11,6 +11,9 @@
 #include "esp_err.h"
 #include "esp_check.h"
 
+#include <Arduino.h>
+#include <Wire.h>
+
 #include "es8311_reg.h"
 
 
@@ -143,17 +146,27 @@ static const struct _coeff_div coeff_div[] = {
 
 static const char *TAG = "ES8311";
 
+// I2C access goes through the Arduino Wire bus (initialised in main.cpp). On
+// Arduino-core 3.x Wire uses the new i2c_master ("driver_ng"), so routing the
+// codec through Wire avoids the old<->new I2C driver conflict.
 static inline esp_err_t es8311_write_reg(es8311_handle_t dev, uint8_t reg_addr, uint8_t data)
 {
     es8311_dev_t *es = (es8311_dev_t *) dev;
-    const uint8_t write_buf[2] = {reg_addr, data};
-    return i2c_master_write_to_device(es->port, es->dev_addr, write_buf, sizeof(write_buf), pdMS_TO_TICKS(1000));
+    Wire.beginTransmission((uint8_t) es->dev_addr);
+    Wire.write(reg_addr);
+    Wire.write(data);
+    return (Wire.endTransmission() == 0) ? ESP_OK : ESP_FAIL;
 }
 
 static inline esp_err_t es8311_read_reg(es8311_handle_t dev, uint8_t reg_addr, uint8_t *reg_value)
 {
     es8311_dev_t *es = (es8311_dev_t *) dev;
-    return i2c_master_write_read_device(es->port, es->dev_addr, &reg_addr, 1, reg_value, 1, pdMS_TO_TICKS(1000));
+    Wire.beginTransmission((uint8_t) es->dev_addr);
+    Wire.write(reg_addr);
+    if (Wire.endTransmission(false) != 0) return ESP_FAIL;      // repeated start
+    if (Wire.requestFrom((uint8_t) es->dev_addr, (uint8_t) 1) != 1) return ESP_FAIL;
+    *reg_value = Wire.read();
+    return ESP_OK;
 }
 
 /*

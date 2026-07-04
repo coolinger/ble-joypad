@@ -8,27 +8,30 @@ Firmware for an ESP32-S3 touchscreen controller for *Elite Dangerous*. It receiv
 
 ## Build / flash / monitor
 
-PlatformIO project, single environment `default`. **`pio` is not on PATH** on this machine — use the full path:
+PlatformIO project, two environments: `default` (USB upload) and `ota` (extends `default`, only swaps the upload path to ArduinoOTA → `FighterController.fritz.box:3232`). **The usual workflow is OTA**, so check `.pio/build/ota/` (not `default/`) for the current firmware artifacts. **`pio` is not on PATH** on this machine — use the full path:
 
 ```bash
-# build
-"d:\pio\penv\Scripts\platformio.exe" run
-# upload over USB CDC
-"d:\pio\penv\Scripts\platformio.exe" run -t upload
+# build + upload over the air (usual workflow)
+"d:\pio\penv\Scripts\platformio.exe" run -e ota -t upload
+# build only
+"d:\pio\penv\Scripts\platformio.exe" run -e ota
+# upload over USB CDC (fallback, e.g. if OTA/WiFi is broken)
+"d:\pio\penv\Scripts\platformio.exe" run -e default -t upload
 # serial monitor (115200)
 "d:\pio\penv\Scripts\platformio.exe" device monitor
 # clean
 "d:\pio\penv\Scripts\platformio.exe" run -t clean
 ```
 
-There is no test suite. OTA upload is also available at runtime via `ArduinoOTA` once the device is on WiFi.
+There is no test suite.
 
 ## Toolchain / platform gotchas
 
 - The `platform` in [platformio.ini](platformio.ini) is the **pioarduino fork** (pinned release 55.03.39 → Arduino-Core 3.3.9 / ESP-IDF 5.5.4), *not* stock `espressif32` (which is frozen at IDF 4.4). The pre-migration config lives in git history; what the upgrade broke and how it was re-fixed is summarized in [CHANGELOG.md](CHANGELOG.md).
 - `lvgl`, `TFT_eSPI`, and `FT6336U_CTP_Controller` are **vendored in [lib/](lib/)** and take precedence over any `lib_deps` versions. Note these three are **gitignored** (not committed), so a fresh clone won't build until they're restored. LVGL is configured by [lv_conf.h](lv_conf.h) at the repo root; TFT_eSPI by [src/User_Setup.h](src/User_Setup.h) (and [lib/TFT_eSPI_Setups](lib/TFT_eSPI_Setups)). Changing display/UI behavior usually means editing these config files, not the library source.
 - `ESP32-BLE-Gamepad` is **also vendored in [lib/](lib/ESP32-BLE-Gamepad), but committed** (unlike the three above) because it carries a local patch — see the next bullet. It is therefore *not* in `lib_deps`; only its NimBLE dependency is, pinned to `^2.0`.
-- **I2S uses the legacy `driver/i2s.h` API deliberately** ([src/sound.cpp](src/sound.cpp), I2S init in [src/main.cpp](src/main.cpp)). On IDF 5.x this header still ships under `driver/deprecated/` and works (with deprecation warnings). The `ESP_I2S` / `I2SClass` path is *not* wired up — don't assume `USE_NEW_I2S_API` selects a working alternate path.
+- **Driver families must not be mixed (IDF 5.x aborts at runtime with "CONFLICT"):** Arduino-core 3.x `Wire` uses the new I2C `driver_ng`, so **everything** on I2C must go through `Wire` — [src/es8311.cpp](src/es8311.cpp) was ported accordingly (no `driver/i2c.h` calls). Likewise audio uses the **new `i2s_std` driver** (`driver/i2s_std.h`): the TX channel `i2s_tx_chan` is created in main.cpp's setup() with `chan_cfg.auto_clear = true` (without it the DMA ring endlessly replays the last tone) and consumed by [src/sound.cpp](src/sound.cpp) via `i2s_channel_write`. Don't reintroduce `driver/i2s.h` / `driver/i2c.h` legacy calls anywhere.
+- **The display flush is deliberately blocking (`pushColors`), not DMA.** `DISPLAY_FLUSH_DMA` in [src/display.cpp](src/display.cpp) selects the path; the DMA variant stalls LVGL mid-frame once the I2S GDMA channel is active, and is slower anyway with PSRAM draw buffers (extra in-place byte-swap pass). See the comment at the top of display.cpp before re-enabling it.
 - **The `ESP32-BLE-Gamepad` patch:** its `BleNUS.h`/`BleNUS.cpp` rely on `Arduino.h` being included transitively (true under NimBLE 1.x, *not* under the NimBLE 2.x the new core pulls in), so they fail with `delay`/`Serial`/`ltoa`/`dtostrf` "not declared". The fix is one line — `#include <Arduino.h>` in [lib/ESP32-BLE-Gamepad/BleNUS.h](lib/ESP32-BLE-Gamepad/BleNUS.h). To keep that fix under version control (rather than in the throwaway `.pio/`), the whole library is vendored into `lib/` and committed. **If you ever re-add `lemmingDev/ESP32-BLE-Gamepad` to `lib_deps`, the registry copy will shadow the vendored one and the error returns** — keep it vendored, or re-apply the include.
 
 ## Architecture (the big picture)

@@ -8,8 +8,18 @@
 static const uint16_t screenWidth  = 240;
 static const uint16_t screenHeight = 320;
 
-// Two LVGL draw buffers (double buffering) allocated in PSRAM and pushed to the
-// panel via SPI DMA. See Display::init() for allocation.
+// Flush path: 0 = blocking pushColors (default), 1 = SPI DMA (pushPixelsDMA).
+//
+// The DMA path is kept for reference but DISABLED: once the i2s_std driver's
+// GDMA channel is active (audio), LVGL stalls mid-frame after ~3 DMA flushes
+// (exact spi_master/GDMA interaction unresolved). The blocking path is also
+// simply faster here: pushPixelsDMA needs an extra in-place byte-swap pass
+// over the PSRAM buffer before every transfer, while pushColors streams and
+// swaps in a single pass.
+#define DISPLAY_FLUSH_DMA 0
+
+// Two LVGL draw buffers (double buffering) allocated in PSRAM.
+// See Display::init() for allocation.
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *lv_buf1 = nullptr;
 static lv_color_t *lv_buf2 = nullptr;
@@ -30,11 +40,7 @@ void my_print(const char * buf)
 }
 #endif
 
-/* Display flushing — DMA path.
-   pushPixelsDMA() is non-blocking and internally waits for the previous transfer
-   before starting the next, so with double buffering LVGL renders into the second
-   buffer while the first is shifted out. lv_disp_flush_ready() may therefore be
-   called immediately. */
+/* Display flushing (path selected by DISPLAY_FLUSH_DMA, see top of file) */
 void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p )
 {
     uint32_t w = ( area->x2 - area->x1 + 1 );
@@ -42,7 +48,11 @@ void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *colo
 
     tft.startWrite();
     tft.setAddrWindow( area->x1, area->y1, w, h );
+#if DISPLAY_FLUSH_DMA
     tft.pushPixelsDMA( (uint16_t*)&color_p->full, w * h );
+#else
+    tft.pushColors( (uint16_t*)&color_p->full, w * h, true );
+#endif
     tft.endWrite();
 
     lv_disp_flush_ready( disp );
@@ -87,8 +97,11 @@ lv_disp_t* Display::init(void)
     lv_init();
     tft.begin();          /* TFT init */
     tft.setRotation( TFT_DIRECTION ); /* No rotation at TFT level - LVGL handles rotation */
-    tft.initDMA();          /* attach the SPI DMA engine to the bus */
+#if DISPLAY_FLUSH_DMA
+    bool dma_ok = tft.initDMA();   /* attach the SPI DMA engine to the bus */
+    Serial.printf("[TFT] initDMA: %s\n", dma_ok ? "OK" : "FAILED (or already enabled)");
     tft.setSwapBytes(true); /* RGB565 byte order for pushPixelsDMA (LV_COLOR_16_SWAP == 0) */
+#endif
 
     /* Allocate two draw buffers in PSRAM as the DMA source. 64-byte (cache line)
        alignment keeps the SPI master's cache write-back coherent when it streams
