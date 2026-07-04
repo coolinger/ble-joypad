@@ -14,6 +14,7 @@ bool soundIsInitialized();
 void playTone(uint16_t frequency, uint16_t duration_ms);
 void beepShort();
 void beepClick();
+void beepSignal();
 void beepConnect();
 void beepDisconnect();
 void beepMotherlode();

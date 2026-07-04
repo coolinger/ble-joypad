@@ -14,6 +14,7 @@ extern i2s_chan_handle_t i2s_tx_chan;
 #define BEEP_SHORT 1
 #define BEEP_MOTHERLODE 1
 #define BEEP_CLICK 1
+#define BEEP_SIGNAL 1
 
 int AUDIO_TONE_AMPL  = 6000; // reduce beep loudness
 
@@ -79,6 +80,12 @@ void beepConnect() {
 void beepDisconnect() {
 #if (BEEP_DISCONNECT)
   playTone(600, 100);
+#endif
+}
+
+void beepSignal() {
+#if (BEEP_SIGNAL)
+  playTone(1400, 40);
 #endif
 }
 
