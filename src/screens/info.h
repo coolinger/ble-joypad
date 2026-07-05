@@ -12,6 +12,7 @@ extern lv_obj_t *wifi_icon;
 extern lv_obj_t *websocket_icon;
 extern lv_obj_t *bluetooth_icon;
 extern lv_obj_t *battery_icon;
+extern lv_obj_t *backpack_panel;
 extern lv_obj_t *medpack_label;
 extern lv_obj_t *energycell_label;
 extern lv_obj_t *bioscan_label;

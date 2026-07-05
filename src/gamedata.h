@@ -92,6 +92,44 @@ extern bool blinkScreen;
 extern int blinkCount;
 extern uint32_t lastBlinkTime;
 
+// Bodies with FSS/DSS-detected signals, pinned at the top of the log view
+// until the ship leaves the system (jump/shutdown). bioDone counts organisms
+// fully analysed (3 samples -> ScanOrganic "Analyse") against the biological
+// signal count. Per-genus scan progress is tracked for the detail line.
+#define MAX_PINNED_BODIES 4
+#define MAX_GENUSES 8
+
+enum BioScanState : uint8_t {
+  BIO_TODO = 0,      // known to exist, not scanned yet
+  BIO_SCANNING = 1,  // 1st/2nd sample in the genetic sampler
+  BIO_DONE = 2       // analysed (all 3 samples taken)
+};
+
+struct BioGenus {
+  char name[14];  // localised genus name, e.g. "Bacterium"
+  uint8_t state = BIO_TODO;
+};
+
+struct PinnedBody {
+  int bodyId = -1;   // journal BodyID (matches ScanOrganic "Body")
+  char label[20];    // body identifier within the system, e.g. "A 1"
+  int bio = 0;
+  int geo = 0;
+  int other = 0;
+  int bioDone = 0;   // number of genuses in BIO_DONE
+  BioGenus genuses[MAX_GENUSES];
+  int genusCount = 0;
+};
+extern PinnedBody pinnedBodies[MAX_PINNED_BODIES];
+extern int pinnedBodyCount;
+
+void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other);
+void addPinnedGenus(int bodyId, const char* name);  // from SAASignalsFound Genuses
+// ScanOrganic progress: scanType is "Log" (1st sample), "Sample" (2nd/3rd)
+// or "Analyse" (complete). Updates genus states and bioDone.
+void organicScanProgress(int bodyId, const char* genusName, const char* scanType);
+void clearPinnedBodies();
+
 // Small API helpers
 void updateJumpsRemaining(int newValue);
 void addLogEntry(const char* text);

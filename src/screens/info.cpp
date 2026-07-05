@@ -14,6 +14,7 @@ lv_obj_t *wifi_icon = nullptr;
 lv_obj_t *websocket_icon = nullptr;
 lv_obj_t *bluetooth_icon = nullptr;
 lv_obj_t *battery_icon = nullptr;
+lv_obj_t *backpack_panel = nullptr;
 lv_obj_t *medpack_label = nullptr;
 lv_obj_t *energycell_label = nullptr;
 lv_obj_t *bioscan_label = nullptr;
@@ -130,8 +131,9 @@ void create_logviewer_ui() {
   lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(log_label, SCREEN_WIDTH - 75);
   
-  // Backpack panel (right side of log area)
-  lv_obj_t* backpack_panel = lv_obj_create(log_area);
+  // Backpack panel (right side of log area) — only shown while on foot
+  backpack_panel = lv_obj_create(log_area);
+  lv_obj_add_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_set_size(backpack_panel, 40, SCREEN_HEIGHT - 62);
   lv_obj_set_pos(backpack_panel, SCREEN_WIDTH - 40, 0);
   lv_obj_set_style_bg_color(backpack_panel, LV_COLOR_BG, 0);
