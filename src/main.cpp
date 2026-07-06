@@ -363,9 +363,6 @@ void updateHeader() {
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     lv_label_set_text_fmt(shell_jumps_label, "%d", status.nav.jumpsRemaining);
-    // Big Michroma only fits one digit next to the JUMPS label; shrink for more.
-    lv_obj_set_style_text_font(shell_jumps_label,
-        status.nav.jumpsRemaining > 9 ? FONT_DISPLAY_MID : FONT_DISPLAY_BIG, 0);
 
     int fuelPct = (status.fuel.fuelCapacity > 0)
         ? (int)(status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0;

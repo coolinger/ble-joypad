@@ -90,9 +90,12 @@ void create_shell_ui() {
   shell_jumps_label = lv_label_create(strip);
   lv_label_set_text(shell_jumps_label, "0");
   lv_obj_set_style_text_color(shell_jumps_label, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(shell_jumps_label, FONT_DISPLAY_BIG, 0);
-  lv_obj_set_pos(shell_jumps_label, 4, 2);
-  dim_label(strip, "JUMPS", 4, 28);  // stacked below the number: never reaches the fuel arc
+  // Strip grid: value row on top, caption row at y=22 (one shared baseline
+  // with FUEL/HULL/CARGO). Michroma 18 fits three digits left of the fuel arc
+  // and stays the biggest element on the strip.
+  lv_obj_set_style_text_font(shell_jumps_label, FONT_DISPLAY_MID, 0);
+  lv_obj_set_pos(shell_jumps_label, 4, 3);
+  dim_label(strip, "JUMPS", 4, 22);
 
   shell_fuel_arc = make_arc(strip, 108);
   shell_fuel_label = value_label(strip, "--%", 148, 7);
