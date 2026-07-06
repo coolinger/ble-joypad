@@ -37,12 +37,12 @@ There is no test suite.
 
 ## Architecture (the big picture)
 
-Almost everything lives in [src/main.cpp](src/main.cpp) (~2300 lines), which orchestrates networking, UI updates, input, and audio. The other `src/` modules are extractions from it; the screen modules own UI *construction*, but main.cpp owns most of the *update* logic.
+Almost everything lives in [src/main.cpp](src/main.cpp) (~2500 lines), which orchestrates networking, UI updates, input, and audio. The other `src/` modules are extractions from it; the screen modules own UI *construction*, but main.cpp owns most of the *update* logic.
 
-**Dual-core split (FreeRTOS):**
-- `loop()` (Arduino task, core 1): drives `lv_timer_handler()` rendering, reads the TTP223 pads, sends BLE reports, handles OTA / WiFi / display-timeout.
-- `loop2()` (pinned to core 0, created in `setup()` as `msgTaskHandle`): tight 10 ms poll of the WebSocket via `checkMessages()`.
-- **All LVGL access is guarded by `lvglMutex`.** Any function that touches LVGL widgets (the many `update*` / `switchToPage` / overlay functions) takes this mutex first. New UI code must do the same, because rendering and data updates run on different cores.
+**Dual-task split (FreeRTOS), not dual-core:** both tasks are pinned to core 1 at priority 1 — core 0 is deliberately left for WiFi/BT — so the split is task-level scheduling, not physical-core parallelism.
+- `loop()` (Arduino task): drives `lv_timer_handler()` rendering, reads the TTP223 pads, sends BLE reports, handles OTA / WiFi / display-timeout.
+- `loop2()` (created in `setup()` as `msgTaskHandle`, `xTaskCreatePinnedToCore(..., 1)`): tight 10 ms poll of the WebSocket via `checkMessages()`.
+- **All LVGL access is guarded by `lvglMutex`.** Any function that touches LVGL widgets (the many `update*` / `switchToPage` / overlay functions) takes this mutex first. New UI code must do the same, because rendering and data updates run in different concurrently-scheduled tasks.
 
 **Data flow:** WebSocket message → `onWebSocketMessage` → `handleEliteEvent(eventType, doc)` parses Elite/Icarus JSON → mutates the single global **`StatusModel status`** (defined in [src/gamedata.h](src/gamedata.h)) → screen `update*` functions read `status` and push into LVGL widgets. `StatusModel` is the single source of truth (cargo, fuel, hull, shields, nav, location, credits, etc.); legacy `#define` aliases like `cargoInfo`/`fuelInfo` map onto `status.*` for migration convenience.
 

@@ -7,7 +7,6 @@ class Display
 {
 public:
     lv_display_t* init();
-    void routine();
     void setTouchCallback(void (*cb)());
 };
 

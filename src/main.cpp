@@ -21,7 +21,6 @@
 // driver/i2s.h so the legacy<->new "CONFLICT" runtime error can't occur and the
 // deprecation warnings are gone. The TX channel handle (i2s_tx_chan) is created
 // in setup() and used by sound.cpp for playback.
-#define USE_NEW_I2S_API 1
 #include "driver/i2s_std.h"
 
 
@@ -51,12 +50,8 @@ BleGamepadConfiguration bleGamepadConfig;
 bool bleConnected = false;
 
 // Display and LVGL objects
-//TFT_eSPI tft = TFT_eSPI();
 //static lv_display_t* disp;
 Display disp;
-
-#include "config.h"
-#include "gamedata.h"
 
 WiFiMulti wifiMulti;
 
@@ -315,7 +310,8 @@ void updateBackpackDisplay() {
     xSemaphoreGive(lvglMutex);
   }
 }
-void update_wifi_icon() {
+// Unlocked variants: caller must already hold lvglMutex (e.g. updateHeader()).
+void update_wifi_icon_unlocked() {
     // Update WiFi icon color based on signal quality
   if (wifi_icon) {
     if (WiFi.status() == WL_CONNECTED) {
@@ -334,7 +330,7 @@ void update_wifi_icon() {
     }
   }
 }
-void update_bluetooth_icon() {
+void update_bluetooth_icon_unlocked() {
     // Update Bluetooth icon
   if (bluetooth_icon) {
     if (bleGamepad && bleGamepad->isConnected()) {
@@ -342,6 +338,21 @@ void update_bluetooth_icon() {
     } else {
       lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
     }
+  }
+}
+
+// Locked wrappers: for call sites that do NOT already hold lvglMutex
+// (checkBleConnection() in loop(), onWifiConnect() on the WiFi event task).
+void update_wifi_icon() {
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    update_wifi_icon_unlocked();
+    xSemaphoreGive(lvglMutex);
+  }
+}
+void update_bluetooth_icon() {
+  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    update_bluetooth_icon_unlocked();
+    xSemaphoreGive(lvglMutex);
   }
 }
 
@@ -365,7 +376,7 @@ void updateHeader() {
     lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
   }
 
-  update_wifi_icon();
+  update_wifi_icon_unlocked();
   // Update WebSocket icon
   if (websocket_icon) {
     if (useWebSocket && wsClient.available()) {
@@ -374,9 +385,9 @@ void updateHeader() {
       lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // black - not connected
     }
   }
-  update_bluetooth_icon();
-  
-    
+  update_bluetooth_icon_unlocked();
+
+
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -691,35 +702,32 @@ void switchToPage(int page) {
       }
       lv_screen_load(logviewer_screen);
       currentPage = 1;
-      // Don't call updateLogDisplay here - it will update when events arrive
-      updateCargoBar();
-      updateHeader();
-      updateStatusLine();
-      updateBackpackDisplay();
     } else if (page == 2) {
       if (!settings_screen) {
         create_settings_ui();
       }
       lv_screen_load(settings_screen);
       currentPage = 2;
-      updateSystemInfo();
     }
-    
+
     xSemaphoreGive(lvglMutex);
+  }
+  // Populate the page's widgets after releasing lvglMutex: these update
+  // functions each take the (non-recursive) mutex themselves, so calling
+  // them while still holding it above would deadlock-timeout and silently
+  // no-op (~100-200ms frozen UI per call, updates never applied).
+  if (page == 1) {
+    // Don't call updateLogDisplay here - it will update when events arrive
+    updateCargoBar();
+    updateHeader();
+    updateStatusLine();
+    updateBackpackDisplay();
+  } else if (page == 2) {
+    updateSystemInfo();
   }
   // Reset timeout and turn on display on page switch
   wakeDisplay();
 }
-
-// LVGL logging callback
-void my_print(lv_log_level_t level, const char * buf)
-{
-  LV_UNUSED(level);
-  Serial.print("[LVGL] ");
-  Serial.print(buf);
-  Serial.flush();
-}
-
 
 void checkBleConnection()
 {
@@ -1619,10 +1627,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
 
             // Highlight if already in cargo
             if (cargoHasSymbol(symbol)) {
-              materials += display;
-            } else {
-              materials += display;
+              materials += "*";
             }
+            materials += display;
             count++;
             if (count >= 3) break;  // Limit to 3 materials
           }
@@ -1993,7 +2000,7 @@ void setup()
 
   // Keep the backlight firmly off during early boot (the panel GRAM still
   // holds the image from before the reset). The LEDC PWM attach happens only
-  // AFTER display init, because tft.begin() reconfigures the pin (see below).
+  // after display init (see below).
   pinMode(BL_PIN, OUTPUT);
   digitalWrite(BL_PIN, LOW);
 
@@ -2356,8 +2363,8 @@ void showJumpOverlay(int jumps) {
     lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
     lv_obj_set_style_transform_scale(jump_overlay_label, 768, LV_PART_MAIN);
     lv_obj_update_layout(jump_overlay_label);
-    lv_coord_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
-    lv_coord_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
+    int32_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
+    int32_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
     lv_obj_set_style_transform_pivot_x(jump_overlay_label, pivotX, LV_PART_MAIN);
     lv_obj_set_style_transform_pivot_y(jump_overlay_label, pivotY, LV_PART_MAIN);
 
@@ -2365,17 +2372,17 @@ void showJumpOverlay(int jumps) {
     lv_anim_init(&zoom_anim);
     lv_anim_set_var(&zoom_anim, jump_overlay_label);
     lv_anim_set_values(&zoom_anim, 768, 0);
-    lv_anim_set_time(&zoom_anim, 1000);
+    lv_anim_set_duration(&zoom_anim, 1000);
     lv_anim_set_path_cb(&zoom_anim, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&zoom_anim, jump_overlay_zoom_exec);
-    lv_anim_set_ready_cb(&zoom_anim, jump_overlay_anim_ready);
+    lv_anim_set_completed_cb(&zoom_anim, jump_overlay_anim_ready);
     lv_anim_start(&zoom_anim);
 
     lv_anim_t fade_anim;
     lv_anim_init(&fade_anim);
     lv_anim_set_var(&fade_anim, jump_overlay_label);
     lv_anim_set_values(&fade_anim, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_time(&fade_anim, 1000);
+    lv_anim_set_duration(&fade_anim, 1000);
     lv_anim_set_path_cb(&fade_anim, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&fade_anim, jump_overlay_opa_exec);
     lv_anim_start(&fade_anim);
@@ -2405,7 +2412,12 @@ void showPageOverlay(const char* name) {
       lv_obj_delete(page_overlay);
       page_overlay = nullptr;
     }
-    page_overlay = lv_label_create(lv_screen_active());
+    lv_obj_t* parent = lv_screen_active();
+    if (!parent) {
+      xSemaphoreGive(lvglMutex);
+      return;
+    }
+    page_overlay = lv_label_create(parent);
     lv_label_set_text(page_overlay, name);
     lv_obj_set_style_text_font(page_overlay, FONT_BIG, 0);
     lv_obj_set_style_text_color(page_overlay, LV_COLOR_HIGHLIGHT_BG, 0);

@@ -20,7 +20,8 @@ extern lv_obj_t *bioscan_data_label;
 extern lv_obj_t *jump_overlay_label;
 extern lv_obj_t *status_label;   // sidebar header: current system name
 
-// Sidebar cards for pinned body signals (filled by updatePinnedSidebar in main)
+// Sidebar cards for pinned body signals (filled by updatePinnedSidebarUnlocked in main.cpp;
+// caller must hold lvglMutex)
 extern lv_obj_t *pin_cards[MAX_PINNED_BODIES];
 extern lv_obj_t *pin_title_labels[MAX_PINNED_BODIES];
 extern lv_obj_t *pin_genus_labels[MAX_PINNED_BODIES];

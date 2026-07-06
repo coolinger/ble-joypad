@@ -120,11 +120,6 @@ lv_display_t* Display::init(void)
     return disp;
 }
 
-void Display::routine(void)
-{
-    lv_timer_handler();
-}
-
 void Display::setTouchCallback(void (*cb)())
 {
     touchCallback = cb;
