@@ -398,6 +398,50 @@ void updateStatusLine() {
 static char* logText = nullptr;  // Allocated on heap
 static const int LOG_TEXT_SIZE = 2048;  // Large buffer with PSRAM for more log entries
 
+// Fill the sidebar pin cards from pinnedBodies[]. Caller MUST hold lvglMutex
+// (the mutex is not recursive - never call this from outside updateLogDisplay
+// without taking the mutex yourself).
+static void updatePinnedSidebarUnlocked() {
+  for (int i = 0; i < MAX_PINNED_BODIES; i++) {
+    if (!pin_cards[i]) return;
+    if (i >= pinnedBodyCount) {
+      lv_obj_add_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    PinnedBody &pb = pinnedBodies[i];
+    lv_obj_remove_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
+
+    bool bioComplete = (pb.bio > 0 && pb.bioDone >= pb.bio);
+    char t[64];
+    int l = snprintf(t, sizeof(t), "%s", pb.label);
+    if (pb.bio > 0 && l < (int)sizeof(t))
+      l += snprintf(t + l, sizeof(t) - l, "  Bio %d/%d", pb.bioDone, pb.bio);
+    if (pb.geo > 0 && l < (int)sizeof(t))
+      l += snprintf(t + l, sizeof(t) - l, "  Geo %d", pb.geo);
+    if (pb.other > 0 && l < (int)sizeof(t))
+      l += snprintf(t + l, sizeof(t) - l, "  Sig %d", pb.other);
+    lv_label_set_text(pin_title_labels[i], t);
+    lv_obj_set_style_text_color(pin_title_labels[i],
+        bioComplete ? lv_color_hex(0xc6e6dc) : lv_color_hex(0xffb000), 0);
+
+    if (pb.genusCount > 0) {
+      // Genus states: green = to scan, purple = in the sampler, blue = done.
+      char g[256];
+      int gl = 0;
+      for (int gi = 0; gi < pb.genusCount && gl < (int)sizeof(g) - 32; gi++) {
+        const char *col = "00c060";
+        if (pb.genuses[gi].state == BIO_SCANNING) col = "c85aff";
+        else if (pb.genuses[gi].state == BIO_DONE) col = "4169e1";
+        gl += snprintf(g + gl, sizeof(g) - gl, "#%s %s# ", col, pb.genuses[gi].name);
+      }
+      lv_label_set_text(pin_genus_labels[i], g);
+      lv_obj_remove_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
 void updateLogDisplay() {
   if (!log_label || !logText) return;  // Check logText is allocated
   
@@ -413,48 +457,8 @@ void updateLogDisplay() {
     memset(logText, 0, LOG_TEXT_SIZE);
     int currentLen = 0;
 
-    // Pinned body signals stay at the top until a jump/shutdown clears them.
-    // Orange while organic scans are outstanding, green once Bio is complete.
-    for (int p = 0; p < pinnedBodyCount; p++) {
-      PinnedBody &pb = pinnedBodies[p];
-      bool bioComplete = (pb.bio > 0 && pb.bioDone >= pb.bio);
-      char line[72];
-      int l = snprintf(line, sizeof(line), "#%s %s",
-                       bioComplete ? "c6e6dc" : "ffb000", pb.label);
-      if (pb.bio > 0 && l < (int)sizeof(line))
-        l += snprintf(line + l, sizeof(line) - l, " Bio %d/%d", pb.bioDone, pb.bio);
-      if (pb.geo > 0 && l < (int)sizeof(line))
-        l += snprintf(line + l, sizeof(line) - l, " Geo:%d", pb.geo);
-      if (pb.other > 0 && l < (int)sizeof(line))
-        l += snprintf(line + l, sizeof(line) - l, " Sig:%d", pb.other);
-      if (l < (int)sizeof(line))
-        l += snprintf(line + l, sizeof(line) - l, "#");
-      if (l + 2 > LOG_TEXT_SIZE - currentLen) break;
-      memcpy(logText + currentLen, line, l);
-      currentLen += l;
-      logText[currentLen++] = '\n';
-      logText[currentLen] = '\0';
-
-      // Genus detail line: green = still to scan, purple = in the sampler
-      // (1st/2nd sample taken), dark blue = analysed.
-      if (pb.genusCount > 0) {
-        char gline[224];
-        int gl = snprintf(gline, sizeof(gline), " ");
-        for (int gi = 0; gi < pb.genusCount; gi++) {
-          const char* col = "00c060";                                  // to scan
-          if (pb.genuses[gi].state == BIO_SCANNING) col = "c85aff";    // sampling
-          else if (pb.genuses[gi].state == BIO_DONE) col = "4169e1";   // done
-          if (gl >= (int)sizeof(gline) - 1) break;
-          gl += snprintf(gline + gl, sizeof(gline) - gl, "#%s %s# ",
-                         col, pb.genuses[gi].name);
-        }
-        if (gl + 2 > LOG_TEXT_SIZE - currentLen) break;
-        memcpy(logText + currentLen, gline, gl);
-        currentLen += gl;
-        logText[currentLen++] = '\n';
-        logText[currentLen] = '\0';
-      }
-    }
+    // Pins render as sidebar cards now, not as log lines.
+    updatePinnedSidebarUnlocked();
 
     // Only show as many entries as we actually have
     int entriesToShow = (eventLogCount < 9) ? eventLogCount : 9;
