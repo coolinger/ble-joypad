@@ -1,4 +1,5 @@
 #include "gamedata.h"
+#include <string.h>
 
 // Unified status instance
 StatusModel status;
@@ -130,6 +131,91 @@ void organicScanProgress(int bodyId, const char* genusName, const char* scanType
 
 void clearPinnedBodies() {
   pinnedBodyCount = 0;
+}
+
+// ---------------- Exploration progress ----------------
+// BodyID dedupe bitmaps (BodyIDs are small ints; clamp to 0..255).
+static uint32_t scannedBits[8];
+static uint32_t mappedBits[8];
+static uint32_t unmappedBits[8];   // bodies whose Scan said WasMapped == false
+#define EXPL_MAX_STATIONS 24
+static uint32_t stationHashes[EXPL_MAX_STATIONS];
+static int stationHashCount = 0;
+
+static bool testAndSetBit(uint32_t* bits, int id) {
+  if (id < 0 || id > 255) return false;
+  uint32_t mask = 1UL << (id & 31);
+  if (bits[id >> 5] & mask) return false;
+  bits[id >> 5] |= mask;
+  return true;
+}
+
+void explorationReset() {
+  status.exploration = ExplorationInfo();
+  memset(scannedBits, 0, sizeof(scannedBits));
+  memset(mappedBits, 0, sizeof(mappedBits));
+  memset(unmappedBits, 0, sizeof(unmappedBits));
+  stationHashCount = 0;
+}
+
+void explorationHonk(int bodyCount) {
+  status.exploration.honked = true;
+  if (bodyCount > 0) status.exploration.bodyCount = bodyCount;
+}
+
+void explorationAllFound() {
+  status.exploration.allFound = true;
+}
+
+void explorationScan(int bodyId, bool wasDiscovered, bool wasMapped) {
+  if (!testAndSetBit(scannedBits, bodyId)) return;  // body already counted
+  status.exploration.scanned++;
+  if (!wasDiscovered) status.exploration.firstDiscovered++;
+  if (!wasMapped) testAndSetBit(unmappedBits, bodyId);
+}
+
+void explorationMapped(int bodyId) {
+  if (!testAndSetBit(mappedBits, bodyId)) return;
+  status.exploration.mapped++;
+  // First map iff nobody had mapped it before our Scan (Scan precedes mapping).
+  if (bodyId >= 0 && bodyId <= 255 &&
+      (unmappedBits[bodyId >> 5] & (1UL << (bodyId & 31)))) {
+    status.exploration.firstMapped++;
+  }
+}
+
+// FNV-1a over the signal name for station dedupe.
+static uint32_t fnv1a(const char* s) {
+  uint32_t h = 2166136261u;
+  while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+  return h;
+}
+
+bool explorationStation(const char* signalName, const char* signalType) {
+  if (!signalName || !signalName[0] || !signalType) return false;
+  uint8_t* bucket = nullptr;
+  // Largest-pad classification by journal SignalType.
+  if (strcmp(signalType, "Outpost") == 0) {
+    bucket = &status.exploration.stationsM;
+  } else if (strcmp(signalType, "FleetCarrier") == 0) {
+    bucket = &status.exploration.carriers;
+  } else if (strcmp(signalType, "StationCoriolis") == 0 ||
+             strcmp(signalType, "StationONeilOrbis") == 0 ||
+             strcmp(signalType, "StationONeilCylinder") == 0 ||
+             strcmp(signalType, "StationBernalSphere") == 0 ||
+             strcmp(signalType, "StationAsteroid") == 0 ||
+             strcmp(signalType, "StationMegaShip") == 0) {
+    bucket = &status.exploration.stationsL;
+  } else {
+    return false;  // installations, USS, ... are not landable stations
+  }
+  uint32_t h = fnv1a(signalName);
+  for (int i = 0; i < stationHashCount; i++) {
+    if (stationHashes[i] == h) return false;  // already counted
+  }
+  if (stationHashCount < EXPL_MAX_STATIONS) stationHashes[stationHashCount++] = h;
+  if (*bucket < 255) (*bucket)++;
+  return true;
 }
 
 // Implementations for updateJumpsRemaining/addLogEntry live in main.cpp.

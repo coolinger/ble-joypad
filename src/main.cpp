@@ -101,7 +101,6 @@ const char ignoreEvent_Materials[] PROGMEM = "Materials";
 const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
 const char ignoreEvent_Missions[] PROGMEM = "Missions";
-const char ignoreEvent_FSSSignalDiscovered[] PROGMEM = "FSSSignalDiscovered";
 
 const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Music,
@@ -112,8 +111,7 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Materials,
   ignoreEvent_MaterialCollected,
   ignoreEvent_ShipLocker,
-  ignoreEvent_Missions,
-  ignoreEvent_FSSSignalDiscovered
+  ignoreEvent_Missions
 };
 const int ignoreJournalEventsCount = sizeof(ignoreJournalEvents) / sizeof(ignoreJournalEvents[0]);
 
@@ -680,6 +678,7 @@ void updateSystemInfo() {
       "  Cargo: %d/%d (Drones: %d)\n"
       "  Backpack: H%d E%d\n"
       "  Bioscans: %d\n\n"
+      "  Expl: %s B:%d S:%d M:%d 1st:%d/%d St:%dL %dM %dFC\n\n"
       "Task Stack Free: %d bytes\n\n"
       "Uptime: %lu sec",
       freeInternal / 1024,
@@ -698,6 +697,10 @@ void updateSystemInfo() {
       status.cargo.usedSpace, status.cargo.totalCapacity, status.cargo.dronesCount,
       status.backpack.healthpack, status.backpack.energycell,
       status.bioscan.totalScans,
+      status.exploration.honked ? (status.exploration.allFound ? "HONK+ALL" : "HONK") : "-",
+      status.exploration.bodyCount, status.exploration.scanned, status.exploration.mapped,
+      status.exploration.firstDiscovered, status.exploration.firstMapped,
+      status.exploration.stationsL, status.exploration.stationsM, status.exploration.carriers,
       stackHighWater * 4,
       millis() / 1000);
     
@@ -1506,7 +1509,20 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         break;
       }
     }
-    
+
+    // Exploration progress (data only; these events still get logged below)
+    if (event == "FSSDiscoveryScan") {
+      explorationHonk(doc["BodyCount"] | 0);
+    } else if (event == "FSSAllBodiesFound") {
+      explorationAllFound();
+    } else if (event == "Scan") {
+      explorationScan(doc["BodyID"] | -1,
+                      doc["WasDiscovered"] | true,
+                      doc["WasMapped"] | true);
+    } else if (event == "SAAScanComplete") {
+      explorationMapped(doc["BodyID"] | -1);
+    }
+
     if (event == "CommunityGoal") {
       // Show player's percentile band for community goals
       if (!doc["CurrentGoals"].isNull()) {
@@ -1560,6 +1576,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       // Left the old system: pinned body signals are no longer relevant
       clearPinnedBodies();
+      explorationReset();
       updateLogDisplay();
     } else if (event == "StartJump") {
       // Hyperspace charge engaged: the old system's data is stale NOW. The
@@ -1567,6 +1584,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // (StartJump with JumpType "Supercruise" changes nothing.)
       if (strcmp(doc["JumpType"] | "", "Hyperspace") == 0) {
         clearPinnedBodies();
+        explorationReset();
         if (doc["StarSystem"].is<const char*>()) {
           status.currentSystem = doc["StarSystem"].as<const char*>();
           status.currentStation = "";
@@ -1660,6 +1678,12 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
           addLogEntry(logBuf);
         }
       }
+    } else if (event == "FSSSignalDiscovered") {
+      // Silent, high-volume: count landable stations by largest pad, no log line.
+      if (doc["IsStation"] | false) {
+        explorationStation(doc["SignalName"] | "", doc["SignalType"] | "");
+      }
+      return;  // consume: never reaches the generic log
     } else if (event == "FSSBodySignals" || event == "SAASignalsFound") {
       // Append signal counts per type, e.g. "FSSBodySignals Bi:1 Ge:2"
       // Label = first two chars of the type name ("$SAA_SignalType_Xxx;" -> "Xx")
@@ -1773,6 +1797,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     } else if (event == "Shutdown" || event == "CarrierJump") {
       // Session over / carrier moved: pinned body signals are stale
       clearPinnedBodies();
+      explorationReset();
       addLogEntry(event.c_str());
     } else {
       // Generic journal event - only add to display if not hidden

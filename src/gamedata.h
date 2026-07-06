@@ -40,6 +40,22 @@ struct BioscanInfo {
   int totalScans = 0;
 };
 
+// Per-system exploration progress (reset on hyperspace jump, like the pins).
+// "first*" counters rely on Scan.WasDiscovered / Scan.WasMapped, which
+// describe what Universal Cartographics knew BEFORE the player's scan.
+struct ExplorationInfo {
+  bool honked = false;        // FSSDiscoveryScan seen
+  bool allFound = false;      // FSSAllBodiesFound
+  int  bodyCount = 0;         // FSSDiscoveryScan.BodyCount
+  int  scanned = 0;           // unique Scan BodyIDs
+  int  mapped = 0;            // unique SAAScanComplete BodyIDs
+  int  firstDiscovered = 0;   // scans with WasDiscovered == false
+  int  firstMapped = 0;       // maps of bodies whose Scan had WasMapped == false
+  uint8_t stationsL = 0;      // largest pad L (Coriolis/Orbis/Ocellus/Asteroid/MegaShip)
+  uint8_t stationsM = 0;      // largest pad M (Outpost)
+  uint8_t carriers = 0;       // FleetCarrier
+};
+
 struct EventLogEntry {
   char text[55];
   uint32_t timestamp;
@@ -60,6 +76,7 @@ struct StatusModel {
   NavRouteInfo nav;
   BackpackInfo backpack;
   BioscanInfo bioscan;
+  ExplorationInfo exploration;
   float shieldsPercent = 0.0f;
 
   String currentSystem;
@@ -129,6 +146,15 @@ void addPinnedGenus(int bodyId, const char* name);  // from SAASignalsFound Genu
 // or "Analyse" (complete). Updates genus states and bioDone.
 void organicScanProgress(int bodyId, const char* genusName, const char* scanType);
 void clearPinnedBodies();
+
+// Exploration progress API (implementation in gamedata.cpp; dedupe backing
+// bitmaps are file-static there).
+void explorationReset();
+void explorationHonk(int bodyCount);
+void explorationAllFound();
+void explorationScan(int bodyId, bool wasDiscovered, bool wasMapped);
+void explorationMapped(int bodyId);
+bool explorationStation(const char* signalName, const char* signalType);
 
 // Small API helpers
 void updateJumpsRemaining(int newValue);
