@@ -1618,7 +1618,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
 
             // Highlight if already in cargo
             if (cargoHasSymbol(symbol)) {
-              materials += String("#c6e6dc ") + display + "#"; // LV_COLOR_OK_FG
+              materials += display;
             } else {
               materials += display;
             }
