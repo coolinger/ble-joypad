@@ -118,7 +118,7 @@ void create_logviewer_ui() {
   status_label = lv_label_create(log_area);
   lv_obj_set_pos(status_label, 5, 2);
   lv_obj_set_width(status_label, SCREEN_WIDTH - 75);
-  lv_label_set_long_mode(status_label, LV_LABEL_LONG_WRAP);
+  lv_label_set_long_mode(status_label, LV_LABEL_LONG_MODE_WRAP);
   lv_label_set_text(status_label, "Waiting for events..."); // Initial empty status
   lv_obj_set_style_text_color(status_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(status_label, &lv_font_montserrat_10, 0);
@@ -128,7 +128,7 @@ void create_logviewer_ui() {
   lv_label_set_text(log_label, " ");
   lv_label_set_recolor(log_label, true); // allow inline color for highlights
   lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
-  lv_label_set_long_mode(log_label, LV_LABEL_LONG_WRAP);
+  lv_label_set_long_mode(log_label, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_set_width(log_label, SCREEN_WIDTH - 75);
   
   // Backpack panel (right side of log area) — only shown while on foot

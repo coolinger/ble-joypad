@@ -47,7 +47,7 @@ static void updateAmplitudeDisplay(int amplitude) {
 }
 
 static void amplitude_slider_handler(lv_event_t * e) {
-  lv_obj_t* slider = lv_event_get_target(e);
+  lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
   if (!slider) return;
   int raw = lv_slider_get_value(slider);
   const int step = 500;
@@ -114,7 +114,7 @@ void create_settings_ui() {
   lv_obj_add_event_cb(amplitude_slider, amplitude_slider_handler, LV_EVENT_VALUE_CHANGED, NULL);
   updateAmplitudeDisplay(AUDIO_TONE_AMPL);
 
-  lv_obj_t* btn_wifi = lv_btn_create(settings_screen);
+  lv_obj_t* btn_wifi = lv_button_create(settings_screen);
   lv_obj_set_size(btn_wifi, 145, 35);
   lv_obj_set_pos(btn_wifi, 10, 175);
   lv_obj_add_style(btn_wifi, &btn_style, 0);
@@ -125,7 +125,7 @@ void create_settings_ui() {
   lv_label_set_text(label_wifi, "Restart WiFi");
   lv_obj_center(label_wifi);
   
-  lv_obj_t* btn_ws = lv_btn_create(settings_screen);
+  lv_obj_t* btn_ws = lv_button_create(settings_screen);
   lv_obj_set_size(btn_ws, 145, 35);
   lv_obj_set_pos(btn_ws, 165, 175);
   lv_obj_add_style(btn_ws, &btn_style, 0);
@@ -136,7 +136,7 @@ void create_settings_ui() {
   lv_label_set_text(label_ws, "Restart WS");
   lv_obj_center(label_ws);
   
-  lv_obj_t* btn_reboot = lv_btn_create(settings_screen);
+  lv_obj_t* btn_reboot = lv_button_create(settings_screen);
   lv_obj_set_size(btn_reboot, 300, 35);
   lv_obj_set_pos(btn_reboot, 10, 215);
   lv_obj_add_style(btn_reboot, &btn_style, 0);

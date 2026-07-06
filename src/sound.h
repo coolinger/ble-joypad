@@ -4,7 +4,6 @@
 
 // Audio constants used by both sound and main
 static const int AUDIO_SAMPLE_RATE = 44100;
-static const int AUDIO_MCLK_HZ    = 11289600;
 
 extern int AUDIO_TONE_AMPL;
 

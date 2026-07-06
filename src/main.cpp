@@ -11,7 +11,6 @@
 #include <ArduinoOTA.h>
 #include <esp_heap_caps.h>
 #include <algorithm>
-#include "es8311.h"
 #include "sound.h"
 #include "config.h"
 #include "gamedata.h"
@@ -30,25 +29,12 @@ using namespace websockets;
 
 
 
-#define PCF8575_ADDR 0x20
-#define I2C_SDA 16
-#define I2C_SCL 15
-#define BUZZER_PIN 5
-#define INT_N_PIN 17
-#define RST_N_PIN 18
-
-#define I2S_MCK 4
-#define I2S_BCK 5
-#define I2S_DINT 6
-#define I2S_DOUT 8
-#define I2S_WS 7
+// All board pins live in config.h (Guition JC4827W543). The PCF8575 with the
+// TTP223 pads sits on Wire1 (PCF_SDA/PCF_SCL); GT911 touch owns Wire.
+#define I2C_SPEED 400000
 
 // TX channel handle for the new i2s_std driver (created in setup(), used by sound.cpp)
 i2s_chan_handle_t i2s_tx_chan = NULL;
-#define BATTERY_ADC_PIN 9
-#define I2C_SPEED 400000
-
-#define BATPIN 2
 
 #define DR_REG_USB_SERIAL_JTAG_BASE             0x60038000
 
@@ -58,32 +44,9 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 
 // Global flags
 
-// Button mapping (PCF8575 pins)
-enum ButtonIndex
-{
-  SILVER_LEFT = 13,
-  SILVER_MID = 14,
-  SILVER_RIGHT = 15,
-  BLACK = 1,
-  WHITE = 0,
-  RED = 5,
-  YELLOW = 2,
-  BLUE = 3,
-  GREEN = 4,
-  LARGE_YELLOW = 12,
-  LARGE_BLUE = 11,
-  LARGE_GREEN = 10
-};
-
-const uint8_t buttonPins[12] = {
-    SILVER_LEFT, SILVER_MID, SILVER_RIGHT,
-    BLACK, WHITE, RED,
-    YELLOW, BLUE, GREEN,
-    LARGE_YELLOW, LARGE_BLUE, LARGE_GREEN};
 PCF8575* pcf = nullptr;
 BleGamepad* bleGamepad = nullptr;
 BleGamepadConfiguration bleGamepadConfig;
-uint16_t lastButtonState = 0;
 bool bleConnected = false;
 
 // Display and LVGL objects
@@ -165,17 +128,15 @@ uint32_t bleDisconnectedTime = 0;
 const uint32_t LED_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 bool ledOn = true;
 
-// Display timeout adapts to power source
-const uint32_t DISPLAY_TIMEOUT_USB_MS = 5 * 60 * 1000;  // 5 minutes when on USB
-const uint32_t DISPLAY_TIMEOUT_BATT_MS = 30 * 1000;     // 30 seconds on battery
-// Without a BLE host the controller is not in use: short timeout, even on USB.
+// While a BLE host is connected the display may idle this long (with the dim
+// stage before the end); without one the controller is not in use: 5 s.
+const uint32_t DISPLAY_TIMEOUT_ACTIVE_MS = 5 * 60 * 1000;
 const uint32_t DISPLAY_TIMEOUT_NO_BLE_MS = 5 * 1000;
-uint32_t displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS;
 
 // Backlight (GPIO45) is driven by LEDC PWM so we can dim it. Two-stage timeout:
 // full brightness while active, 30% for the last DISPLAY_DIM_LEAD_MS, then off.
-#define BL_PIN 45
-const uint8_t  BL_DUTY_FULL = 255;          // 100%
+#define BL_PIN LCD_BL_PIN
+uint8_t BL_DUTY_FULL = 255;  // adjustable from the system screen
 const uint8_t  BL_DUTY_DIM  = 77;           // ~30%
 const uint32_t DISPLAY_DIM_LEAD_MS = 15000; // dim this long before the final off
 bool displayDimmed = false;                 // true while at BL_DUTY_DIM
@@ -217,15 +178,6 @@ bool reqRestartWifi = false;
 bool reqRestartWebSocket = false;
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
-
-// Battery monitoring
-const uint32_t BATTERY_SAMPLE_INTERVAL = 5000; // Sample battery divider every 5 seconds
-uint32_t lastBatterySample = 0;
-const int BATTERY_USB_THRESH_HIGH = 2550;
-const int BATTERY_USB_THRESH_LOW = 2500;
-bool usbPowered = false;
-int batteryRaw = 0;
-int batteryLevel = 5;
 
 // Heap monitoring
 uint32_t lastHeapPrint = 0;
@@ -276,18 +228,6 @@ void wakeDisplay()
   displayManualOff = false;
   setDisplayPower(true);
 }
-bool is_plugged_usb(void){
-  // TP4056 CHRG pin (GPIO2, open-drain + pull-up): LOW = actively charging, so
-  // USB is definitely present. HIGH is ambiguous (battery-only OR charge
-  // complete on USB), so then the ADC divider decides, with hysteresis so the
-  // state doesn't flap inside the threshold band.
-  if (digitalRead(BATPIN) == LOW) return true;
-  int raw = analogRead(BATTERY_ADC_PIN);
-  if (raw >= BATTERY_USB_THRESH_HIGH) return true;
-  if (raw <= BATTERY_USB_THRESH_LOW) return false;
-  return usbPowered;  // inside hysteresis band: keep previous state
-}
-
 // Helper function to print heap status including PSRAM
 void printHeapStatus(const char* location) {
 
@@ -341,7 +281,7 @@ void updateBackpackDisplay() {
 
     // The backpack only exists on foot: hide the whole panel otherwise
     if (backpack_panel) {
-      if (status.onFoot) lv_obj_clear_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
+      if (status.onFoot) lv_obj_remove_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
       else lv_obj_add_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -359,9 +299,9 @@ void updateBackpackDisplay() {
       lv_label_set_text(bioscan_label, buf);
       
       if (status.bioscan.totalScans > 0) {
-        lv_obj_clear_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
         if (bioscan_data_label) {
-          lv_obj_clear_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_remove_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
         }
       } else {
         lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
@@ -424,25 +364,7 @@ void updateHeader() {
     lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
   }
 
-  // Battery/USB indicator
-  if (battery_icon) {
-    const char* icon = LV_SYMBOL_BATTERY_EMPTY;
-    if (usbPowered) {  // sampled state from sampleBatteryAdc, no extra ADC read
-      icon = LV_SYMBOL_USB;
-    } else {
-      switch (batteryLevel) {
-        case 5: icon = LV_SYMBOL_BATTERY_FULL; break;
-        case 4: icon = LV_SYMBOL_BATTERY_3; break;
-        case 3: icon = LV_SYMBOL_BATTERY_2; break;
-        case 2: icon = LV_SYMBOL_BATTERY_1; break;
-        case 1: icon = LV_SYMBOL_BATTERY_EMPTY; break;
-        default: icon = LV_SYMBOL_BATTERY_EMPTY; break;
-      }
-    }
-    lv_label_set_text(battery_icon, icon);
-  }
-  
-  update_wifi_icon();  
+  update_wifi_icon();
   // Update WebSocket icon
   if (websocket_icon) {
     if (useWebSocket && wsClient.available()) {
@@ -657,46 +579,6 @@ void addLogEntry(const char* text) {
   if (!replayingHistory) updateLogDisplay();
 }
 
-static void sampleBatteryAdc() {
-  int raw = analogRead(BATTERY_ADC_PIN);
-  batteryRaw = raw;
-
-  // Determine USB/battery (hysteresis lives in is_plugged_usb)
-  bool prevUsb = usbPowered;
-  usbPowered = is_plugged_usb();
-
-  // Map raw ADC to coarse level for icon
-  if (usbPowered) {
-    batteryLevel = 5;
-  } else if (raw >= 2480) {
-    batteryLevel = 5;
-  } else if (raw >= 2380) {
-    batteryLevel = 4;
-  } else if (raw >= 2280) {
-    batteryLevel = 3;
-  } else if (raw >= 2180) {
-    batteryLevel = 2;
-  } else if (raw >= 1980) {
-    batteryLevel = 1;
-  } else {
-    batteryLevel = 0;
-  }
-
-  // Adjust display timeout on power source change
-  if (usbPowered != prevUsb) {
-    displayTimeoutMs = usbPowered ? DISPLAY_TIMEOUT_USB_MS : DISPLAY_TIMEOUT_BATT_MS;
-    lastTouchTime = millis(); // reset timer to avoid immediate sleep when switching
-    //addLogEntry(usbPowered ? "Power: USB" : "Power: Battery");
-  }
-
-  char buf[64];
-  snprintf(buf, sizeof(buf), "Battery ADC: %d", raw);
-  Serial.println(buf);  // keep in serial only; do not log to display
-
-  updateHeader();
-}
-
-
 void updateSystemInfo() {
   if (!sys_info_label) return;
   
@@ -796,13 +678,13 @@ void switchToPage(int page) {
       if (!fighter_screen) {
         create_fighter_ui();
       }
-      lv_scr_load(fighter_screen);
+      lv_screen_load(fighter_screen);
       currentPage = 0;
     } else if (page == 1) {
       if (!logviewer_screen) {
         create_logviewer_ui();
       }
-      lv_scr_load(logviewer_screen);
+      lv_screen_load(logviewer_screen);
       currentPage = 1;
       // Don't call updateLogDisplay here - it will update when events arrive
       updateCargoBar();
@@ -813,7 +695,7 @@ void switchToPage(int page) {
       if (!settings_screen) {
         create_settings_ui();
       }
-      lv_scr_load(settings_screen);
+      lv_screen_load(settings_screen);
       currentPage = 2;
       updateSystemInfo();
     }
@@ -883,7 +765,7 @@ void checkDisplayTimeout()
 
   // No BLE host connected -> nothing to control, allow only a short on-time
   // (grace starts at the disconnect: checkBleConnection resets lastTouchTime).
-  uint32_t limit = bleConnected ? displayTimeoutMs : DISPLAY_TIMEOUT_NO_BLE_MS;
+  uint32_t limit = bleConnected ? DISPLAY_TIMEOUT_ACTIVE_MS : DISPLAY_TIMEOUT_NO_BLE_MS;
 
   uint32_t idle = millis() - lastTouchTime;
   bool inDimWindow = limit > DISPLAY_DIM_LEAD_MS &&
@@ -2103,13 +1985,6 @@ void setup()
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
   Serial.printf("[VERSION] Build: %s %s\n", __DATE__, __TIME__);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
-  displayTimeoutMs = DISPLAY_TIMEOUT_USB_MS; // default to USB timeout until first sample
-  
-  //set batpin  pullup high
-  pinMode(BATPIN, INPUT_PULLUP);
-
   // Keep the backlight firmly off during early boot (the panel GRAM still
   // holds the image from before the reset). The LEDC PWM attach happens only
   // AFTER display init, because tft.begin() reconfigures the pin (see below).
@@ -2153,48 +2028,26 @@ void setup()
   lastBleActiveTime = millis();
   bleDisconnectedTime = millis();
 
-  Serial.println("[I2C] Initializing I2C bus...");
-  Wire.begin(I2C_SDA, I2C_SCL, I2C_SPEED);
+  // Wire (GT911 touch) is initialized inside Display::init() via bb_captouch.
+  // Wire1 carries the PCF8575 with the TTP223 pads.
+  Serial.println("[I2C] Initializing Wire1 (PCF8575/TTP223)...");
+  Wire1.begin(PCF_SDA, PCF_SCL, I2C_SPEED);
 
   // Display first: clears the stale panel content and shows the boot splash
   // while the rest of setup() (WiFi, audio, BLE) runs.
   Serial.println("[DISPLAY] Initializing display and LVGL...");
   disp.init();
   disp.setTouchCallback(handleTouchActivity);
-  // The FNK0104B TFT_eSPI setup defines TFT_BL 45, so tft.begin() just
-  // reconfigured GPIO45 as a plain GPIO output — which detaches it from any
-  // earlier LEDC routing and would make every later ledcWrite() (dim, display
-  // off) silently do nothing. Attach the LEDC PWM only now, after TFT init.
+  // Attach the backlight PWM after panel init so nothing re-muxes GPIO1 later.
   ledcAttach(BL_PIN, 5000, 8);
   ledcWrite(BL_PIN, BL_DUTY_FULL);  // reveal the splash
 
   Serial.println("[WIFI] Connecting...");
   WifiConnect();
 
-  //Audio pins:
-  //GPIO1: Audio Power amplifier IC enable Pin, low level enable
-  //GPIO4: Audio I2S bus master clock signal
-  //GPIO5: Audio I2S bus bit clock signal
-  //GPIO6: Audio I2S bus bit output data signal
-  //GPIO7: Audio I2S bus left and right channel selection signal. High level: right channel; low level: left channel
-  //GPIO8: I2S bus bit input data signal
-  //GPIO16: I2C bus data signal
-  //GPIO17: I2C bus clock signal
+  // NS4168 mono I2S amp: no enable pin, no codec, no MCLK - just feed it I2S.
+  Serial.println("[I2S] Initializing I2S audio (NS4168)...");
 
-  Serial.println("[I2S] Initializing I2S audio...");
-  // Enable audio amplifier (GPIO1, active LOW)
-  pinMode(1, OUTPUT);
-  digitalWrite(1, LOW);  // Enable amplifier
-  delay(100);  // Wait for amplifier to stabilize
-  
-  // Initialize ES8311 codec FIRST
-  Serial.println("[ES8311] Initializing codec...");
-  if (es8311_codec_init() != ESP_OK) {
-    Serial.println("[ES8311] ERROR: Codec initialization failed!");
-  } else {
-    Serial.println("[ES8311] Codec initialized successfully");
-  }
-  
   // Initialize I2S (new IDF i2s_std driver): create the TX channel, configure
   // standard Philips slot format + clocking, then enable it.
   Serial.println("[I2S] Configuring I2S driver (std)...");
@@ -2210,17 +2063,14 @@ void setup()
       .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
       .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
       .gpio_cfg = {
-        .mclk = (gpio_num_t)I2S_MCK,   // GPIO4
-        .bclk = (gpio_num_t)I2S_BCK,   // GPIO5
-        .ws   = (gpio_num_t)I2S_WS,    // GPIO7
-        .dout = (gpio_num_t)I2S_DOUT,  // GPIO8 (kept as-is from the legacy config)
+        .mclk = I2S_GPIO_UNUSED,       // NS4168 needs no MCLK
+        .bclk = (gpio_num_t)I2S_BCK,   // GPIO42
+        .ws   = (gpio_num_t)I2S_WS,    // GPIO2 (LRCLK)
+        .dout = (gpio_num_t)I2S_DOUT,  // GPIO41
         .din  = I2S_GPIO_UNUSED,
         .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
       },
     };
-    // ES8311 needs MCLK = 256 * fs (11.2896 MHz @ 44.1 kHz). The S3 has no APLL for
-    // I2S in this IDF, so the default PLL source + fractional divider is used.
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 
     if (i2s_channel_init_std_mode(i2s_tx_chan, &std_cfg) != ESP_OK) {
       Serial.println("[I2S] ERROR: init_std_mode failed");
@@ -2232,9 +2082,9 @@ void setup()
     }
   }
 
-  Serial.println("[PCF8575] Creating button controller...");
-  pcf = new PCF8575(PCF8575_ADDR);
-  pcf->begin();
+  Serial.println("[PCF8575] Init TTP223 pads (Wire1 @0x22)...");
+  pcf = new PCF8575(PCF8575_ADDR, &Wire1);
+  if (!pcf->begin()) Serial.println("[PCF8575] ERROR: not found on Wire1");
 
   Serial.println("[BLE] Creating and configuring gamepad...");
   bleGamepad = new BleGamepad("CoolJoyBLE", "leDev", 100);
@@ -2251,7 +2101,7 @@ void setup()
   Serial.println("[UI] Creating logviewer UI...");
   create_logviewer_ui();
   Serial.println("[UI] Loading logviewer screen...");
-  lv_scr_load(logviewer_screen);
+  lv_screen_load(logviewer_screen);
 
   // Replace the boot splash with the first full UI frame.
   lv_refr_now(NULL);
@@ -2395,12 +2245,6 @@ void loop()
     lastWifiStatusPrint = currentTime;
   }
 
-  // Sample battery ADC divider
-  if ((currentTime - lastBatterySample) >= BATTERY_SAMPLE_INTERVAL || lastBatterySample == 0) {
-    sampleBatteryAdc();
-    lastBatterySample = currentTime;
-  }
-
   // Handle OTA updates
   if (WiFi.status() == WL_CONNECTED) {
     if (!otaInitialized) {
@@ -2431,75 +2275,15 @@ void loop()
     }
   }
   
-  // Read PCF8575 state
-  uint16_t pcfState = pcf->read16();
-  bool anyPressed = false;
-  
-  // Check SILVER buttons for page switching (first 3 buttons) - always available
-  static bool silverLeftWasPressed = false;
-  static bool silverMidWasPressed = false;
-  static bool silverRightWasPressed = false;
-  
-  bool silverLeftPressed = !(pcfState & (1 << SILVER_LEFT));
-  bool silverMidPressed = !(pcfState & (1 << SILVER_MID));
-  bool silverRightPressed = !(pcfState & (1 << SILVER_RIGHT));
-  
-  // Handle SILVER_LEFT - switch to page 0 (Fighter)
-  if (silverLeftPressed && !silverLeftWasPressed) {
-    switchToPage(0);
-    Serial.println("Page: Fighter (0)");
-  }
-  silverLeftWasPressed = silverLeftPressed;
-  
-  // Handle SILVER_MID - switch to page 1 (Log Viewer)
-  if (silverMidPressed && !silverMidWasPressed) {
-    switchToPage(1);
-    Serial.println("Page: Log Viewer (1)");
-  }
-  silverMidWasPressed = silverMidPressed;
-  
-  // Handle SILVER_RIGHT - switch to page 2 (System Settings)
-  if (silverRightPressed && !silverRightWasPressed) {
-    switchToPage(2);
-    Serial.println("Page: System Settings (2)");
-  }
-  silverRightWasPressed = silverRightPressed;
-  
-  // Handle remaining buttons (indices 3-11) for gamepad - only when BLE connected
-  if (bleConnected) {
-    for (uint8_t i = 3; i < 12; i++) {
-      bool pressed = !(pcfState & (1 << buttonPins[i]));
-      bool lastPressed = (lastButtonState & (1 << i)) != 0;
-      
-      if (pressed != lastPressed) {
-        if (pressed) {
-          bleGamepad->press(i + 1);
-          Serial.printf("Button %d pressed\n", i + 1);
-          // BLACK button (BLE button 4) doubles as "display off"; waking is
-          // done by touch / page buttons / BLE reconnect via wakeDisplay().
-          if (i == 3) {
-            setDisplayPower(false);
-            displayManualOff = true;
-          }
-          anyPressed = true;
-          lastButtonState |= (1 << i);
-        } else {
-          bleGamepad->release(i + 1);
-          Serial.printf("Button %d released\n", i + 1);
-          lastButtonState &= ~(1 << i);
-        }
-      }
-    }
-    bleGamepad->sendReport();
-  }
-  
+  // TTP223 page navigation lands here (next task).
+
   delay(5);
 }
 
 static void jump_overlay_zoom_exec(void* obj, int32_t value) {
   // Avoid zero zoom which triggers divide-by-zero in LVGL transform math
   if (value < 1) value = 1;
-  lv_obj_set_style_transform_zoom(static_cast<lv_obj_t*>(obj), value, LV_PART_MAIN);
+  lv_obj_set_style_transform_scale(static_cast<lv_obj_t*>(obj), value, LV_PART_MAIN);
 }
 
 static void jump_overlay_opa_exec(void* obj, int32_t value) {
@@ -2509,7 +2293,7 @@ static void jump_overlay_opa_exec(void* obj, int32_t value) {
 static void jump_overlay_anim_ready(lv_anim_t* anim) {
   lv_obj_t* obj = static_cast<lv_obj_t*>(anim->var);
   if (obj) {
-    lv_obj_del_async(obj);
+    lv_obj_delete_async(obj);
     if (obj == jump_overlay_label) {
       jump_overlay_label = nullptr;
     }
@@ -2520,10 +2304,10 @@ void showJumpOverlay(int jumps) {
   if (!lvglMutex) return;
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     if (jump_overlay_label) {
-      lv_obj_del(jump_overlay_label);
+      lv_obj_delete(jump_overlay_label);
       jump_overlay_label = nullptr;
     }
-    lv_obj_t* parent = lv_scr_act();
+    lv_obj_t* parent = lv_screen_active();
     if (!parent) {
       xSemaphoreGive(lvglMutex);
       return;
@@ -2534,7 +2318,7 @@ void showJumpOverlay(int jumps) {
     lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
     lv_obj_center(jump_overlay_label);
     lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
-    lv_obj_set_style_transform_zoom(jump_overlay_label, 768, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale(jump_overlay_label, 768, LV_PART_MAIN);
     lv_obj_update_layout(jump_overlay_label);
     lv_coord_t pivotX = lv_obj_get_width(jump_overlay_label) / 2;
     lv_coord_t pivotY = lv_obj_get_height(jump_overlay_label) / 2;
