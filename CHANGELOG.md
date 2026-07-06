@@ -13,7 +13,8 @@ event.
   rail, footer) built once in `setup()` on `lv_layer_top()`, overlaying every
   screen instead of being duplicated per page.
   - **Strip** (480×44): jump count (Michroma 24), fuel/hull `lv_arc` gauges
-    with cyan % labels, cargo `n/N`, BLE/WS/WiFi icons (orange when connected).
+    with cyan % labels, cargo `n/N`, BLE/WS icons (orange when connected), WiFi
+    icon colored by signal quality (green/yellow-green/orange/red by RSSI).
   - **Tab rail** (34px, right edge, `x`=446): `FTR`/`LOG`/`SYS` tabs, tappable
     (deferred via `reqPageSwitch`, actioned in `loop()`) alongside the
     existing TTP223 prev/next cycle; active tab inverts to orange via
