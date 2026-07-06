@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a PNG into an RGB565 C header for TFT_eSPI pushImage().
+"""Convert a PNG into an RGB565 C header for Arduino_GFX draw16bitRGBBitmap().
 
 Alpha is composited over black; the image is scaled to the target width
 keeping aspect ratio. Output uses natural RGB565 word values, i.e. draw with

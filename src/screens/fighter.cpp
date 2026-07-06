@@ -5,6 +5,7 @@
 #include "gamedata.h"
 #include "config.h"
 #include "colors.h"
+#include "theme.h"
 
 // External BLE gamepad instance
 extern BleGamepad* bleGamepad;
@@ -31,7 +32,7 @@ static const char * btnm_map[] = {"Zurueck", "Verteid.", "Feuer", "\n",
 // without blocking the LVGL/render thread the way delay() did.
 static void release_btn_cb(lv_timer_t * timer)
 {
-    uint8_t btn = (uint8_t)(uintptr_t)timer->user_data;
+    uint8_t btn = (uint8_t)(uintptr_t)lv_timer_get_user_data(timer);
     if (bleGamepad) bleGamepad->release(btn);
 }
 
@@ -48,7 +49,7 @@ static void pressMomentary(uint8_t btn)
 static void btnmatrix_event_handler(lv_event_t * e)
 {
     lv_obj_t * obj = (lv_obj_t*)lv_event_get_target(e);
-    uint32_t id = lv_btnmatrix_get_selected_btn(obj);
+    uint32_t id = lv_buttonmatrix_get_selected_button(obj);
     const uint8_t btn_to_cmd[] = {0, 1, 2, 7, 20, 3, 5, 4, 6};
 
     if (id < 9) {
@@ -73,15 +74,15 @@ void create_fighter_ui()
 {
   fighter_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(fighter_screen, LV_COLOR_BG, 0);
-  lv_scr_load(fighter_screen);
+  lv_screen_load(fighter_screen);
 
-  btnmatrix = lv_btnmatrix_create(fighter_screen);
-  lv_btnmatrix_set_map(btnmatrix, btnm_map);
+  btnmatrix = lv_buttonmatrix_create(fighter_screen);
+  lv_buttonmatrix_set_map(btnmatrix, btnm_map);
       
   static lv_style_t style_bg;
     lv_style_init(&style_bg);
     lv_style_set_pad_all(&style_bg, 0);
-    lv_style_set_pad_gap(&style_bg, 1);
+    lv_style_set_pad_gap(&style_bg, 4);
     lv_style_set_clip_corner(&style_bg, true);
     lv_style_set_radius(&style_bg, LV_RADIUS_CIRCLE);
     lv_style_set_border_width(&style_bg, 0);
@@ -95,14 +96,15 @@ void create_fighter_ui()
     lv_obj_set_style_border_width(btnmatrix, 1, 0);
   lv_obj_set_style_radius(btnmatrix, 10, 0);
   lv_obj_add_style(btnmatrix, &style_bg, 0);
+  lv_obj_set_style_text_font(btnmatrix, FONT_HEAD, LV_PART_ITEMS);
 
     lv_obj_set_style_bg_color(btnmatrix, LV_COLOR_BG, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(btnmatrix, LV_COLOR_HIGHLIGHT_BG, LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_text_color(btnmatrix, LV_COLOR_FG, LV_PART_ITEMS);
     lv_obj_set_style_border_color(btnmatrix, LV_COLOR_GAUGE_FG, LV_PART_ITEMS);
     lv_obj_set_style_border_width(btnmatrix, 1, LV_PART_ITEMS);
-  lv_obj_set_style_radius(btnmatrix, 5, LV_PART_ITEMS);
+  lv_obj_set_style_radius(btnmatrix, 8, LV_PART_ITEMS);
   
-  lv_btnmatrix_set_btn_ctrl(btnmatrix, 4, LV_BTNMATRIX_CTRL_NO_REPEAT);
+  lv_buttonmatrix_set_button_ctrl(btnmatrix, 4, LV_BUTTONMATRIX_CTRL_NO_REPEAT);
   lv_obj_add_event_cb(btnmatrix, btnmatrix_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
 }

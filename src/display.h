@@ -3,28 +3,10 @@
 
 #include "lvgl.h"
 
-#ifndef I2C_SCL
-#define I2C_SCL 15
-#endif
-#ifndef I2C_SDA
-#define I2C_SDA 16
-#endif
-#ifndef INT_N_PIN
-#define INT_N_PIN 17
-#endif
-#ifndef RST_N_PIN
-#define RST_N_PIN 18
-#endif
-
-#define TFT_DIRECTION 3   //TFT direction
-
 class Display
 {
-private:
-
 public:
-    lv_disp_t* init();
-    void routine();
+    lv_display_t* init();
     void setTouchCallback(void (*cb)());
 };
 
