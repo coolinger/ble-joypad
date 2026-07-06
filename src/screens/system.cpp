@@ -4,6 +4,7 @@
 #include "gamedata.h"
 #include "colors.h"
 #include "theme.h"
+#include "shell.h"
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <ArduinoWebsockets.h>
@@ -28,8 +29,8 @@ lv_obj_t *amplitude_value_label = nullptr;
 
 static lv_obj_t *brightness_value_label = nullptr;
 
-#define RIGHT_X 310
-#define RIGHT_W (SCREEN_WIDTH - RIGHT_X - 10)   // 160
+#define RIGHT_X 262
+#define RIGHT_W (CONTENT_W - RIGHT_X - 6)   // 178
 
 static void restart_wifi_handler(lv_event_t *e) {
   beepClick();
@@ -51,7 +52,7 @@ static void reboot_handler(lv_event_t *e) {
 static void updateAmplitudeDisplay(int amplitude) {
   if (!amplitude_value_label) return;
   char buf[48];
-  snprintf(buf, sizeof(buf), "Volume: %d", amplitude);
+  snprintf(buf, sizeof(buf), "Volume: %d%%", amplitude * 100 / 12000);
   lv_label_set_text(amplitude_value_label, buf);
 }
 
@@ -85,10 +86,16 @@ static void brightness_slider_handler(lv_event_t *e) {
   updateBrightnessDisplay(v);
 }
 
+static void style_slider(lv_obj_t *slider) {
+  lv_obj_set_style_bg_color(slider, LV_COLOR_GAUGE_BG, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(slider, LV_COLOR_FG, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(slider, LV_COLOR_FG, LV_PART_KNOB);
+}
+
 static lv_obj_t* make_button(lv_obj_t *parent, const char *text, int y,
                              lv_event_cb_t cb) {
   lv_obj_t *btn = lv_button_create(parent);
-  lv_obj_set_size(btn, RIGHT_W, 34);
+  lv_obj_set_size(btn, RIGHT_W, 32);
   lv_obj_set_pos(btn, RIGHT_X, y);
   lv_obj_add_style(btn, &style_btn, 0);
   lv_obj_add_style(btn, &style_btn_pressed, LV_STATE_PRESSED);
@@ -104,16 +111,10 @@ void create_settings_ui() {
   settings_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(settings_screen, LV_COLOR_BG, 0);
 
-  lv_obj_t *title = lv_label_create(settings_screen);
-  lv_label_set_text(title, "SYSTEM");
-  lv_obj_set_style_text_color(title, LV_COLOR_FG, 0);
-  lv_obj_set_style_text_font(title, FONT_BIG, 0);
-  lv_obj_set_pos(title, 10, 8);
-
   // Left: diagnostics panel (filled by updateSystemInfo in main.cpp)
   lv_obj_t *info_area = lv_obj_create(settings_screen);
-  lv_obj_set_size(info_area, 290, SCREEN_HEIGHT - 50);
-  lv_obj_set_pos(info_area, 10, 40);
+  lv_obj_set_size(info_area, 250, CONTENT_H - 8);
+  lv_obj_set_pos(info_area, 4, CONTENT_Y + 4);
   lv_obj_add_style(info_area, &style_panel, 0);
   lv_obj_set_scrollbar_mode(info_area, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scroll_dir(info_area, LV_DIR_NONE);
@@ -123,41 +124,43 @@ void create_settings_ui() {
   lv_obj_set_style_text_color(sys_info_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(sys_info_label, FONT_SMALL, 0);
   lv_label_set_long_mode(sys_info_label, LV_LABEL_LONG_MODE_WRAP);
-  lv_obj_set_width(sys_info_label, 270);
+  lv_obj_set_width(sys_info_label, 232);
   lv_obj_set_pos(sys_info_label, 2, 2);
 
   // Right column: brightness, volume, actions
   brightness_value_label = lv_label_create(settings_screen);
   lv_obj_set_style_text_color(brightness_value_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(brightness_value_label, FONT_SMALL, 0);
-  lv_obj_set_pos(brightness_value_label, RIGHT_X, 40);
+  lv_obj_set_pos(brightness_value_label, RIGHT_X, CONTENT_Y + 4);
 
   lv_obj_t *brightness_slider = lv_slider_create(settings_screen);
   lv_obj_set_size(brightness_slider, RIGHT_W, 12);
-  lv_obj_set_pos(brightness_slider, RIGHT_X, 60);
+  lv_obj_set_pos(brightness_slider, RIGHT_X, CONTENT_Y + 22);
   lv_slider_set_range(brightness_slider, 20, 255);
   lv_slider_set_value(brightness_slider, BL_DUTY_FULL, LV_ANIM_OFF);
   lv_obj_add_event_cb(brightness_slider, brightness_slider_handler,
                       LV_EVENT_VALUE_CHANGED, NULL);
+  style_slider(brightness_slider);
   updateBrightnessDisplay(BL_DUTY_FULL);
 
   amplitude_value_label = lv_label_create(settings_screen);
   lv_obj_set_style_text_color(amplitude_value_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(amplitude_value_label, FONT_SMALL, 0);
-  lv_obj_set_pos(amplitude_value_label, RIGHT_X, 85);
+  lv_obj_set_pos(amplitude_value_label, RIGHT_X, CONTENT_Y + 44);
 
   amplitude_slider = lv_slider_create(settings_screen);
   lv_obj_set_size(amplitude_slider, RIGHT_W, 12);
-  lv_obj_set_pos(amplitude_slider, RIGHT_X, 105);
+  lv_obj_set_pos(amplitude_slider, RIGHT_X, CONTENT_Y + 62);
   lv_slider_set_range(amplitude_slider, 500, 12000);
   lv_slider_set_value(amplitude_slider, AUDIO_TONE_AMPL, LV_ANIM_OFF);
   lv_obj_add_event_cb(amplitude_slider, amplitude_slider_handler,
                       LV_EVENT_VALUE_CHANGED, NULL);
+  style_slider(amplitude_slider);
   updateAmplitudeDisplay(AUDIO_TONE_AMPL);
 
-  make_button(settings_screen, "Restart WiFi", 130, restart_wifi_handler);
-  make_button(settings_screen, "Restart WS", 172, restart_websocket_handler);
-  lv_obj_t *reboot = make_button(settings_screen, "REBOOT", 222, reboot_handler);
+  make_button(settings_screen, "Restart WiFi", CONTENT_Y + 86, restart_wifi_handler);
+  make_button(settings_screen, "Restart WS", CONTENT_Y + 126, restart_websocket_handler);
+  lv_obj_t *reboot = make_button(settings_screen, "REBOOT", CONTENT_Y + 166, reboot_handler);
   lv_obj_set_style_border_color(reboot, LV_COLOR_WARNING_FG, 0);
 
   // No updateSystemInfo() here: our only caller (switchToPage) holds lvglMutex
