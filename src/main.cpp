@@ -932,6 +932,7 @@ void requestCmdrStatusWs();
 void requestShipStatusWs();
 void requestLoadingStatusWs();
 void requestLogEntriesWs(int count);
+void requestSystemWs();
 void requestCmdrProfileWs();
 void requestNavRouteWs();
 static void requestAllStatusOnce();
@@ -1038,6 +1039,16 @@ void onWebSocketMessage(WebsocketsMessage message) {
         // on-foot session can push FSSBodySignals out of the window - re-scan
         // the body (FSS/DSS) to re-pin it.
         requestLogEntriesWs(50);
+      }
+    } else if (name && strcmp(name, "getSystem") == 0 && !msg.isNull()) {
+      // Current-system fallback: only adopt the name while we know nothing —
+      // live journal events stay the authoritative source.
+      const char* sysName = msg["name"] | "";
+      if (sysName[0] && strcmp(sysName, "Unknown") != 0 &&
+          status.currentSystem.length() == 0) {
+        status.currentSystem = sysName;
+        Serial.printf("[WS] getSystem: current system = %s\n", sysName);
+        updateStatusLine();
       }
     } else if (name && strcmp(name, "getLogEntries") == 0 && msg.is<JsonArray>()) {
       // Recent journal entries, newest first. Replay oldest-first so the final
@@ -2311,6 +2322,17 @@ void loop()
     }
     lastSummaryRequest = currentTime;
   }
+
+  // Fallback for the current system name: after a long exploration session the
+  // 50-entry replay window may hold no FSDJump/Location, leaving the footer on
+  // "Waiting for events...". Once the replay is done, ask Icarus directly
+  // (getSystem -> message.name) until we know where we are.
+  static uint32_t lastSystemRequest = 0;
+  if (historyLoaded && status.currentSystem.length() == 0 &&
+      (currentTime - lastSystemRequest) > SUMMARY_REQUEST_INTERVAL) {
+    if (wsClient.available()) requestSystemWs();
+    lastSystemRequest = currentTime;
+  }
   
   // Print WiFi signal quality every 30 seconds
   if (WiFi.status() == WL_CONNECTED && (currentTime - lastWifiStatusPrint) > WIFI_STATUS_PRINT_INTERVAL) {
@@ -2522,6 +2544,21 @@ void requestLoadingStatusWs() {
   String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getLoadingStatus\",\"message\":null}";
   wsClient.send(payload);
   Serial.println("[WS] Sent getLoadingStatus request");
+}
+
+// Ask Icarus for the current system (response: message.name). Boot fallback
+// for when the replayed history contains no system-setting event. NOTE: the
+// response can be large in busy systems (bodies/stations arrays), so this is
+// only requested while no system name is known.
+void requestSystemWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  String reqId = String("esp32-sys-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getSystem\",\"message\":{}}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getSystem request");
 }
 
 // Fetch the most recent journal entries to rebuild log/pins/state after boot
