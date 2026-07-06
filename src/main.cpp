@@ -654,7 +654,7 @@ void updateSystemInfo() {
       mode = "In Ship";
     }
     
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
       "FW: " __DATE__ " " __TIME__ "\n\n"
       "Memory:\n"

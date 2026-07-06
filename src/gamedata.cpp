@@ -138,7 +138,7 @@ void clearPinnedBodies() {
 static uint32_t scannedBits[8];
 static uint32_t mappedBits[8];
 static uint32_t unmappedBits[8];   // bodies whose Scan said WasMapped == false
-#define EXPL_MAX_STATIONS 24
+#define EXPL_MAX_STATIONS 40
 static uint32_t stationHashes[EXPL_MAX_STATIONS];
 static int stationHashCount = 0;
 
@@ -213,7 +213,8 @@ bool explorationStation(const char* signalName, const char* signalType) {
   for (int i = 0; i < stationHashCount; i++) {
     if (stationHashes[i] == h) return false;  // already counted
   }
-  if (stationHashCount < EXPL_MAX_STATIONS) stationHashes[stationHashCount++] = h;
+  if (stationHashCount >= EXPL_MAX_STATIONS) return false;  // full: undercount, never inflate
+  stationHashes[stationHashCount++] = h;
   if (*bucket < 255) (*bucket)++;
   return true;
 }
