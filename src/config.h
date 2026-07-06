@@ -52,6 +52,10 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 #define I2S_WS    2   // LRCLK
 #define I2S_DOUT 41
 
+// Page-switch fade duration in ms (0 = instant). Full-screen redraws are
+// pushed over blocking QSPI - keep this short or zero if it stutters.
+#define PAGE_FADE_MS 120
+
 // Display geometry
 #define SCREEN_WIDTH 480
 #define SCREEN_HEIGHT 272

@@ -719,19 +719,31 @@ void switchToPage(int page) {
       if (!fighter_screen) {
         create_fighter_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(fighter_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(fighter_screen);
+#endif
       currentPage = 0;
     } else if (page == 1) {
       if (!logviewer_screen) {
         create_logviewer_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(logviewer_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(logviewer_screen);
+#endif
       currentPage = 1;
     } else if (page == 2) {
       if (!settings_screen) {
         create_settings_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(settings_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(settings_screen);
+#endif
       currentPage = 2;
     }
 
@@ -795,7 +807,6 @@ void requestSummary();
 void connectWebSocket();
 void updateJumpsRemaining(int newValue);
 void showJumpOverlay(int jumps);
-void showPageOverlay(const char* name);
 static void startOtaIfNeeded();
 
 void checkDisplayTimeout()
@@ -2366,7 +2377,6 @@ void loop()
     delay(5);
     return;
   }
-  static const char* pageNames[3] = {"FIGHTER", "LOG", "SYSTEM"};
   static uint16_t lastTtpState = 0;
   uint16_t ttpState = pcf->read16();
   uint16_t rising = ttpState & ~lastTtpState;
@@ -2382,11 +2392,9 @@ void loop()
     } else if (topEdge) {
       switchToPage((currentPage + 2) % 3);   // previous
       Serial.printf("[TTP] prev -> page %d\n", currentPage);
-      showPageOverlay(pageNames[currentPage]);
     } else if (bottomEdge) {
       switchToPage((currentPage + 1) % 3);   // next
       Serial.printf("[TTP] next -> page %d\n", currentPage);
-      showPageOverlay(pageNames[currentPage]);
     } else if (midEdge) {
       Serial.println("[TTP] display off");
       setDisplayPower(false);
@@ -2461,56 +2469,6 @@ void showJumpOverlay(int jumps) {
     lv_anim_set_path_cb(&fade_anim, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&fade_anim, jump_overlay_opa_exec);
     lv_anim_start(&fade_anim);
-
-    xSemaphoreGive(lvglMutex);
-  }
-}
-
-// Brief page-name flash after a TTP page switch (the pads have no labels).
-static lv_obj_t* page_overlay = nullptr;
-
-static void page_overlay_opa_exec(void* obj, int32_t value) {
-  lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), (lv_opa_t)value, LV_PART_MAIN);
-}
-
-static void page_overlay_anim_ready(lv_anim_t* anim) {
-  lv_obj_t* obj = static_cast<lv_obj_t*>(anim->var);
-  if (obj) {
-    lv_obj_delete_async(obj);
-    if (obj == page_overlay) page_overlay = nullptr;
-  }
-}
-
-void showPageOverlay(const char* name) {
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (page_overlay) {
-      lv_obj_delete(page_overlay);
-      page_overlay = nullptr;
-    }
-    lv_obj_t* parent = lv_screen_active();
-    if (!parent) {
-      xSemaphoreGive(lvglMutex);
-      return;
-    }
-    page_overlay = lv_label_create(parent);
-    lv_label_set_text(page_overlay, name);
-    lv_obj_set_style_text_font(page_overlay, FONT_BIG, 0);
-    lv_obj_set_style_text_color(page_overlay, LV_COLOR_HIGHLIGHT_BG, 0);
-    lv_obj_set_style_bg_color(page_overlay, LV_COLOR_BG, 0);
-    lv_obj_set_style_bg_opa(page_overlay, LV_OPA_80, 0);
-    lv_obj_set_style_pad_all(page_overlay, 8, 0);
-    lv_obj_set_style_radius(page_overlay, 6, 0);
-    lv_obj_align(page_overlay, LV_ALIGN_TOP_MID, 0, 40);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, page_overlay);
-    lv_anim_set_exec_cb(&a, page_overlay_opa_exec);
-    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_delay(&a, 600);
-    lv_anim_set_duration(&a, 400);
-    lv_anim_set_completed_cb(&a, page_overlay_anim_ready);
-    lv_anim_start(&a);
 
     xSemaphoreGive(lvglMutex);
   }
