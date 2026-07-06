@@ -10,16 +10,12 @@ lv_obj_t *cargo_bar = nullptr;
 lv_obj_t *header_label = nullptr;
 lv_obj_t *fuel_bar = nullptr;
 lv_obj_t *hull_bar = nullptr;
-lv_obj_t *wifi_icon = nullptr;
-lv_obj_t *websocket_icon = nullptr;
-lv_obj_t *bluetooth_icon = nullptr;
 lv_obj_t *backpack_panel = nullptr;
 lv_obj_t *medpack_label = nullptr;
 lv_obj_t *energycell_label = nullptr;
 lv_obj_t *bioscan_label = nullptr;
 lv_obj_t *bioscan_data_label = nullptr;
 lv_obj_t *jump_overlay_label = nullptr;
-lv_obj_t *status_label = nullptr;
 lv_obj_t *pin_cards[MAX_PINNED_BODIES] = {nullptr};
 lv_obj_t *pin_title_labels[MAX_PINNED_BODIES] = {nullptr};
 lv_obj_t *pin_genus_labels[MAX_PINNED_BODIES] = {nullptr};
@@ -58,15 +54,6 @@ static lv_obj_t* make_gauge(lv_obj_t *parent, const char *tag, int x, int w) {
   return bar;
 }
 
-static lv_obj_t* make_icon(lv_obj_t *parent, const char *sym, int x) {
-  lv_obj_t *icon = lv_label_create(parent);
-  lv_label_set_text(icon, sym);
-  lv_obj_set_style_text_color(icon, lv_color_hex(0x000000), 0);  // off = invisible-ish
-  lv_obj_set_style_text_font(icon, FONT_HEAD, 0);
-  lv_obj_set_pos(icon, x, 6);
-  return icon;
-}
-
 void create_logviewer_ui() {
   logviewer_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(logviewer_screen, LV_COLOR_BG, 0);
@@ -85,10 +72,6 @@ void create_logviewer_ui() {
 
   fuel_bar = make_gauge(header, "F", 130, 85);
   hull_bar = make_gauge(header, "H", 250, 85);
-
-  bluetooth_icon = make_icon(header, LV_SYMBOL_BLUETOOTH, SCREEN_WIDTH - 90);
-  websocket_icon = make_icon(header, LV_SYMBOL_REFRESH,   SCREEN_WIDTH - 62);
-  wifi_icon      = make_icon(header, LV_SYMBOL_WIFI,      SCREEN_WIDTH - 34);
 
   // ---------------- Left column: event log ----------------
   lv_obj_t *log_area = make_box(logviewer_screen);
@@ -131,14 +114,6 @@ void create_logviewer_ui() {
   lv_obj_set_style_pad_all(sidebar, 5, 0);
   lv_obj_set_style_pad_row(sidebar, 4, 0);
   lv_obj_set_flex_flow(sidebar, LV_FLEX_FLOW_COLUMN);
-
-  // Current system name (updateStatusLine writes into this)
-  status_label = lv_label_create(sidebar);
-  lv_obj_set_width(status_label, SIDEBAR_W - 12);
-  lv_label_set_long_mode(status_label, LV_LABEL_LONG_MODE_WRAP);
-  lv_label_set_text(status_label, "Waiting for events...");
-  lv_obj_set_style_text_color(status_label, LV_COLOR_HIGHLIGHT_BG, 0);
-  lv_obj_set_style_text_font(status_label, FONT_HEAD, 0);
 
   // Pinned body signal cards (hidden until pins exist)
   for (int i = 0; i < MAX_PINNED_BODIES; i++) {

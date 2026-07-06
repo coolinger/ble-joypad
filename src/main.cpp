@@ -17,6 +17,7 @@
 #include "screens/fighter.h"
 #include "screens/info.h"
 #include "screens/system.h"
+#include "screens/shell.h"
 // I2S: new IDF "std" driver (driver/i2s_std.h). Migrated off the legacy
 // driver/i2s.h so the legacy<->new "CONFLICT" runtime error can't occur and the
 // deprecation warnings are gone. The TX channel handle (i2s_tx_chan) is created
@@ -188,6 +189,7 @@ bool wifiWasConnected = false;
 // WiFi/WebSocket calls never stall rendering or the core-0 message task.
 bool reqRestartWifi = false;
 bool reqRestartWebSocket = false;
+volatile int reqPageSwitch = -1;  // set by the shell tab rail (LVGL cb), serviced in loop()
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
 
@@ -260,31 +262,6 @@ void printHeapStatus(const char* location) {
     location, freePSRAM, totalPSRAM, (freePSRAM * 100.0 / totalPSRAM), freeInternal);
 }
 
-void updateCargoBar() {
-  if (!cargo_bar) return;
-  
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    int total = status.cargo.totalCapacity;
-  int used = status.cargo.usedSpace;
-  int drones = status.cargo.dronesCount;
-  int cargo = status.cargo.cargoCount;
-  int free = total - used;
-  
-  lv_bar_set_range(cargo_bar, 0, total);
-  lv_bar_set_value(cargo_bar, used, LV_ANIM_OFF);
-  
-  // Update label
-  lv_obj_t* label = lv_obj_get_child(cargo_bar, 0);
-  if (label) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Cargo: %d/%d (Drones: %d)", used, total, drones);
-    lv_label_set_text(label, buf);
-  }
-    
-    xSemaphoreGive(lvglMutex);
-  }
-}
-
 void updateBackpackDisplay() {
   if (!medpack_label || !energycell_label) return;
 
@@ -342,7 +319,7 @@ void update_wifi_icon_unlocked() {
         lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF0000), 0);  // red - Weak
       }
     } else {
-      lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
+      lv_obj_set_style_text_color(wifi_icon, LV_COLOR_HAIRLINE, 0);  // off - No connection
     }
   }
 }
@@ -350,9 +327,9 @@ void update_bluetooth_icon_unlocked() {
     // Update Bluetooth icon
   if (bluetooth_icon) {
     if (bleGamepad && bleGamepad->isConnected()) {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
+      lv_obj_set_style_text_color(bluetooth_icon, LV_COLOR_FG, 0);  // connected
     } else {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
+      lv_obj_set_style_text_color(bluetooth_icon, LV_COLOR_HAIRLINE, 0);  // off - not connected
     }
   }
 }
@@ -373,36 +350,31 @@ void update_bluetooth_icon() {
 }
 
 void updateHeader() {
-  if (!header_label) return;
-  
+  if (!shell_jumps_label) return;
+
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    char buf[64];
-  snprintf(buf, sizeof(buf), "Jumps: %d", status.nav.jumpsRemaining);
-  lv_label_set_text(header_label, buf);
-  
-  // Update fuel bar
-  if (fuel_bar) {
-    float fuelPercent = (fuelInfo.fuelCapacity > 0) ? 
-      (status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0.0f;
-    lv_bar_set_value(fuel_bar, (int)fuelPercent, LV_ANIM_OFF);
-  }
-  
-  // Update hull bar
-  if (hull_bar) {
-    lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
-  }
+    lv_label_set_text_fmt(shell_jumps_label, "%d", status.nav.jumpsRemaining);
 
-  update_wifi_icon_unlocked();
-  // Update WebSocket icon
-  if (websocket_icon) {
-    if (useWebSocket && wsClient.available()) {
-      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
-    } else {
-      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // black - not connected
+    int fuelPct = (status.fuel.fuelCapacity > 0)
+        ? (int)(status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0;
+    lv_arc_set_value(shell_fuel_arc, fuelPct);
+    lv_label_set_text_fmt(shell_fuel_label, "%d%%", fuelPct);
+
+    int hullPct = (int)(status.hull.hullHealth * 100.0f);
+    lv_arc_set_value(shell_hull_arc, hullPct);
+    lv_label_set_text_fmt(shell_hull_label, "%d%%", hullPct);
+    lv_obj_set_style_text_color(shell_hull_label,
+        hullPct <= 25 ? LV_COLOR_WARNING_FG : LV_COLOR_VALUE, 0);
+
+    lv_label_set_text_fmt(shell_cargo_label, "%d/%d",
+        status.cargo.usedSpace, status.cargo.totalCapacity);
+
+    update_wifi_icon_unlocked();
+    if (websocket_icon) {
+      lv_obj_set_style_text_color(websocket_icon,
+          (useWebSocket && wsClient.available()) ? LV_COLOR_FG : LV_COLOR_HAIRLINE, 0);
     }
-  }
-  update_bluetooth_icon_unlocked();
-
+    update_bluetooth_icon_unlocked();
 
     xSemaphoreGive(lvglMutex);
   }
@@ -412,12 +384,19 @@ void updateStatusLine() {
   if (!status_label) return;
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    // Just the current system name — this line is the "where am I" indicator,
-    // everything else already lives in the header bars / log.
     const char* system = status.currentSystem.length()
                              ? status.currentSystem.c_str()
                              : "Waiting for events...";
     lv_label_set_text(status_label, system);
+
+    const char* mode = "";
+    if (status.onFoot) mode = "ON FOOT";
+    else if (status.inSrv) mode = "SRV";
+    else if (status.inTaxi) mode = "TAXI";
+    else if (status.docked) mode = "DOCKED";
+    else if (status.inShip) mode = "SHIP";
+    if (shell_mode_label) lv_label_set_text(shell_mode_label, mode);
+
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -731,6 +710,7 @@ void switchToPage(int page) {
       currentPage = 2;
     }
 
+    shell_set_active_tab(page);
     xSemaphoreGive(lvglMutex);
   }
   // Populate the page's widgets after releasing lvglMutex: these update
@@ -739,7 +719,6 @@ void switchToPage(int page) {
   // no-op (~100-200ms frozen UI per call, updates never applied).
   if (page == 1) {
     // Don't call updateLogDisplay here - it will update when events arrive
-    updateCargoBar();
     updateHeader();
     updateStatusLine();
     updateBackpackDisplay();
@@ -1022,7 +1001,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
       if (msg["inMulticrew"].is<bool>()) status.inMulticrew = msg["inMulticrew"];
 
       updateHeader();
-      updateCargoBar();
       updateBackpackDisplay();  // onFoot may have changed -> panel visibility
     } else if (name && strcmp(name, "gameStateChange") == 0) {
       Serial.println("[WS] gameStateChange broadcast received, refreshing state");
@@ -1132,7 +1110,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
       }
 
       updateHeader();
-      updateCargoBar();
     } else if (name && strcmp(name, "getNavRoute") == 0 && !msg.isNull()) {
       Serial.println("[WS] Received NavRoute response");
       if (msg["jumpsToDestination"].is<int>()) {
@@ -1474,7 +1451,6 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update all displays
     updateHeader();
     updateStatusLine();
-    updateCargoBar();
     updateBackpackDisplay();
     
     Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
@@ -1867,7 +1843,6 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     }
     
     updateHeader();
-    updateCargoBar();
   } else if (eventType == "CARGO") {
     // Parse cargo inventory
     cargoInfo.usedSpace = doc["Count"];
@@ -1892,8 +1867,8 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
     }
-    
-    updateCargoBar();
+
+    updateHeader();
   } else if (eventType == "NavRouteClear") {
     // Route cleared -> zero out jumps
     updateJumpsRemaining(0);
@@ -2161,6 +2136,9 @@ void setup()
   create_fighter_ui();
   Serial.println("[UI] Creating logviewer UI...");
   create_logviewer_ui();
+  Serial.println("[UI] Creating MFD shell...");
+  create_shell_ui();
+  shell_set_active_tab(currentPage);
   Serial.println("[UI] Loading logviewer screen...");
   lv_screen_load(logviewer_screen);
 
@@ -2245,6 +2223,11 @@ void loop()
       wsClient.close();
     }
     connectWebSocket();
+  }
+  if (reqPageSwitch >= 0) {
+    int p = reqPageSwitch;
+    reqPageSwitch = -1;
+    if (p != currentPage) switchToPage(p);
   }
 
   uint32_t currentTime = millis();
