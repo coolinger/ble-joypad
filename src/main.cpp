@@ -629,7 +629,7 @@ void updateSystemInfo() {
     
     char buf[512];
     snprintf(buf, sizeof(buf),
-      "SYSTEM INFORMATION\n\n"
+      "FW: " __DATE__ " " __TIME__ "\n\n"
       "Memory:\n"
       "  Internal RAM: %d KB\n"
       "  PSRAM: %d / %d KB (%.0f%%)\n"
