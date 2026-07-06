@@ -36,10 +36,12 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 #define TOUCH_INT  3
 #define TOUCH_RST 38
 
-// PCF8575 expander with the three TTP223 pads (external I2C bus -> Wire1)
+// PCF8575 expander with the three TTP223 pads (external I2C bus -> Wire1).
+// Address = 0x20 (A0-A2 low). The old ESPHome test saw 0x22 only because
+// mounting glue temporarily bridged an address strap; boot scan confirms 0x20.
 #define PCF_SDA 18
 #define PCF_SCL 17
-#define PCF8575_ADDR 0x22
+#define PCF8575_ADDR 0x20
 // TTP223 pads sit right of the display, active-high on these PCF bits:
 #define TTP_TOP_BIT    5  // "touch3" (top)    -> previous page
 #define TTP_MID_BIT    6  // "touch2" (middle) -> display off

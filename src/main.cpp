@@ -2116,7 +2116,7 @@ void setup()
     }
   }
 
-  Serial.println("[PCF8575] Init TTP223 pads (Wire1 @0x22)...");
+  Serial.println("[PCF8575] Init TTP223 pads (Wire1 @0x20)...");
   pcf = new PCF8575(PCF8575_ADDR, &Wire1);
   pcfAvailable = pcf->begin();
   if (!pcfAvailable) Serial.println("[PCF8575] ERROR: not found on Wire1 (will retry)");
@@ -2311,7 +2311,7 @@ void loop()
     }
   }
 
-  // --- TTP223 page navigation (PCF8575 @0x22 on Wire1, active-high) ---
+  // --- TTP223 page navigation (PCF8575 @0x20 on Wire1, active-high) ---
   // top = previous page, bottom = next page (wrap over the 3 pages),
   // middle = display off. While the display is dark, ANY pad only wakes it.
   // Without the expander (bad wiring / not fitted) the poll is skipped and a

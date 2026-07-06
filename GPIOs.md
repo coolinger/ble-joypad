@@ -27,10 +27,10 @@ Source: References/JC4827W543_4.3inch_ESP32S3_board/Docs/"4.3 inches IO pin dist
 
 | GPIO | Function | Notes |
 |------|----------|-------|
-| 18   | Wire1 SDA | PCF8575 @ 0x22 |
-| 17   | Wire1 SCL | PCF8575 @ 0x22 |
+| 18   | Wire1 SDA | PCF8575 @ 0x20 |
+| 17   | Wire1 SCL | PCF8575 @ 0x20 |
 
-## PCF8575 (0x22) — TTP223 touch pads, right of the display, active-high
+## PCF8575 (0x20) — TTP223 touch pads, right of the display, active-high
 
 | PCF bit | Pad | Position | Function |
 |---------|--------|----------|-----------------|
