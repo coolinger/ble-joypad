@@ -5,6 +5,7 @@
 #include "gamedata.h"
 #include "config.h"
 #include "colors.h"
+#include "theme.h"
 
 // External BLE gamepad instance
 extern BleGamepad* bleGamepad;
@@ -81,7 +82,7 @@ void create_fighter_ui()
   static lv_style_t style_bg;
     lv_style_init(&style_bg);
     lv_style_set_pad_all(&style_bg, 0);
-    lv_style_set_pad_gap(&style_bg, 1);
+    lv_style_set_pad_gap(&style_bg, 4);
     lv_style_set_clip_corner(&style_bg, true);
     lv_style_set_radius(&style_bg, LV_RADIUS_CIRCLE);
     lv_style_set_border_width(&style_bg, 0);
@@ -95,13 +96,14 @@ void create_fighter_ui()
     lv_obj_set_style_border_width(btnmatrix, 1, 0);
   lv_obj_set_style_radius(btnmatrix, 10, 0);
   lv_obj_add_style(btnmatrix, &style_bg, 0);
+  lv_obj_set_style_text_font(btnmatrix, FONT_HEAD, LV_PART_ITEMS);
 
     lv_obj_set_style_bg_color(btnmatrix, LV_COLOR_BG, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(btnmatrix, LV_COLOR_HIGHLIGHT_BG, LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_text_color(btnmatrix, LV_COLOR_FG, LV_PART_ITEMS);
     lv_obj_set_style_border_color(btnmatrix, LV_COLOR_GAUGE_FG, LV_PART_ITEMS);
     lv_obj_set_style_border_width(btnmatrix, 1, LV_PART_ITEMS);
-  lv_obj_set_style_radius(btnmatrix, 5, LV_PART_ITEMS);
+  lv_obj_set_style_radius(btnmatrix, 8, LV_PART_ITEMS);
   
   lv_buttonmatrix_set_button_ctrl(btnmatrix, 4, LV_BUTTONMATRIX_CTRL_NO_REPEAT);
   lv_obj_add_event_cb(btnmatrix, btnmatrix_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
