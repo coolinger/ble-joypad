@@ -49,6 +49,20 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 
 PCF8575* pcf = nullptr;
 bool pcfAvailable = false;  // begin() succeeded; loop() retries every 5 s if not
+
+// Boot-time diagnostic: probe every I2C address on the given bus.
+static void scanI2CBus(TwoWire &bus, const char* name) {
+  Serial.printf("[I2C] %s scan:", name);
+  int found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    bus.beginTransmission(a);
+    if (bus.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", a);
+      found++;
+    }
+  }
+  Serial.printf(" -> %d device(s)\n", found);
+}
 BleGamepad* bleGamepad = nullptr;
 BleGamepadConfiguration bleGamepadConfig;
 bool bleConnected = false;
@@ -2048,7 +2062,10 @@ void setup()
   // Wire (GT911 touch) is initialized inside Display::init() via bb_captouch.
   // Wire1 carries the PCF8575 with the TTP223 pads.
   Serial.println("[I2C] Initializing Wire1 (PCF8575/TTP223)...");
-  Wire1.begin(PCF_SDA, PCF_SCL, I2C_SPEED);
+  bool w1ok = Wire1.begin(PCF_SDA, PCF_SCL, I2C_SPEED);
+  Serial.printf("[I2C] Wire1.begin(sda=%d, scl=%d, %lu Hz) -> %s\n",
+                PCF_SDA, PCF_SCL, (unsigned long)I2C_SPEED, w1ok ? "OK" : "FAILED");
+  scanI2CBus(Wire1, "Wire1");
 
   // Display first: clears the stale panel content and shows the boot splash
   // while the rest of setup() (WiFi, audio, BLE) runs.
