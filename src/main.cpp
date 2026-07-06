@@ -2432,11 +2432,7 @@ void showJumpOverlay(int jumps) {
       lv_obj_delete(jump_overlay_label);
       jump_overlay_label = nullptr;
     }
-    lv_obj_t* parent = lv_screen_active();
-    if (!parent) {
-      xSemaphoreGive(lvglMutex);
-      return;
-    }
+    lv_obj_t* parent = lv_layer_top();  // persistent layer: survives page fades
     jump_overlay_label = lv_label_create(parent);
     lv_label_set_text_fmt(jump_overlay_label, "%d", jumps);
     lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
