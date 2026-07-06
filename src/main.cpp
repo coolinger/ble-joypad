@@ -41,6 +41,7 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 // Audio clocking constants now in sound.h
 
 #include "colors.h"
+#include "theme.h"
 
 // Global flags
 
@@ -2095,7 +2096,8 @@ void setup()
 
   Serial.println("[BLE] Starting BLE gamepad...");
   bleGamepad->begin(&bleGamepadConfig);
-  
+
+  theme_init();
   Serial.println("[UI] Creating fighter UI...");
   create_fighter_ui();
   Serial.println("[UI] Creating logviewer UI...");
