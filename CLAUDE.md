@@ -8,15 +8,13 @@ Firmware for an ESP32-S3 touchscreen controller for *Elite Dangerous*. It receiv
 
 ## Build / flash / monitor
 
-PlatformIO project, two environments: `default` (USB upload) and `ota` (extends `default`, only swaps the upload path to ArduinoOTA → `FighterController.fritz.box:3232`). **`[env:ota]` is currently INACTIVE**: the JC4827W543's 4 MB flash uses `huge_app.csv`, which has no `ota_0`/`ota_1` slots, so `espota` has nowhere to write. **The usual workflow is now USB**, via `-e default`. If OTA comes back, it needs a custom two-slot partition table and the firmware must fit in **~1.97 MB per slot** (see [CHANGELOG.md](CHANGELOG.md) for the current size vs. that budget). **`pio` is not on PATH** on this machine — use the full path:
+PlatformIO project, single environment: `default` (USB upload). OTA was abandoned by decision (2026-07-06) — there is no `[env:ota]` anymore, USB flashing (`-e default`) is the workflow, and the user flashes the device himself. The JC4827W543's 4 MB flash uses `huge_app.csv` (3 MB app partition, no `ota_0`/`ota_1` slots); with OTA off the table, that 3 MB app partition is the only size limit. **`pio` is not on PATH** on this machine — use the full path:
 
 ```bash
 # build + upload over USB (usual workflow)
 "d:\pio\penv\Scripts\platformio.exe" run -e default -t upload
 # build only
 "d:\pio\penv\Scripts\platformio.exe" run -e default
-# upload over the air (inactive until a two-slot partition table exists — see above)
-"d:\pio\penv\Scripts\platformio.exe" run -e ota -t upload
 # serial monitor (115200)
 "d:\pio\penv\Scripts\platformio.exe" device monitor
 # clean

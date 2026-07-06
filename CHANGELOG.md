@@ -58,11 +58,10 @@ event.
   - `Flash: [=======   ]  68.0% (used 2139350 bytes from 3145728 bytes)`
   - `RAM:   [==        ]  19.4% (used 63480 bytes from 327680 bytes)`
   - `.pio/build/default/firmware.bin`: 2,139,760 bytes (~2.04 MB)
-- OTA return still needs ≤ ~1.97 MB per slot (custom two-slot table w/o
-  SPIFFS) — the build is now **~73 KB over** that budget, down from the
-  ~89 KB gap measured before this overhaul (the `FONT_HEAD` trim clawed back
-  some of what the new fonts/panel added). Remaining trim candidate: the
-  boot splash asset (`src/ed_logo.h`).
+- OTA has been dropped by decision (2026-07-06): `[env:ota]` is removed from
+  `platformio.ini` and USB flashing is the only workflow going forward. With
+  no OTA slot to fit, there is no image-size constraint beyond the 3 MB
+  `huge_app.csv` app partition.
 
 ## Hardware Migration - Guition JC4827W543 (July 2026)
 
