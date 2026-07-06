@@ -1,5 +1,78 @@
 # BLE Joypad - Changelog
 
+## Hardware Migration - Guition JC4827W543 (July 2026)
+
+Migrated off the Freenove ESP32-S3 WROOM (FNK0104B) onto a **Guition JC4827W543**
+(ESP32-S3-WROOM-1 N4R8, 4.3" 480×272 NV3041A QSPI panel, GT911 capacitive touch,
+4 MB flash / 8 MB octal PSRAM). This is a full hardware swap: new display driver
+stack, new touch controller, no more physical buttons, a different audio amp, no
+battery monitoring, and an LVGL 8→9 bump to go with the new display library. The
+UI was largely rebuilt for the bigger panel along the way.
+
+### Hardware
+- **Display**: TFT_eSPI (parallel, 2.8") → **Arduino_GFX** (`Arduino_ESP32QSPI` +
+  `Arduino_NV3041A`), 4.3" 480×272 over QSPI.
+- **Touch**: FT6336U → **GT911**, read via `bb_captouch` on `Wire` (SDA=8/SCL=4).
+- **Buttons**: the 12-button PCF8575 gamepad is gone entirely. Replaced by an
+  on-screen fighter pad (BLE IDs 13–20 unchanged) plus 3 TTP223 capacitive pads
+  on a PCF8575 — now on a *second* I2C bus, `Wire1` (SDA=18/SCL=17), address
+  `0x22` — used only for page navigation and display-off, never for BLE.
+- **Audio**: ES8311 codec driver deleted. A bare **NS4168 mono I2S amp** now
+  drives sound directly (BCLK=42, WS=2, DOUT=41, no MCLK, no codec setup),
+  still via `i2s_std` with `chan_cfg.auto_clear = true`.
+- **Battery monitoring deleted** — the JC4827W543's IP5306 exposes no status
+  line to sample.
+
+### LVGL 8.4 → 9.5
+- `lvgl` moved from a vendored/gitignored copy to `lvgl/lvgl@^9.5` pulled
+  straight from the registry (`lib_deps`), alongside `moononournation/GFX
+  Library for Arduino@^1.6.6` for Arduino_GFX.
+- `lv_conf.h` at the repo root trimmed down to a minimal 9.x config, picked up
+  via `-DLV_CONF_INCLUDE_SIMPLE -I .` in `platformio.ini`'s `build_flags`.
+- v8→v9 rename sweep across the UI code: `lv_scr_load` → `lv_screen_load`,
+  `lv_btnmatrix` → `lv_buttonmatrix`, `lv_obj_clear_flag` →
+  `lv_obj_remove_flag`, zoom → `lv_obj_set_style_transform_scale`,
+  `LV_LABEL_LONG_WRAP` → `LV_LABEL_LONG_MODE_WRAP`, the timer `user_data`
+  getter, and an `lv_event_get_target` cast fixup. Recolor markup (`#color
+  ...#`) now survives only in the sidebar's genus labels — it was stripped
+  from the `ProspectedAsteroid` log line since the log itself is monochrome.
+
+### Input model change
+- All 12 physical PCF8575 gamepad buttons and the FNK0104B expander wiring
+  are gone.
+- 3 TTP223 pads sit right of the display on the `Wire1` PCF8575 (0x22),
+  active-high, edge-triggered: top = previous page, middle = display off,
+  bottom = next page. While the display is off, any pad press only wakes it
+  rather than acting.
+- BLE gamepad presses now come exclusively from the on-screen fighter pad
+  (IDs 13–20 unchanged); the TTP223 pads never reach BLE.
+
+### UI rebuild for 480×272
+- New `theme` module (`src/theme.h`/`.cpp`) centralizes colors/styles.
+- Info screen rebuilt as a two-column dashboard: log (left, 300px) + a
+  pinned-bodies sidebar (right, 180px) with genus color states; a backpack
+  card shows only when on-foot; cargo bar bottom-left; 32px header.
+- Fighter pad scaled up with bigger touch targets/fonts for the 4.3" panel
+  (BLE IDs 13–20 unchanged).
+- New system screen: diagnostics plus brightness/volume sliders.
+- Page-title overlay shown on TTP223 page switches.
+- Boot splash resized to 460×265.
+
+### 4 MB flash / `huge_app.csv` (OTA parked)
+- The board only has 4 MB flash, so `platformio.ini` now uses
+  `board_build.partitions = huge_app.csv` (no OTA slots). `[env:ota]` is kept
+  in the config but is **INACTIVE** until a custom two-slot partition table
+  exists.
+- Measured firmware size (`pio run -e default`):
+  - `Flash: [=======   ]  68.6% (used 2156838 bytes from 3145728 bytes)`
+  - `RAM:   [==        ]  19.3% (used 63144 bytes from 327680 bytes)`
+  - `.pio/build/default/firmware.bin`: 2,157,248 bytes (~2.06 MB)
+- OTA return needs ≤ ~1.97 MB (custom two-slot table w/o SPIFFS) — the
+  current build is already **~89 KB over** that per-slot budget. Trim
+  candidates before OTA can return: the Montserrat font selection in
+  `lv_conf.h` (12/14/16/20/28 all enabled — audit which sizes the UI
+  actually uses), and the 238 KB boot splash asset (`src/ed_logo.h`).
+
 ## Toolchain Migration - pioarduino / ESP-IDF 5.5 (June 2026)
 
 Moved off the now-frozen stock `espressif32` platform (Arduino core 2.0.x / ESP-IDF 4.4)
