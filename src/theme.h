@@ -8,7 +8,6 @@
 // Fonts enabled in lv_conf.h
 #define FONT_SMALL  (&lv_font_montserrat_12)
 #define FONT_BODY   (&lv_font_montserrat_14)
-#define FONT_HEAD   (&lv_font_montserrat_16)
 #define FONT_BIG    (&lv_font_montserrat_20)
 #define FONT_JUMBO  (&lv_font_montserrat_28)
 

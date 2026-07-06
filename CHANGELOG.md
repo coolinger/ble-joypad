@@ -1,5 +1,68 @@
 # BLE Joypad - Changelog
 
+## V5 MFD Overhaul (July 2026)
+
+Reworked the UI around a persistent "shell" frame drawn on `lv_layer_top()`
+instead of being rebuilt per page, added custom-generated fonts with full
+umlaut support, and rebuilt all three pages into a shared content zone.
+Exploration tracking gained a live context panel fed by a previously-dropped
+event.
+
+### Shell / navigation
+- New `src/screens/shell.h`/`.cpp`: a persistent frame (metrics strip, tab
+  rail, footer) built once in `setup()` on `lv_layer_top()`, overlaying every
+  screen instead of being duplicated per page.
+  - **Strip** (480×44): jump count (Michroma 24), fuel/hull `lv_arc` gauges
+    with cyan % labels, cargo `n/N`, BLE/WS/WiFi icons (orange when connected).
+  - **Tab rail** (34px, right edge, `x`=446): `FTR`/`LOG`/`SYS` tabs, tappable
+    (deferred via `reqPageSwitch`, actioned in `loop()`) alongside the
+    existing TTP223 prev/next cycle; active tab inverts to orange via
+    `shell_set_active_tab()`.
+  - **Footer**: current system name (left) + on-foot/ship mode (right).
+- Page-title overlay (shown briefly on TTP page switches) removed — the tab
+  rail always shows current-page state, making the overlay redundant. An
+  optional page-fade (`PAGE_FADE_MS` in `config.h`, default 120 ms, 0
+  disables) replaces it; the jump-detected overlay moved to `lv_layer_top()`
+  so it survives page fades (`act_scr` flips ~33 ms late otherwise).
+- All three pages rebuilt into the shell's 446×208 content zone
+  (`CONTENT_X/Y/W/H` in `shell.h`) instead of each owning the full screen.
+
+### Fonts
+- Added custom MFD fonts generated via `npx lv_font_conv` from TTFs in
+  `tools/fonts/` (committed): `font_michroma_24`/`font_michroma_12`
+  (headline/label) and `font_jura_16` (buttons), all built **with** the
+  German umlaut set (äöüÄÖÜß) so fighter labels read "Zurück"/"Befehle"
+  natively. Adds roughly +50 KB to flash.
+- Dropped the now-dead `FONT_HEAD` (`lv_font_montserrat_16`): its only caller
+  was the old page header, replaced by the shell strip. Removed the
+  `#define` from `theme.h` and disabled `LV_FONT_MONTSERRAT_16` in
+  `lv_conf.h`.
+
+### Log page / context panel
+- LOG page (`src/screens/info.cpp`) rebuilt into the content zone: an
+  events + relative-time column, a `SIGNALS` sidebar of pinned-body cards,
+  and a new bottom context panel.
+- Context panel toggles via `updateContextPanel()` between **BACKPACK** (on
+  foot) and **EXPLORATION** (in ship): honk state, bodies scanned/mapped
+  (`n[/n] OK` once `FSSAllBodiesFound` fires), first-discovery/first-map
+  counts (highlighted when >0), and stations by landing-pad size
+  (`nL`/`nM`/`nFC`).
+- `FSSSignalDiscovered` is no longer dropped on the floor: it's now consumed
+  silently (no log line — high-volume) to count stations by pad size
+  (Outpost→M, big stations→L, FleetCarrier→FC), deduped by a capped
+  name-hash table that can undercount but never inflates.
+
+### Size / OTA budget
+- Measured firmware size (`pio run -e default`):
+  - `Flash: [=======   ]  68.0% (used 2139350 bytes from 3145728 bytes)`
+  - `RAM:   [==        ]  19.4% (used 63480 bytes from 327680 bytes)`
+  - `.pio/build/default/firmware.bin`: 2,139,760 bytes (~2.04 MB)
+- OTA return still needs ≤ ~1.97 MB per slot (custom two-slot table w/o
+  SPIFFS) — the build is now **~73 KB over** that budget, down from the
+  ~89 KB gap measured before this overhaul (the `FONT_HEAD` trim clawed back
+  some of what the new fonts/panel added). Remaining trim candidate: the
+  boot splash asset (`src/ed_logo.h`).
+
 ## Hardware Migration - Guition JC4827W543 (July 2026)
 
 Migrated off the Freenove ESP32-S3 WROOM (FNK0104B) onto a **Guition JC4827W543**
