@@ -24,9 +24,11 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 #define LCD_QSPI_D3   39
 #define LCD_BL_PIN     1   // backlight LEDC PWM. NOT an amp-enable pin!
 
-// Arduino_GFX rotation index (0..3). 2 = 180deg, matching the mounting used in
-// the ESPHome test (References/jc4827w543.yaml). Touch coords flip with it.
-#define DISPLAY_ROTATION 2
+// Arduino_GFX rotation index (0..3). 0 matches the actual mounting (TTP223
+// pads right of the panel; hardware-verified). The ESPHome test's
+// "rotation: 180" counted from a different native orientation. The touch
+// mirror in display.cpp follows this define.
+#define DISPLAY_ROTATION 0
 
 // GT911 capacitive touch (its own I2C bus -> Wire)
 #define TOUCH_SDA  8

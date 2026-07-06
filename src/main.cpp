@@ -30,7 +30,10 @@ using namespace websockets;
 
 // All board pins live in config.h (Guition JC4827W543). The PCF8575 with the
 // TTP223 pads sits on Wire1 (PCF_SDA/PCF_SCL); GT911 touch owns Wire.
-#define I2C_SPEED 400000
+// 50 kHz on Wire1: the PCF8575 hangs off jumper wires with only the ESP32's
+// weak internal pull-ups — 400 kHz gets no ACK. 50 kHz is the ESPHome default
+// the same hardware was verified with.
+#define I2C_SPEED 50000
 
 // TX channel handle for the new i2s_std driver (created in setup(), used by sound.cpp)
 i2s_chan_handle_t i2s_tx_chan = NULL;
@@ -45,6 +48,7 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 // Global flags
 
 PCF8575* pcf = nullptr;
+bool pcfAvailable = false;  // begin() succeeded; loop() retries every 5 s if not
 BleGamepad* bleGamepad = nullptr;
 BleGamepadConfiguration bleGamepadConfig;
 bool bleConnected = false;
@@ -2097,7 +2101,8 @@ void setup()
 
   Serial.println("[PCF8575] Init TTP223 pads (Wire1 @0x22)...");
   pcf = new PCF8575(PCF8575_ADDR, &Wire1);
-  if (!pcf->begin()) Serial.println("[PCF8575] ERROR: not found on Wire1");
+  pcfAvailable = pcf->begin();
+  if (!pcfAvailable) Serial.println("[PCF8575] ERROR: not found on Wire1 (will retry)");
 
   Serial.println("[BLE] Creating and configuring gamepad...");
   bleGamepad = new BleGamepad("CoolJoyBLE", "leDev", 100);
@@ -2292,6 +2297,18 @@ void loop()
   // --- TTP223 page navigation (PCF8575 @0x22 on Wire1, active-high) ---
   // top = previous page, bottom = next page (wrap over the 3 pages),
   // middle = display off. While the display is dark, ANY pad only wakes it.
+  // Without the expander (bad wiring / not fitted) the poll is skipped and a
+  // reconnect is attempted every 5 s instead of spamming I2C errors at 5 ms.
+  if (!pcfAvailable) {
+    static uint32_t lastPcfRetry = 0;
+    if (millis() - lastPcfRetry >= 5000) {
+      lastPcfRetry = millis();
+      pcfAvailable = pcf->begin();
+      if (pcfAvailable) Serial.println("[PCF8575] reconnected");
+    }
+    delay(5);
+    return;
+  }
   static const char* pageNames[3] = {"FIGHTER", "LOG", "SYSTEM"};
   static uint16_t lastTtpState = 0;
   uint16_t ttpState = pcf->read16();
