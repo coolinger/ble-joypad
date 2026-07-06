@@ -13,9 +13,11 @@
 
 // Custom MFD fonts (generated via lv_font_conv, see tools/fonts/; include äöüÄÖÜß)
 LV_FONT_DECLARE(font_michroma_24);
+LV_FONT_DECLARE(font_michroma_18);
 LV_FONT_DECLARE(font_michroma_12);
 LV_FONT_DECLARE(font_jura_16);
 #define FONT_DISPLAY_BIG   (&font_michroma_24)
+#define FONT_DISPLAY_MID   (&font_michroma_18)  // 2-digit jump counts
 #define FONT_DISPLAY_LABEL (&font_michroma_12)
 #define FONT_BTN           (&font_jura_16)
 

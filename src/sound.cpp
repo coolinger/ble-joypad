@@ -15,6 +15,7 @@ extern i2s_chan_handle_t i2s_tx_chan;
 #define BEEP_MOTHERLODE 1
 #define BEEP_CLICK 1
 #define BEEP_SIGNAL 1
+#define BEEP_FIRSTDISC 1
 
 int AUDIO_TONE_AMPL  = 6000; // reduce beep loudness
 
@@ -86,6 +87,16 @@ void beepDisconnect() {
 void beepSignal() {
 #if (BEEP_SIGNAL)
   playTone(1400, 40);
+#endif
+}
+
+// Rising three-tone chime: played when a Scan discovers a body nobody in the
+// galaxy has scanned before (Scan.WasDiscovered == false).
+void beepFirstDiscovery() {
+#if (BEEP_FIRSTDISC)
+  playTone(1200, 60);
+  playTone(1500, 60);
+  playTone(1800, 90);
 #endif
 }
 

@@ -161,6 +161,8 @@ bool displayManualOff = false;
 // FSSBodySignals: one short beep per detected signal. Incremented by the WS
 // task (handleEliteEvent), drained evenly spaced by loop() on core 1.
 volatile int pendingSignalBeeps = 0;
+// Set by the WS task when a Scan yields a first discovery; loop() plays the chime.
+volatile bool pendingFirstDiscBeep = false;
 
 // History replay (getLogEntries after boot): rebuilds log/pins/system state
 // from the most recent journal entries. While replayingHistory is set, the
@@ -361,6 +363,9 @@ void updateHeader() {
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     lv_label_set_text_fmt(shell_jumps_label, "%d", status.nav.jumpsRemaining);
+    // Big Michroma only fits one digit next to the JUMPS label; shrink for more.
+    lv_obj_set_style_text_font(shell_jumps_label,
+        status.nav.jumpsRemaining > 9 ? FONT_DISPLAY_MID : FONT_DISPLAY_BIG, 0);
 
     int fuelPct = (status.fuel.fuelCapacity > 0)
         ? (int)(status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0;
@@ -1531,9 +1536,13 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       explorationAllFound();
       explTouched = true;
     } else if (event == "Scan") {
+      int prevFirst = status.exploration.firstDiscovered;
       explorationScan(doc["BodyID"] | -1,
                       doc["WasDiscovered"] | true,
                       doc["WasMapped"] | true);
+      // First discovery (nobody scanned this body before): celebratory chime.
+      if (status.exploration.firstDiscovered > prevFirst && !replayingHistory)
+        pendingFirstDiscBeep = true;
       explTouched = true;
     } else if (event == "SAAScanComplete") {
       explorationMapped(doc["BodyID"] | -1);
@@ -2250,6 +2259,12 @@ void loop()
     beepSignal();
     pendingSignalBeeps--;
     lastSignalBeepTime = millis();
+  }
+
+  // First discovery: three-tone chime (queued by the WS task's Scan hook).
+  if (pendingFirstDiscBeep) {
+    pendingFirstDiscBeep = false;
+    beepFirstDiscovery();
   }
 
   checkBleConnection();

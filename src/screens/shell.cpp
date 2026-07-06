@@ -91,8 +91,8 @@ void create_shell_ui() {
   lv_label_set_text(shell_jumps_label, "0");
   lv_obj_set_style_text_color(shell_jumps_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(shell_jumps_label, FONT_DISPLAY_BIG, 0);
-  lv_obj_set_pos(shell_jumps_label, 10, 6);
-  dim_label(strip, "JUMPS", 48, 22);
+  lv_obj_set_pos(shell_jumps_label, 4, 6);
+  dim_label(strip, "JUMPS", 46, 22);
 
   shell_fuel_arc = make_arc(strip, 108);
   shell_fuel_label = value_label(strip, "--%", 148, 7);
@@ -145,6 +145,10 @@ void create_shell_ui() {
     lv_obj_set_style_text_font(l, FONT_DISPLAY_LABEL, 0);
     lv_obj_set_style_text_color(l, LV_COLOR_DIM, 0);
     lv_obj_center(l);
+    // Rotate the tab caption 90deg (reads top-to-bottom on the narrow rail)
+    lv_obj_set_style_transform_pivot_x(l, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(l, lv_pct(50), 0);
+    lv_obj_set_style_transform_rotation(l, 900, 0);
   }
 
   // ---- footer ----
