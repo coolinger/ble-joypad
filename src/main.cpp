@@ -262,44 +262,51 @@ void printHeapStatus(const char* location) {
     location, freePSRAM, totalPSRAM, (freePSRAM * 100.0 / totalPSRAM), freeInternal);
 }
 
-void updateBackpackDisplay() {
-  if (!medpack_label || !energycell_label) return;
+// Context panel: BACKPACK while on foot, EXPLORATION otherwise.
+void updateContextPanel() {
+  if (!ctx_panel) return;
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    char buf[8];
+    // NOTE: ctx_lines use Montserrat (ASCII only) - keep these strings ASCII
+    // (no "·"/"—" typographic characters, they would render as blanks).
+    char line[48];
+    if (status.onFoot) {
+      lv_label_set_text(ctx_rail_label, "BACKPACK / ON FOOT");
+      snprintf(line, sizeof(line), "Med %d   Cell %d",
+               status.backpack.healthpack, status.backpack.energycell);
+      lv_label_set_text(ctx_lines[0], line);
+      snprintf(line, sizeof(line), "Bio-Daten %d", status.bioscan.totalScans);
+      lv_label_set_text(ctx_lines[1], line);
+      lv_label_set_text(ctx_lines[2], "");
+      lv_label_set_text(ctx_lines[3], "");
+      lv_obj_set_style_text_color(ctx_lines[2], LV_COLOR_FG, 0);
+    } else {
+      ExplorationInfo &x = status.exploration;
+      lv_label_set_text(ctx_rail_label, "EXPLORATION");
 
-    // The backpack only exists on foot: hide the whole panel otherwise
-    if (backpack_panel) {
-      if (status.onFoot) lv_obj_remove_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
-      else lv_obj_add_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
-    }
+      if (!x.honked) snprintf(line, sizeof(line), "HONK -   BODIES -");
+      else if (x.allFound) snprintf(line, sizeof(line), "HONK OK  BODIES %d/%d OK", x.bodyCount, x.bodyCount);
+      else snprintf(line, sizeof(line), "HONK OK  BODIES %d", x.bodyCount);
+      lv_label_set_text(ctx_lines[0], line);
 
-    // Update medpack count
-    snprintf(buf, sizeof(buf), "%d", status.backpack.healthpack);
-    lv_label_set_text(medpack_label, buf);
-    
-    // Update energycell count
-    snprintf(buf, sizeof(buf), "%d", status.backpack.energycell);
-    lv_label_set_text(energycell_label, buf);
-    
-    // Update bioscan count if available
-    if (bioscan_label) {
-      snprintf(buf, sizeof(buf), "%d", status.bioscan.totalScans);
-      lv_label_set_text(bioscan_label, buf);
-      
-      if (status.bioscan.totalScans > 0) {
-        lv_obj_remove_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
-        if (bioscan_data_label) {
-          lv_obj_remove_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
-        }
-      } else {
-        lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
-        if (bioscan_data_label) {
-          lv_obj_add_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
-        }
+      snprintf(line, sizeof(line), "SCAN %d   MAP %d", x.scanned, x.mapped);
+      lv_label_set_text(ctx_lines[1], line);
+
+      snprintf(line, sizeof(line), "FIRST: DISC %d  MAP %d", x.firstDiscovered, x.firstMapped);
+      lv_label_set_text(ctx_lines[2], line);
+      lv_obj_set_style_text_color(ctx_lines[2],
+          (x.firstDiscovered + x.firstMapped) > 0 ? LV_COLOR_HIGHLIGHT_BG : LV_COLOR_DIM, 0);
+
+      int st = x.stationsL + x.stationsM + x.carriers;
+      if (st == 0) snprintf(line, sizeof(line), "STATIONS -");
+      else {
+        int l2 = snprintf(line, sizeof(line), "STATIONS");
+        if (x.stationsL) l2 += snprintf(line + l2, sizeof(line) - l2, " %dL", x.stationsL);
+        if (x.stationsM) l2 += snprintf(line + l2, sizeof(line) - l2, " %dM", x.stationsM);
+        if (x.carriers)  l2 += snprintf(line + l2, sizeof(line) - l2, " %dFC", x.carriers);
       }
+      lv_label_set_text(ctx_lines[3], line);
     }
-    
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -448,20 +455,30 @@ static void updatePinnedSidebarUnlocked() {
   }
 }
 
+// Relative age like "9s" / "12m" / "2h" for the log time column.
+static void formatAge(char* out, size_t n, uint32_t thenMs) {
+  uint32_t d = (millis() - thenMs) / 1000;
+  if (d < 60)        snprintf(out, n, "%lus", (unsigned long)d);
+  else if (d < 3600) snprintf(out, n, "%lum", (unsigned long)(d / 60));
+  else               snprintf(out, n, "%luh", (unsigned long)(d / 3600));
+}
+
 void updateLogDisplay() {
   if (!log_label || !logText) return;  // Check logText is allocated
-  
+
   // Print heap status before display update
   static int updateCount = 0;
   if (updateCount++ % 10 == 0) {  // Every 10th update
     printHeapStatus("before display");
   }
-  
+
   // Take mutex before accessing LVGL objects
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     // Clear buffer safely
     memset(logText, 0, LOG_TEXT_SIZE);
     int currentLen = 0;
+    char ageText[160] = {0};  // parallel right-column ages, one line per entry
+    int ageLen = 0;
 
     // Pins render as sidebar cards now, not as log lines.
     updatePinnedSidebarUnlocked();
@@ -519,6 +536,13 @@ void updateLogDisplay() {
         currentLen += copyLen;
         logText[currentLen++] = '\n';
         logText[currentLen] = '\0';
+
+        // Parallel age line for the time column (same row as the text above).
+        if (ageLen < (int)sizeof(ageText) - 8) {
+          char age[8];
+          formatAge(age, sizeof(age), eventLog[idx].timestamp);
+          ageLen += snprintf(ageText + ageLen, sizeof(ageText) - ageLen, "%s\n", age);
+        }
       } else {
         Serial.println("[LOG] ERROR: No space for text copy");
         break;
@@ -531,7 +555,8 @@ void updateLogDisplay() {
     // Update label - this is where LVGL might run out of memory
     Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
     lv_label_set_text(log_label, logText);
-    
+    if (log_time_label) lv_label_set_text(log_time_label, ageText);
+
     xSemaphoreGive(lvglMutex);
     
     // Print heap after display update
@@ -721,7 +746,7 @@ void switchToPage(int page) {
     // Don't call updateLogDisplay here - it will update when events arrive
     updateHeader();
     updateStatusLine();
-    updateBackpackDisplay();
+    updateContextPanel();
   } else if (page == 2) {
     updateSystemInfo();
   }
@@ -1001,7 +1026,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
       if (msg["inMulticrew"].is<bool>()) status.inMulticrew = msg["inMulticrew"];
 
       updateHeader();
-      updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+      updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     } else if (name && strcmp(name, "gameStateChange") == 0) {
       Serial.println("[WS] gameStateChange broadcast received, refreshing state");
       requestShipStatusWs();
@@ -1312,7 +1337,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
       
-      updateBackpackDisplay();
+      updateContextPanel();
     }
     return;
   } else if (eventType == "BIOSCAN") {
@@ -1326,7 +1351,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Just track total count, ignore variants
       status.bioscan.totalScans = count;
       Serial.printf("[BIOSCAN] Total scans: %d\n", status.bioscan.totalScans);
-      updateBackpackDisplay();
+      updateContextPanel();
     }
     return;
   } else if (eventType == "SUMMARY") {
@@ -1375,7 +1400,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     if (doc["inSrv"].is<bool>()) status.inSrv = doc["inSrv"];
     if (doc["inTaxi"].is<bool>()) status.inTaxi = doc["inTaxi"];
     if (doc["inMulticrew"].is<bool>()) status.inMulticrew = doc["inMulticrew"];
-    updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+    updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     
     // Update route jumps (now a single integer, not an object)
     if (!doc["route"].isNull()) {
@@ -1451,7 +1476,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update all displays
     updateHeader();
     updateStatusLine();
-    updateBackpackDisplay();
+    updateContextPanel();
     
     Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
       status.fuel.fuelMain, status.fuel.fuelCapacity,
@@ -1498,6 +1523,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     } else if (event == "SAAScanComplete") {
       explorationMapped(doc["BodyID"] | -1);
     }
+    // Panel refresh is cheap and deduped by the mutex - one call covers the
+    // whole block above rather than branching per event again.
+    updateContextPanel();
 
     if (event == "CommunityGoal") {
       // Show player's percentile band for community goals
@@ -1553,6 +1581,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Left the old system: pinned body signals are no longer relevant
       clearPinnedBodies();
       explorationReset();
+      updateContextPanel();
       updateLogDisplay();
     } else if (event == "StartJump") {
       // Hyperspace charge engaged: the old system's data is stale NOW. The
@@ -1561,6 +1590,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       if (strcmp(doc["JumpType"] | "", "Hyperspace") == 0) {
         clearPinnedBodies();
         explorationReset();
+        updateContextPanel();
         if (doc["StarSystem"].is<const char*>()) {
           status.currentSystem = doc["StarSystem"].as<const char*>();
           status.currentStation = "";
@@ -1656,8 +1686,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
     } else if (event == "FSSSignalDiscovered") {
       // Silent, high-volume: count landable stations by largest pad, no log line.
-      if (doc["IsStation"] | false) {
-        explorationStation(doc["SignalName"] | "", doc["SignalType"] | "");
+      if ((doc["IsStation"] | false) &&
+          explorationStation(doc["SignalName"] | "", doc["SignalType"] | "")) {
+        updateContextPanel();
       }
       return;  // consume: never reaches the generic log
     } else if (event == "FSSBodySignals" || event == "SAASignalsFound") {
@@ -1738,7 +1769,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       Serial.printf("[BACKPACK] H:%d E:%d\n",
                     status.backpack.healthpack, status.backpack.energycell);
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "BackpackChange") {
       for (JsonObject item : doc["Added"].as<JsonArray>()) {
         const char* n = item["Name"] | "";
@@ -1754,26 +1785,27 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       if (status.backpack.healthpack < 0) status.backpack.healthpack = 0;
       if (status.backpack.energycell < 0) status.backpack.energycell = 0;
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "UseConsumable") {
       const char* n = doc["Name"] | "";
       if (strcmp(n, "healthpack") == 0 && status.backpack.healthpack > 0)
         status.backpack.healthpack--;
       else if (strcmp(n, "energycell") == 0 && status.backpack.energycell > 0)
         status.backpack.energycell--;
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "Disembark") {
       status.onFoot = true;
-      updateBackpackDisplay();  // show the backpack panel
+      updateContextPanel();  // switch panel to BACKPACK / ON FOOT
       addLogEntry("Disembark");
     } else if (event == "Embark") {
       status.onFoot = false;
-      updateBackpackDisplay();  // hide the backpack panel
+      updateContextPanel();  // switch panel back to EXPLORATION
       addLogEntry("Embark");
     } else if (event == "Shutdown" || event == "CarrierJump") {
       // Session over / carrier moved: pinned body signals are stale
       clearPinnedBodies();
       explorationReset();
+      updateContextPanel();
       addLogEntry(event.c_str());
     } else {
       // Generic journal event - only add to display if not hidden
@@ -1825,7 +1857,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       if (flags["inSrv"].is<bool>()) status.inSrv = flags["inSrv"];
       if (flags["inTaxi"].is<bool>()) status.inTaxi = flags["inTaxi"];
       if (flags["inMulticrew"].is<bool>()) status.inMulticrew = flags["inMulticrew"];
-      updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+      updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     }
     
     // Update legal state
@@ -2401,7 +2433,8 @@ void showJumpOverlay(int jumps) {
     lv_label_set_text_fmt(jump_overlay_label, "%d", jumps);
     lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
     lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
-    lv_obj_center(jump_overlay_label);
+    lv_obj_align(jump_overlay_label, LV_ALIGN_TOP_MID, -SHELL_RAIL_W / 2,
+                 CONTENT_Y + CONTENT_H / 2 - 20);
     lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
     lv_obj_set_style_transform_scale(jump_overlay_label, 768, LV_PART_MAIN);
     lv_obj_update_layout(jump_overlay_label);
