@@ -6,7 +6,6 @@
 
 lv_obj_t *logviewer_screen = nullptr;
 lv_obj_t *log_label = nullptr;
-lv_obj_t *log_time_label = nullptr;
 lv_obj_t *jump_overlay_label = nullptr;
 lv_obj_t *pin_cards[MAX_PINNED_BODIES] = {nullptr};
 lv_obj_t *pin_title_labels[MAX_PINNED_BODIES] = {nullptr};
@@ -15,10 +14,11 @@ lv_obj_t *ctx_panel = nullptr;
 lv_obj_t *ctx_rail_label = nullptr;
 lv_obj_t *ctx_lines[4] = {nullptr};
 
-#define EVENTS_W 226
-#define TIME_W   38
-#define SIDE_X   (EVENTS_W + TIME_W + 8)          // 272
-#define SIDE_W   (CONTENT_W - SIDE_X - 6)         // 168
+// No time column (static ages were useless); the freed width goes to the
+// sidebar so long context lines ("HONK OK  BODIES 20/20 OK") fit.
+#define EVENTS_W 230
+#define SIDE_X   (EVENTS_W + 8)                   // 238
+#define SIDE_W   (CONTENT_W - SIDE_X - 6)         // 202
 #define CTX_H    76
 
 static lv_obj_t* rail(lv_obj_t *parent, const char *txt, int x, int y, int w) {
@@ -40,7 +40,7 @@ void create_logviewer_ui() {
   lv_obj_set_style_bg_color(logviewer_screen, LV_COLOR_BG, 0);
 
   // ---- events column (left) ----
-  rail(logviewer_screen, "EVENTS", CONTENT_X + 8, CONTENT_Y + 4, EVENTS_W + TIME_W);
+  rail(logviewer_screen, "EVENTS", CONTENT_X + 8, CONTENT_Y + 4, EVENTS_W);
 
   log_label = lv_label_create(logviewer_screen);
   lv_obj_set_pos(log_label, CONTENT_X + 8, CONTENT_Y + 24);
@@ -49,14 +49,6 @@ void create_logviewer_ui() {
   lv_label_set_long_mode(log_label, LV_LABEL_LONG_MODE_CLIP);  // 1 line per entry
   lv_obj_set_style_text_color(log_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(log_label, FONT_BODY, 0);
-
-  log_time_label = lv_label_create(logviewer_screen);
-  lv_obj_set_pos(log_time_label, CONTENT_X + 8 + EVENTS_W, CONTENT_Y + 24);
-  lv_obj_set_width(log_time_label, TIME_W);
-  lv_label_set_text(log_time_label, " ");
-  lv_obj_set_style_text_align(log_time_label, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_style_text_color(log_time_label, LV_COLOR_DIM, 0);
-  lv_obj_set_style_text_font(log_time_label, FONT_BODY, 0);
 
   // ---- sidebar (right) ----
   lv_obj_t *side = lv_obj_create(logviewer_screen);

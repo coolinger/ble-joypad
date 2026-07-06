@@ -4,8 +4,7 @@
 #include "../gamedata.h"   // MAX_PINNED_BODIES
 
 extern lv_obj_t *logviewer_screen;
-extern lv_obj_t *log_label;        // event texts (left part of the column)
-extern lv_obj_t *log_time_label;   // right-aligned relative ages, same line grid
+extern lv_obj_t *log_label;        // event texts (left column)
 extern lv_obj_t *jump_overlay_label;
 
 // Pinned body signal cards (filled by updatePinnedSidebarUnlocked in main.cpp;

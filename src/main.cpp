@@ -460,14 +460,6 @@ static void updatePinnedSidebarUnlocked() {
   }
 }
 
-// Relative age like "9s" / "12m" / "2h" for the log time column.
-static void formatAge(char* out, size_t n, uint32_t thenMs) {
-  uint32_t d = (millis() - thenMs) / 1000;
-  if (d < 60)        snprintf(out, n, "%lus", (unsigned long)d);
-  else if (d < 3600) snprintf(out, n, "%lum", (unsigned long)(d / 60));
-  else               snprintf(out, n, "%luh", (unsigned long)(d / 3600));
-}
-
 void updateLogDisplay() {
   if (!log_label || !logText) return;  // Check logText is allocated
 
@@ -482,8 +474,6 @@ void updateLogDisplay() {
     // Clear buffer safely
     memset(logText, 0, LOG_TEXT_SIZE);
     int currentLen = 0;
-    char ageText[160] = {0};  // parallel right-column ages, one line per entry
-    int ageLen = 0;
 
     // Pins render as sidebar cards now, not as log lines.
     updatePinnedSidebarUnlocked();
@@ -541,13 +531,6 @@ void updateLogDisplay() {
         currentLen += copyLen;
         logText[currentLen++] = '\n';
         logText[currentLen] = '\0';
-
-        // Parallel age line for the time column (same row as the text above).
-        if (ageLen < (int)sizeof(ageText) - 8) {
-          char age[8];
-          formatAge(age, sizeof(age), eventLog[idx].timestamp);
-          ageLen += snprintf(ageText + ageLen, sizeof(ageText) - ageLen, "%s\n", age);
-        }
       } else {
         Serial.println("[LOG] ERROR: No space for text copy");
         break;
@@ -560,7 +543,6 @@ void updateLogDisplay() {
     // Update label - this is where LVGL might run out of memory
     Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
     lv_label_set_text(log_label, logText);
-    if (log_time_label) lv_label_set_text(log_time_label, ageText);
 
     xSemaphoreGive(lvglMutex);
     
