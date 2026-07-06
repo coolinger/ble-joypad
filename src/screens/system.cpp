@@ -160,5 +160,6 @@ void create_settings_ui() {
   lv_obj_t *reboot = make_button(settings_screen, "REBOOT", 222, reboot_handler);
   lv_obj_set_style_border_color(reboot, LV_COLOR_WARNING_FG, 0);
 
-  updateSystemInfo();
+  // No updateSystemInfo() here: our only caller (switchToPage) holds lvglMutex
+  // and refreshes the panel itself right after releasing it.
 }
