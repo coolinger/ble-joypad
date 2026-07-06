@@ -2275,7 +2275,33 @@ void loop()
     }
   }
   
-  // TTP223 page navigation lands here (next task).
+  // --- TTP223 page navigation (PCF8575 @0x22 on Wire1, active-high) ---
+  // top = previous page, bottom = next page (wrap over the 3 pages),
+  // middle = display off. While the display is dark, ANY pad only wakes it.
+  static uint16_t lastTtpState = 0;
+  uint16_t ttpState = pcf->read16();
+  uint16_t rising = ttpState & ~lastTtpState;
+  lastTtpState = ttpState;
+
+  bool topEdge    = (rising >> TTP_TOP_BIT) & 1;
+  bool midEdge    = (rising >> TTP_MID_BIT) & 1;
+  bool bottomEdge = (rising >> TTP_BOTTOM_BIT) & 1;
+
+  if (topEdge || midEdge || bottomEdge) {
+    if (!displayOn) {
+      wakeDisplay();               // dark display: first press only wakes
+    } else if (topEdge) {
+      switchToPage((currentPage + 2) % 3);   // previous
+      Serial.printf("[TTP] prev -> page %d\n", currentPage);
+    } else if (bottomEdge) {
+      switchToPage((currentPage + 1) % 3);   // next
+      Serial.printf("[TTP] next -> page %d\n", currentPage);
+    } else if (midEdge) {
+      Serial.println("[TTP] display off");
+      setDisplayPower(false);
+      displayManualOff = true;     // stays dark until touch/TTP/BLE wake
+    }
+  }
 
   delay(5);
 }
