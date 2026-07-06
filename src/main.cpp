@@ -1523,20 +1523,26 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     }
 
     // Exploration progress (data only; these events still get logged below)
+    bool explTouched = false;
     if (event == "FSSDiscoveryScan") {
       explorationHonk(doc["BodyCount"] | 0);
+      explTouched = true;
     } else if (event == "FSSAllBodiesFound") {
       explorationAllFound();
+      explTouched = true;
     } else if (event == "Scan") {
       explorationScan(doc["BodyID"] | -1,
                       doc["WasDiscovered"] | true,
                       doc["WasMapped"] | true);
+      explTouched = true;
     } else if (event == "SAAScanComplete") {
       explorationMapped(doc["BodyID"] | -1);
+      explTouched = true;
     }
-    // Panel refresh is cheap and deduped by the mutex - one call covers the
-    // whole block above rather than branching per event again.
-    updateContextPanel();
+    // Only refresh the panel when one of the exploration events above
+    // actually touched its state - avoids a refresh for every journal
+    // event (incl. high-volume FSSSignalDiscovered and replay entries).
+    if (explTouched) updateContextPanel();
 
     if (event == "CommunityGoal") {
       // Show player's percentile band for community goals
@@ -2475,8 +2481,8 @@ void updateJumpsRemaining(int newValue) {
   bool changed = status.nav.jumpsRemaining != newValue;
   status.nav.jumpsRemaining = newValue;
   if (changed && !replayingHistory) {  // no overlay animation for old events
-    pendingJumpOverlay = true;
     pendingJumpValue = newValue;
+    pendingJumpOverlay = true;
   }
 }
 

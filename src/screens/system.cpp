@@ -116,8 +116,8 @@ void create_settings_ui() {
   lv_obj_set_size(info_area, 250, CONTENT_H - 8);
   lv_obj_set_pos(info_area, 4, CONTENT_Y + 4);
   lv_obj_add_style(info_area, &style_panel, 0);
-  lv_obj_set_scrollbar_mode(info_area, LV_SCROLLBAR_MODE_OFF);
-  lv_obj_set_scroll_dir(info_area, LV_DIR_NONE);
+  lv_obj_set_scrollbar_mode(info_area, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_scroll_dir(info_area, LV_DIR_VER);
 
   sys_info_label = lv_label_create(info_area);
   lv_label_set_text(sys_info_label, "Loading...");

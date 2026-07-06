@@ -19,7 +19,7 @@ lv_obj_t *ctx_lines[4] = {nullptr};
 #define TIME_W   38
 #define SIDE_X   (EVENTS_W + TIME_W + 8)          // 272
 #define SIDE_W   (CONTENT_W - SIDE_X - 6)         // 168
-#define CTX_H    72
+#define CTX_H    76
 
 static lv_obj_t* rail(lv_obj_t *parent, const char *txt, int x, int y, int w) {
   lv_obj_t *l = lv_label_create(parent);
