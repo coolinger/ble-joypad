@@ -519,21 +519,22 @@ static void updatePinnedSidebarUnlocked() {
   for (int i = 0; i < pinnedBodyCount; i++) {
     PinnedBody &pb = pinnedBodies[i];
     if (near == &pinnedBodies[i]) continue;  // shown on the card instead
-    // BIO lists bodies with OPEN bio signals, "label(open)". A body whose
-    // bio is fully analysed but still has geo moves to the GEO line.
+    // Membership per category (a body with bio AND geo appears in BOTH
+    // lines). BIO lists open bio signals as "label(open)"; a body whose bio
+    // is fully analysed drops out of BIO but stays in GEO/OTH.
     int bioOpen = pb.bio - pb.bioDone;
     if (bioOpen < 0) bioOpen = 0;
-    int c = (bioOpen > 0) ? 0 : (pb.geo > 0) ? 1 : 2;
     char lbl[16];
     compactBodyLabel(pb.name, lbl, sizeof(lbl));
-    if (lens[c] < (int)sizeof(lines[c]) - 1) {
-      if (c == 0)
-        lens[c] += snprintf(lines[c] + lens[c], sizeof(lines[c]) - lens[c],
-                            " %s(%d)", lbl, bioOpen);
-      else
-        lens[c] += snprintf(lines[c] + lens[c], sizeof(lines[c]) - lens[c],
-                            " %s", lbl);
-    }
+    if (bioOpen > 0 && lens[0] < (int)sizeof(lines[0]) - 1)
+      lens[0] += snprintf(lines[0] + lens[0], sizeof(lines[0]) - lens[0],
+                          " %s(%d)", lbl, bioOpen);
+    if (pb.geo > 0 && lens[1] < (int)sizeof(lines[1]) - 1)
+      lens[1] += snprintf(lines[1] + lens[1], sizeof(lines[1]) - lens[1],
+                          " %s", lbl);
+    if (pb.other > 0 && lens[2] < (int)sizeof(lines[2]) - 1)
+      lens[2] += snprintf(lines[2] + lens[2], sizeof(lines[2]) - lens[2],
+                          " %s", lbl);
   }
   for (int c = 0; c < 3; c++) {
     if (!cat_lines[c]) continue;
