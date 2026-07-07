@@ -40,6 +40,30 @@ struct BioscanInfo {
   int totalScans = 0;
 };
 
+// Per-system exploration progress (reset on hyperspace jump, like the pins).
+// "first*" counters rely on Scan.WasDiscovered / Scan.WasMapped, which
+// describe what Universal Cartographics knew BEFORE the player's scan.
+struct ExplorationInfo {
+  bool honked = false;        // FSSDiscoveryScan seen
+  bool allFound = false;      // FSSAllBodiesFound
+  int  bodyCount = 0;         // FSSDiscoveryScan.BodyCount
+  int  scanned = 0;           // unique Scan BodyIDs
+  int  mapped = 0;            // unique SAAScanComplete BodyIDs
+  int  firstDiscovered = 0;   // scans with WasDiscovered == false
+  int  firstMapped = 0;       // maps of bodies whose Scan had WasMapped == false
+  uint8_t stationsL = 0;      // largest pad L (Coriolis/Orbis/Ocellus/Asteroid/MegaShip)
+  uint8_t stationsM = 0;      // largest pad M (Outpost)
+  uint8_t carriers = 0;       // FleetCarrier
+  // System-wide signal tally (FSSBodySignals/SAASignalsFound, deduped per
+  // body). Independent of the pinned-body registry so header totals survive
+  // auto-unpins of completed bodies.
+  uint8_t sigBodies = 0;      // bodies with any signal
+  int  sigBio = 0;            // biological signals total
+  int  sigGeo = 0;            // geological signals total
+  int  sigOther = 0;          // everything else (human/thargoid/guardian/...)
+  int  bioAnalysed = 0;       // genuses completed (ScanOrganic "Analyse")
+};
+
 struct EventLogEntry {
   char text[55];
   uint32_t timestamp;
@@ -60,6 +84,7 @@ struct StatusModel {
   NavRouteInfo nav;
   BackpackInfo backpack;
   BioscanInfo bioscan;
+  ExplorationInfo exploration;
   float shieldsPercent = 0.0f;
 
   String currentSystem;
@@ -75,6 +100,9 @@ struct StatusModel {
   bool inTaxi = false;
   bool inMulticrew = false;
   long credits = 0;
+  // Body whose gravity well the player is in (ApproachBody/LeaveBody journal
+  // events; the DSS probe scan starts there). -1 = none.
+  int nearBodyId = -1;
   std::vector<CommunityGoal> communityGoals;
 };
 
@@ -92,11 +120,13 @@ extern bool blinkScreen;
 extern int blinkCount;
 extern uint32_t lastBlinkTime;
 
-// Bodies with FSS/DSS-detected signals, pinned at the top of the log view
-// until the ship leaves the system (jump/shutdown). bioDone counts organisms
-// fully analysed (3 samples -> ScanOrganic "Analyse") against the biological
-// signal count. Per-genus scan progress is tracked for the detail line.
-#define MAX_PINNED_BODIES 4
+// Registry of bodies with FSS/DSS-detected signals, kept until the ship
+// leaves the system (jump/shutdown). Sized so a signal-rich system fits
+// whole (15 signal bodies seen in the wild); rendering decides what to show.
+// bioDone counts organisms fully analysed (3 samples -> ScanOrganic
+// "Analyse") against the biological signal count. Per-genus scan progress is
+// tracked for the detail line.
+#define MAX_PINNED_BODIES 16
 #define MAX_GENUSES 8
 
 enum BioScanState : uint8_t {
@@ -112,7 +142,10 @@ struct BioGenus {
 
 struct PinnedBody {
   int bodyId = -1;   // journal BodyID (matches ScanOrganic "Body")
-  char label[20];    // body identifier within the system, e.g. "A 1"
+  // FULL journal BodyName. Shortening to the in-system id ("5 b a") happens
+  // at RENDER time against the then-current system name - pins created while
+  // the system name was still unknown (boot replay) self-heal that way.
+  char name[44];
   int bio = 0;
   int geo = 0;
   int other = 0;
@@ -123,12 +156,24 @@ struct PinnedBody {
 extern PinnedBody pinnedBodies[MAX_PINNED_BODIES];
 extern int pinnedBodyCount;
 
-void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other);
+void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int other);
 void addPinnedGenus(int bodyId, const char* name);  // from SAASignalsFound Genuses
 // ScanOrganic progress: scanType is "Log" (1st sample), "Sample" (2nd/3rd)
 // or "Analyse" (complete). Updates genus states and bioDone.
 void organicScanProgress(int bodyId, const char* genusName, const char* scanType);
 void clearPinnedBodies();
+
+// Exploration progress API (implementation in gamedata.cpp; dedupe backing
+// bitmaps are file-static there).
+void explorationReset();
+void explorationHonk(int bodyCount);
+void explorationAllFound();
+void explorationScan(int bodyId, bool wasDiscovered, bool wasMapped);
+void explorationMapped(int bodyId);
+bool explorationStation(const char* signalName, const char* signalType);
+// System-wide signal tally from FSSBodySignals/SAASignalsFound (deduped by
+// BodyID, so a later DSS re-announcement doesn't double-count).
+void explorationSignals(int bodyId, int bio, int geo, int other);
 
 // Small API helpers
 void updateJumpsRemaining(int newValue);

@@ -8,7 +8,6 @@
 #include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
-#include <ArduinoOTA.h>
 #include <esp_heap_caps.h>
 #include <algorithm>
 #include "sound.h"
@@ -17,6 +16,7 @@
 #include "screens/fighter.h"
 #include "screens/info.h"
 #include "screens/system.h"
+#include "screens/shell.h"
 // I2S: new IDF "std" driver (driver/i2s_std.h). Migrated off the legacy
 // driver/i2s.h so the legacy<->new "CONFLICT" runtime error can't occur and the
 // deprecation warnings are gone. The TX channel handle (i2s_tx_chan) is created
@@ -43,6 +43,21 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 // Audio clocking constants now in sound.h
 
 #include "colors.h"
+
+// ArduinoJson allocator that pins document pools to PSRAM. The default
+// malloc prefers INTERNAL ram for small pool chunks, so parsing a ~100 KB
+// getLogEntries response drained the internal heap - concurrently, any
+// lazy lock-init on core 0 (lwIP/newlib) failed its allocation -> abort().
+struct SpiRamJsonAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t n) override {
+    return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  void deallocate(void* p) override { heap_caps_free(p); }
+  void* reallocate(void* p, size_t n) override {
+    return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+};
+static SpiRamJsonAllocator jsonPsram;
 #include "theme.h"
 
 // Global flags
@@ -85,7 +100,6 @@ uint32_t wsReconnectDelayMs = 3000;           // start with 3s backoff
 const uint32_t WS_RECONNECT_DELAY_MAX = 60000; // cap at 60s
 uint32_t wsLastPing = 0;
 uint32_t wsLastPong = 0;
-bool otaInitialized = false;
 
 // Task handle for Core 0
 TaskHandle_t msgTaskHandle = NULL;
@@ -101,7 +115,6 @@ const char ignoreEvent_Materials[] PROGMEM = "Materials";
 const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
 const char ignoreEvent_Missions[] PROGMEM = "Missions";
-const char ignoreEvent_FSSSignalDiscovered[] PROGMEM = "FSSSignalDiscovered";
 
 const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Music,
@@ -112,8 +125,7 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Materials,
   ignoreEvent_MaterialCollected,
   ignoreEvent_ShipLocker,
-  ignoreEvent_Missions,
-  ignoreEvent_FSSSignalDiscovered
+  ignoreEvent_Missions
 };
 const int ignoreJournalEventsCount = sizeof(ignoreJournalEvents) / sizeof(ignoreJournalEvents[0]);
 
@@ -159,9 +171,14 @@ bool displayDimmed = false;                 // true while at BL_DUTY_DIM
 // (touch / page button / BLE reconnect) wakes it through wakeDisplay().
 bool displayManualOff = false;
 
-// FSSBodySignals: one short beep per detected signal. Incremented by the WS
-// task (handleEliteEvent), drained evenly spaced by loop() on core 1.
-volatile int pendingSignalBeeps = 0;
+// FSSBodySignals: one short ping per detected signal, pitched by category
+// (bio 1800 Hz, geo 900 Hz, other 1400 Hz). Incremented by the WS task
+// (handleEliteEvent), drained evenly spaced by loop() on core 1.
+volatile int pendingBioBeeps = 0;
+volatile int pendingGeoBeeps = 0;
+volatile int pendingOtherBeeps = 0;
+// Set by the WS task when a Scan yields a first discovery; loop() plays the chime.
+volatile bool pendingFirstDiscBeep = false;
 
 // History replay (getLogEntries after boot): rebuilds log/pins/system state
 // from the most recent journal entries. While replayingHistory is set, the
@@ -190,6 +207,7 @@ bool wifiWasConnected = false;
 // WiFi/WebSocket calls never stall rendering or the core-0 message task.
 bool reqRestartWifi = false;
 bool reqRestartWebSocket = false;
+volatile int reqPageSwitch = -1;  // set by the shell tab rail (LVGL cb), serviced in loop()
 uint32_t lastWifiStatusPrint = 0;
 const uint32_t WIFI_STATUS_PRINT_INTERVAL = 30000; // Print every 30 seconds
 
@@ -262,69 +280,51 @@ void printHeapStatus(const char* location) {
     location, freePSRAM, totalPSRAM, (freePSRAM * 100.0 / totalPSRAM), freeInternal);
 }
 
-void updateCargoBar() {
-  if (!cargo_bar) return;
-  
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    int total = status.cargo.totalCapacity;
-  int used = status.cargo.usedSpace;
-  int drones = status.cargo.dronesCount;
-  int cargo = status.cargo.cargoCount;
-  int free = total - used;
-  
-  lv_bar_set_range(cargo_bar, 0, total);
-  lv_bar_set_value(cargo_bar, used, LV_ANIM_OFF);
-  
-  // Update label
-  lv_obj_t* label = lv_obj_get_child(cargo_bar, 0);
-  if (label) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Cargo: %d/%d (Drones: %d)", used, total, drones);
-    lv_label_set_text(label, buf);
-  }
-    
-    xSemaphoreGive(lvglMutex);
-  }
-}
-
-void updateBackpackDisplay() {
-  if (!medpack_label || !energycell_label) return;
+// Context panel: BACKPACK while on foot, EXPLORATION otherwise.
+void updateContextPanel() {
+  if (!ctx_panel) return;
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    char buf[8];
+    // NOTE: ctx_lines use Montserrat (ASCII only) - keep these strings ASCII
+    // (no "·"/"—" typographic characters, they would render as blanks).
+    char line[48];
+    if (status.onFoot) {
+      lv_label_set_text(ctx_rail_label, "BACKPACK / ON FOOT");
+      snprintf(line, sizeof(line), "Med %d   Cell %d",
+               status.backpack.healthpack, status.backpack.energycell);
+      lv_label_set_text(ctx_lines[0], line);
+      snprintf(line, sizeof(line), "Bio-Daten %d", status.bioscan.totalScans);
+      lv_label_set_text(ctx_lines[1], line);
+      lv_label_set_text(ctx_lines[2], "");
+      lv_label_set_text(ctx_lines[3], "");
+      lv_obj_set_style_text_color(ctx_lines[2], LV_COLOR_FG, 0);
+    } else {
+      ExplorationInfo &x = status.exploration;
+      lv_label_set_text(ctx_rail_label, "EXPLORATION");
 
-    // The backpack only exists on foot: hide the whole panel otherwise
-    if (backpack_panel) {
-      if (status.onFoot) lv_obj_remove_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
-      else lv_obj_add_flag(backpack_panel, LV_OBJ_FLAG_HIDDEN);
-    }
+      if (!x.honked) snprintf(line, sizeof(line), "HONK -   BODIES -");
+      else if (x.allFound) snprintf(line, sizeof(line), "HONK OK  BODIES %d/%d OK", x.bodyCount, x.bodyCount);
+      else snprintf(line, sizeof(line), "HONK OK  BODIES %d", x.bodyCount);
+      lv_label_set_text(ctx_lines[0], line);
 
-    // Update medpack count
-    snprintf(buf, sizeof(buf), "%d", status.backpack.healthpack);
-    lv_label_set_text(medpack_label, buf);
-    
-    // Update energycell count
-    snprintf(buf, sizeof(buf), "%d", status.backpack.energycell);
-    lv_label_set_text(energycell_label, buf);
-    
-    // Update bioscan count if available
-    if (bioscan_label) {
-      snprintf(buf, sizeof(buf), "%d", status.bioscan.totalScans);
-      lv_label_set_text(bioscan_label, buf);
-      
-      if (status.bioscan.totalScans > 0) {
-        lv_obj_remove_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
-        if (bioscan_data_label) {
-          lv_obj_remove_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
-        }
-      } else {
-        lv_obj_add_flag(bioscan_label, LV_OBJ_FLAG_HIDDEN);
-        if (bioscan_data_label) {
-          lv_obj_add_flag(bioscan_data_label, LV_OBJ_FLAG_HIDDEN);
-        }
+      snprintf(line, sizeof(line), "SCAN %d   MAP %d", x.scanned, x.mapped);
+      lv_label_set_text(ctx_lines[1], line);
+
+      snprintf(line, sizeof(line), "FIRST: DISC %d  MAP %d", x.firstDiscovered, x.firstMapped);
+      lv_label_set_text(ctx_lines[2], line);
+      lv_obj_set_style_text_color(ctx_lines[2],
+          (x.firstDiscovered + x.firstMapped) > 0 ? LV_COLOR_HIGHLIGHT_BG : LV_COLOR_DIM, 0);
+
+      int st = x.stationsL + x.stationsM + x.carriers;
+      if (st == 0) snprintf(line, sizeof(line), "STATIONS -");
+      else {
+        int l2 = snprintf(line, sizeof(line), "STATIONS");
+        if (x.stationsL) l2 += snprintf(line + l2, sizeof(line) - l2, " %dL", x.stationsL);
+        if (x.stationsM) l2 += snprintf(line + l2, sizeof(line) - l2, " %dM", x.stationsM);
+        if (x.carriers)  l2 += snprintf(line + l2, sizeof(line) - l2, " %dFC", x.carriers);
       }
+      lv_label_set_text(ctx_lines[3], line);
     }
-    
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -344,7 +344,7 @@ void update_wifi_icon_unlocked() {
         lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0xFF0000), 0);  // red - Weak
       }
     } else {
-      lv_obj_set_style_text_color(wifi_icon, lv_color_hex(0x000000), 0);  // black - No connection
+      lv_obj_set_style_text_color(wifi_icon, LV_COLOR_HAIRLINE, 0);  // off - No connection
     }
   }
 }
@@ -352,9 +352,9 @@ void update_bluetooth_icon_unlocked() {
     // Update Bluetooth icon
   if (bluetooth_icon) {
     if (bleGamepad && bleGamepad->isConnected()) {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
+      lv_obj_set_style_text_color(bluetooth_icon, LV_COLOR_FG, 0);  // connected
     } else {
-      lv_obj_set_style_text_color(bluetooth_icon, lv_color_hex(0x000000), 0);  // black - not connected
+      lv_obj_set_style_text_color(bluetooth_icon, LV_COLOR_HAIRLINE, 0);  // off - not connected
     }
   }
 }
@@ -375,36 +375,31 @@ void update_bluetooth_icon() {
 }
 
 void updateHeader() {
-  if (!header_label) return;
-  
+  if (!shell_jumps_label) return;
+
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    char buf[64];
-  snprintf(buf, sizeof(buf), "Jumps: %d", status.nav.jumpsRemaining);
-  lv_label_set_text(header_label, buf);
-  
-  // Update fuel bar
-  if (fuel_bar) {
-    float fuelPercent = (fuelInfo.fuelCapacity > 0) ? 
-      (status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0.0f;
-    lv_bar_set_value(fuel_bar, (int)fuelPercent, LV_ANIM_OFF);
-  }
-  
-  // Update hull bar
-  if (hull_bar) {
-    lv_bar_set_value(hull_bar, (int)(status.hull.hullHealth * 100.0f), LV_ANIM_OFF);
-  }
+    lv_label_set_text_fmt(shell_jumps_label, "%d", status.nav.jumpsRemaining);
 
-  update_wifi_icon_unlocked();
-  // Update WebSocket icon
-  if (websocket_icon) {
-    if (useWebSocket && wsClient.available()) {
-      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0xFFFFFF), 0);  // white - connected
-    } else {
-      lv_obj_set_style_text_color(websocket_icon, lv_color_hex(0x000000), 0);  // black - not connected
+    int fuelPct = (status.fuel.fuelCapacity > 0)
+        ? (int)(status.fuel.fuelMain / status.fuel.fuelCapacity * 100.0f) : 0;
+    lv_arc_set_value(shell_fuel_arc, fuelPct);
+    lv_label_set_text_fmt(shell_fuel_label, "%d%%", fuelPct);
+
+    int hullPct = (int)(status.hull.hullHealth * 100.0f);
+    lv_arc_set_value(shell_hull_arc, hullPct);
+    lv_label_set_text_fmt(shell_hull_label, "%d%%", hullPct);
+    lv_obj_set_style_text_color(shell_hull_label,
+        hullPct <= 25 ? LV_COLOR_WARNING_FG : LV_COLOR_VALUE, 0);
+
+    lv_label_set_text_fmt(shell_cargo_label, "%d/%d",
+        status.cargo.usedSpace, status.cargo.totalCapacity);
+
+    update_wifi_icon_unlocked();
+    if (websocket_icon) {
+      lv_obj_set_style_text_color(websocket_icon,
+          (useWebSocket && wsClient.available()) ? LV_COLOR_FG : LV_COLOR_HAIRLINE, 0);
     }
-  }
-  update_bluetooth_icon_unlocked();
-
+    update_bluetooth_icon_unlocked();
 
     xSemaphoreGive(lvglMutex);
   }
@@ -414,12 +409,19 @@ void updateStatusLine() {
   if (!status_label) return;
 
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    // Just the current system name — this line is the "where am I" indicator,
-    // everything else already lives in the header bars / log.
     const char* system = status.currentSystem.length()
                              ? status.currentSystem.c_str()
                              : "Waiting for events...";
     lv_label_set_text(status_label, system);
+
+    const char* mode = "";
+    if (status.onFoot) mode = "ON FOOT";
+    else if (status.inSrv) mode = "SRV";
+    else if (status.inTaxi) mode = "TAXI";
+    else if (status.docked) mode = "DOCKED";
+    else if (status.inShip) mode = "SHIP";
+    if (shell_mode_label) lv_label_set_text(shell_mode_label, mode);
+
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -427,30 +429,76 @@ void updateStatusLine() {
 static char* logText = nullptr;  // Allocated on heap
 static const int LOG_TEXT_SIZE = 2048;  // Large buffer with PSRAM for more log entries
 
-// Fill the sidebar pin cards from pinnedBodies[]. Caller MUST hold lvglMutex
-// (the mutex is not recursive - never call this from outside updateLogDisplay
-// without taking the mutex yourself).
-static void updatePinnedSidebarUnlocked() {
-  for (int i = 0; i < MAX_PINNED_BODIES; i++) {
-    if (!pin_cards[i]) return;
-    if (i >= pinnedBodyCount) {
-      lv_obj_add_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
-      continue;
-    }
-    PinnedBody &pb = pinnedBodies[i];
-    lv_obj_remove_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
+static void shortBodyLabel(const char* bodyName, char* out, size_t outLen);
 
+// Render-time body label: system prefix stripped against the CURRENT system
+// name (labels self-heal once it becomes known) and inner spaces removed,
+// matching the in-game shorthand: "... 5 b a" -> "5ba".
+static void compactBodyLabel(const char* bodyName, char* out, size_t outLen) {
+  char tmp[28];
+  shortBodyLabel(bodyName, tmp, sizeof(tmp));
+  // Strip inner spaces into a scratch buffer first ...
+  char packed[28];
+  size_t o = 0;
+  for (const char* q = tmp; *q && o < sizeof(packed) - 1; q++) {
+    if (*q != ' ') packed[o++] = *q;
+  }
+  packed[o] = '\0';
+  if (o == 0) { snprintf(out, outLen, "?"); return; }
+  // ... then keep the TAIL if it doesn't fit: the end of a body name is the
+  // distinctive part ("...b21-1 5 b"), the head is the system prefix.
+  const char* p = (o >= outLen) ? packed + (o - (outLen - 1)) : packed;
+  snprintf(out, outLen, "%s", p);
+}
+
+// Fill the SIGNALS sidebar from pinnedBodies[] + status.exploration. Caller
+// MUST hold lvglMutex (the mutex is not recursive - never call this from
+// outside updateLogDisplay without taking the mutex yourself).
+// Layout: dynamic header tally, ONE detail card for the body currently in
+// gravity influence (status.nearBodyId), compact per-category body lists.
+static void updatePinnedSidebarUnlocked() {
+  if (!signals_rail_label || !near_card) return;
+
+  // ---- header: system-wide tally (independent of the registry) ----
+  ExplorationInfo &x = status.exploration;
+  if (x.sigBodies == 0) {
+    lv_label_set_text(signals_rail_label, "SIGNALS");
+  } else {
+    int bioOpen = x.sigBio - x.bioAnalysed;
+    if (bioOpen < 0) bioOpen = 0;
+    char hdr[40];
+    int hl = snprintf(hdr, sizeof(hdr), "SIGNALS %d", x.sigBodies);
+    if (x.sigBio > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  B%d", bioOpen);
+    if (x.sigGeo > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  G%d", x.sigGeo);
+    if (x.sigOther > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  O%d", x.sigOther);
+    lv_label_set_text(signals_rail_label, hdr);
+  }
+
+  // ---- detail card: only for the body we are orbiting/approaching ----
+  PinnedBody *near = nullptr;
+  if (status.nearBodyId >= 0) {
+    for (int i = 0; i < pinnedBodyCount; i++) {
+      if (pinnedBodies[i].bodyId == status.nearBodyId) { near = &pinnedBodies[i]; break; }
+    }
+  }
+  if (near) {
+    PinnedBody &pb = *near;
     bool bioComplete = (pb.bio > 0 && pb.bioDone >= pb.bio);
+    char lbl[16];
+    compactBodyLabel(pb.name, lbl, sizeof(lbl));
     char t[64];
-    int l = snprintf(t, sizeof(t), "%s", pb.label);
+    int l = snprintf(t, sizeof(t), "%s", lbl);
     if (pb.bio > 0 && l < (int)sizeof(t))
       l += snprintf(t + l, sizeof(t) - l, "  Bio %d/%d", pb.bioDone, pb.bio);
     if (pb.geo > 0 && l < (int)sizeof(t))
       l += snprintf(t + l, sizeof(t) - l, "  Geo %d", pb.geo);
     if (pb.other > 0 && l < (int)sizeof(t))
       l += snprintf(t + l, sizeof(t) - l, "  Sig %d", pb.other);
-    lv_label_set_text(pin_title_labels[i], t);
-    lv_obj_set_style_text_color(pin_title_labels[i],
+    lv_label_set_text(near_title_label, t);
+    lv_obj_set_style_text_color(near_title_label,
         bioComplete ? lv_color_hex(0xc6e6dc) : lv_color_hex(0xffb000), 0);
 
     if (pb.genusCount > 0) {
@@ -463,23 +511,65 @@ static void updatePinnedSidebarUnlocked() {
         else if (pb.genuses[gi].state == BIO_DONE) col = "4169e1";
         gl += snprintf(g + gl, sizeof(g) - gl, "#%s %s# ", col, pb.genuses[gi].name);
       }
-      lv_label_set_text(pin_genus_labels[i], g);
-      lv_obj_remove_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(near_genus_label, g);
+      lv_obj_remove_flag(near_genus_label, LV_OBJ_FLAG_HIDDEN);
     } else {
-      lv_obj_add_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(near_genus_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_remove_flag(near_card, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(near_card, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- category lines: which bodies (counts live in the header) ----
+  // Registry is sorted bio-first, so the BIO line lists them in rank order.
+  static const char *catPrefix[3] = {"BIO:", "GEO:", "OTH:"};
+  char lines[3][192];
+  int lens[3];
+  for (int c = 0; c < 3; c++) {
+    lens[c] = snprintf(lines[c], sizeof(lines[c]), "%s", catPrefix[c]);
+  }
+  for (int i = 0; i < pinnedBodyCount; i++) {
+    PinnedBody &pb = pinnedBodies[i];
+    if (near == &pinnedBodies[i]) continue;  // shown on the card instead
+    // Membership per category (a body with bio AND geo appears in BOTH
+    // lines). BIO lists open bio signals as "label(open)"; a body whose bio
+    // is fully analysed drops out of BIO but stays in GEO/OTH.
+    int bioOpen = pb.bio - pb.bioDone;
+    if (bioOpen < 0) bioOpen = 0;
+    char lbl[16];
+    compactBodyLabel(pb.name, lbl, sizeof(lbl));
+    if (bioOpen > 0 && lens[0] < (int)sizeof(lines[0]) - 1)
+      lens[0] += snprintf(lines[0] + lens[0], sizeof(lines[0]) - lens[0],
+                          " %s(%d)", lbl, bioOpen);
+    if (pb.geo > 0 && lens[1] < (int)sizeof(lines[1]) - 1)
+      lens[1] += snprintf(lines[1] + lens[1], sizeof(lines[1]) - lens[1],
+                          " %s", lbl);
+    if (pb.other > 0 && lens[2] < (int)sizeof(lines[2]) - 1)
+      lens[2] += snprintf(lines[2] + lens[2], sizeof(lines[2]) - lens[2],
+                          " %s", lbl);
+  }
+  for (int c = 0; c < 3; c++) {
+    if (!cat_lines[c]) continue;
+    bool has = lens[c] > (int)strlen(catPrefix[c]);
+    if (has) {
+      lv_label_set_text(cat_lines[c], lines[c]);
+      lv_obj_remove_flag(cat_lines[c], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(cat_lines[c], LV_OBJ_FLAG_HIDDEN);
     }
   }
 }
 
 void updateLogDisplay() {
   if (!log_label || !logText) return;  // Check logText is allocated
-  
+
   // Print heap status before display update
   static int updateCount = 0;
   if (updateCount++ % 10 == 0) {  // Every 10th update
     printHeapStatus("before display");
   }
-  
+
   // Take mutex before accessing LVGL objects
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
     // Clear buffer safely
@@ -501,12 +591,9 @@ void updateLogDisplay() {
       
       // Validate entry has text
       if (eventLog[idx].text[0] == 0) {
-        Serial.printf("  [%d] idx=%d: <empty>\n", i, idx);
         continue;
       }
-      
-      Serial.printf("  [%d] idx=%d: %s\n", i, idx, eventLog[idx].text);
-      
+
       // Calculate space needed for this entry
       int textLen = strnlen(eventLog[idx].text, sizeof(eventLog[idx].text));
       int countPrefixLen = 0;
@@ -551,10 +638,14 @@ void updateLogDisplay() {
     // Ensure null termination
     logText[LOG_TEXT_SIZE - 1] = '\0';
     
-    // Update label - this is where LVGL might run out of memory
-    Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
-    lv_label_set_text(log_label, logText);
-    
+    // Only touch the label when the content really changed: lv_label_set_text
+    // invalidates (= full redraw of the log area) even for identical text,
+    // which would make the periodic 5 s UI tick needlessly expensive.
+    if (strcmp(lv_label_get_text(log_label), logText) != 0) {
+      Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
+      lv_label_set_text(log_label, logText);
+    }
+
     xSemaphoreGive(lvglMutex);
     
     // Print heap after display update
@@ -656,7 +747,7 @@ void updateSystemInfo() {
       mode = "In Ship";
     }
     
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
       "FW: " __DATE__ " " __TIME__ "\n\n"
       "Memory:\n"
@@ -680,6 +771,7 @@ void updateSystemInfo() {
       "  Cargo: %d/%d (Drones: %d)\n"
       "  Backpack: H%d E%d\n"
       "  Bioscans: %d\n\n"
+      "  Expl: %s B:%d S:%d M:%d 1st:%d/%d St:%dL %dM %dFC\n\n"
       "Task Stack Free: %d bytes\n\n"
       "Uptime: %lu sec",
       freeInternal / 1024,
@@ -698,6 +790,10 @@ void updateSystemInfo() {
       status.cargo.usedSpace, status.cargo.totalCapacity, status.cargo.dronesCount,
       status.backpack.healthpack, status.backpack.energycell,
       status.bioscan.totalScans,
+      status.exploration.honked ? (status.exploration.allFound ? "HONK+ALL" : "HONK") : "-",
+      status.exploration.bodyCount, status.exploration.scanned, status.exploration.mapped,
+      status.exploration.firstDiscovered, status.exploration.firstMapped,
+      status.exploration.stationsL, status.exploration.stationsM, status.exploration.carriers,
       stackHighWater * 4,
       millis() / 1000);
     
@@ -712,22 +808,35 @@ void switchToPage(int page) {
       if (!fighter_screen) {
         create_fighter_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(fighter_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(fighter_screen);
+#endif
       currentPage = 0;
     } else if (page == 1) {
       if (!logviewer_screen) {
         create_logviewer_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(logviewer_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(logviewer_screen);
+#endif
       currentPage = 1;
     } else if (page == 2) {
       if (!settings_screen) {
         create_settings_ui();
       }
+#if PAGE_FADE_MS > 0
+      lv_screen_load_anim(settings_screen, LV_SCR_LOAD_ANIM_FADE_IN, PAGE_FADE_MS, 0, false);
+#else
       lv_screen_load(settings_screen);
+#endif
       currentPage = 2;
     }
 
+    shell_set_active_tab(page);
     xSemaphoreGive(lvglMutex);
   }
   // Populate the page's widgets after releasing lvglMutex: these update
@@ -736,10 +845,9 @@ void switchToPage(int page) {
   // no-op (~100-200ms frozen UI per call, updates never applied).
   if (page == 1) {
     // Don't call updateLogDisplay here - it will update when events arrive
-    updateCargoBar();
     updateHeader();
     updateStatusLine();
-    updateBackpackDisplay();
+    updateContextPanel();
   } else if (page == 2) {
     updateSystemInfo();
   }
@@ -788,8 +896,6 @@ void requestSummary();
 void connectWebSocket();
 void updateJumpsRemaining(int newValue);
 void showJumpOverlay(int jumps);
-void showPageOverlay(const char* name);
-static void startOtaIfNeeded();
 
 void checkDisplayTimeout()
 {
@@ -829,8 +935,6 @@ void checkWifiConnection() {
       Serial.println(WiFi.localIP());
       beepConnect();
       wifiWasConnected = true;
-
-      startOtaIfNeeded();
 
       // Connect to Icarus terminal websocket as soon as WiFi is up
       delay(200);
@@ -882,33 +986,6 @@ static bool cargoHasSymbol(const char* symbol) {
   return false;
 }
 
-static void startOtaIfNeeded() {
-  if (otaInitialized) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("[OTA] End");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    static unsigned int lastPct = 0;
-    unsigned int pct = (progress * 100U) / total;
-    if (pct != lastPct) {
-      Serial.printf("[OTA] %u%%\n", pct);
-      lastPct = pct;
-    }
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("[OTA] Error %u\n", error);
-  });
-
-  ArduinoOTA.begin();
-  otaInitialized = true;
-  Serial.println("[OTA] Ready (use WiFi IP above)");
-}
 
 // Helper function to replace umlauts with double vowels
 void replaceUmlauts(char* str) {
@@ -925,11 +1002,12 @@ void replaceUmlauts(char* str) {
 }
 
 // Forward declaration
-void handleEliteEvent(const String& eventType, JsonDocument& doc);
+void handleEliteEvent(const String& eventType, JsonVariant doc);
 void requestCmdrStatusWs();
 void requestShipStatusWs();
 void requestLoadingStatusWs();
 void requestLogEntriesWs(int count);
+void requestSystemWs();
 void requestCmdrProfileWs();
 void requestNavRouteWs();
 static void requestAllStatusOnce();
@@ -947,13 +1025,16 @@ void onWebSocketMessage(WebsocketsMessage message) {
     return;
   }
 
-  String data = message.data();
-  
-  //Serial.printf("[WS] Received %d bytes\n", data.length());
-  
+  // Parse straight from the library's internal std::string. Arduino String
+  // silently caps out around 64 KB (31 KB responses convert fine, a 106 KB
+  // getLogEntries payload came back as an EMPTY String despite 7 MB free
+  // PSRAM) - and the String detour cost two full-size copies anyway.
+  const websockets::WSString& raw = message.rawData();
+
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
-  JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, data, DeserializationOption::NestingLimit(40));
+  JsonDocument doc(&jsonPsram);  // pools in PSRAM: keep internal RAM for lwIP
+  DeserializationError error = deserializeJson(doc, raw.c_str(), raw.size(),
+                                               DeserializationOption::NestingLimit(40));
   
   if (error) {
     Serial.printf("[WS] JSON parse error: %s\n", error.c_str());
@@ -974,7 +1055,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
     if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
       String eventType = "JOURNAL";  // Reuse existing journal handler
 
-      JsonDocument eventDoc;
+      JsonDocument eventDoc(&jsonPsram);
       eventDoc.set(msg);
 
       printHeapStatus("before handler");
@@ -1019,8 +1100,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
       if (msg["inMulticrew"].is<bool>()) status.inMulticrew = msg["inMulticrew"];
 
       updateHeader();
-      updateCargoBar();
-      updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+      updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     } else if (name && strcmp(name, "gameStateChange") == 0) {
       Serial.println("[WS] gameStateChange broadcast received, refreshing state");
       requestShipStatusWs();
@@ -1031,12 +1111,27 @@ void onWebSocketMessage(WebsocketsMessage message) {
                     complete, (bool)(msg["loadingInProgress"] | false));
       if (complete && !historyRequested && !historyLoaded) {
         historyRequested = true;
-        // 50, not 100 like the web client: the ~100 KB response of count=100
-        // crashed the network stack (abort on core 0, lwIP/String assembly in
-        // internal RAM). 50 (~50 KB) is proven stable. Trade-off: a spammy
-        // on-foot session can push FSSBodySignals out of the window - re-scan
-        // the body (FSS/DSS) to re-pin it.
-        requestLogEntriesWs(50);
+        // 100 like the web client. History: count=100 (~100 KB response)
+        // crashed the OLD platform (abort on core 0, lwIP/String assembly in
+        // internal RAM) and was lowered to 50. The current platform has
+        // SPIRAM_USE_MALLOC (boot log: heap ~8 MB), so big String buffers
+        // land in PSRAM - if the abort ever returns, drop back to 50.
+        // A bigger window matters: exploration sessions push ScanOrganic/
+        // FSSBodySignals pairs apart, losing bio progress on reboot.
+        requestLogEntriesWs(100);
+      }
+    } else if (name && strcmp(name, "getSystem") == 0 && !msg.isNull()) {
+      // Current-system fallback: only adopt the name while we know nothing —
+      // live journal events stay the authoritative source.
+      const char* sysName = msg["name"] | "";
+      if (sysName[0] && strcmp(sysName, "Unknown") != 0 &&
+          status.currentSystem.length() == 0) {
+        status.currentSystem = sysName;
+        Serial.printf("[WS] getSystem: current system = %s\n", sysName);
+        updateStatusLine();
+        // Body labels are shortened against the system name at render time:
+        // re-render the sidebar so pins from the replay heal immediately.
+        updateLogDisplay();
       }
     } else if (name && strcmp(name, "getLogEntries") == 0 && msg.is<JsonArray>()) {
       // Recent journal entries, newest first. Replay oldest-first so the final
@@ -1046,9 +1141,12 @@ void onWebSocketMessage(WebsocketsMessage message) {
       Serial.printf("[WS] Replaying %d journal history entries\n", n);
       replayingHistory = true;
       for (int i = n - 1; i >= 0; i--) {
-        JsonDocument eventDoc;
-        eventDoc.set(entries[i]);
-        handleEliteEvent("JOURNAL", eventDoc);
+        // View into the (PSRAM-backed) response document - the previous
+        // per-entry deep copies churned ~1 KB internal-RAM allocations x100
+        // while lwIP on core 0 needed the same heap: abort() races at boot.
+        handleEliteEvent("JOURNAL", entries[i]);
+        // Let core 0 (WiFi/lwIP) drain its RX queue between entries.
+        vTaskDelay(1);
       }
       replayingHistory = false;
       historyLoaded = true;
@@ -1129,7 +1227,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
       }
 
       updateHeader();
-      updateCargoBar();
     } else if (name && strcmp(name, "getNavRoute") == 0 && !msg.isNull()) {
       Serial.println("[WS] Received NavRoute response");
       if (msg["jumpsToDestination"].is<int>()) {
@@ -1147,7 +1244,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
       // Commander info (name/rank) could be parsed here if needed
     } else {
       Serial.printf("[WS] Unhandled name message: %s\n", name ? name : "(null)");
-      Serial.println(data);
     }
 
     doc.clear();
@@ -1174,7 +1270,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   if (bleConnected && !displayManualOff) wakeDisplay();
   
   // Process event - reuse the doc to avoid extra allocations
-  JsonDocument eventDoc;
+  JsonDocument eventDoc(&jsonPsram);
   eventDoc.set(dataObj);
   
   printHeapStatus("before handler");
@@ -1279,7 +1375,9 @@ static void shortBodyLabel(const char* bodyName, char* out, size_t outLen) {
   snprintf(out, outLen, "%s", p);
 }
 
-void handleEliteEvent(const String& eventType, JsonDocument& doc) {
+// Takes a JsonVariant (view, not copy): live events pass their document,
+// the boot replay passes array elements of the big PSRAM-backed response.
+void handleEliteEvent(const String& eventType, JsonVariant doc) {
   static char logBuf[80];
   static char tempBuf[60];
   
@@ -1332,7 +1430,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
       
-      updateBackpackDisplay();
+      updateContextPanel();
     }
     return;
   } else if (eventType == "BIOSCAN") {
@@ -1346,7 +1444,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Just track total count, ignore variants
       status.bioscan.totalScans = count;
       Serial.printf("[BIOSCAN] Total scans: %d\n", status.bioscan.totalScans);
-      updateBackpackDisplay();
+      updateContextPanel();
     }
     return;
   } else if (eventType == "SUMMARY") {
@@ -1395,7 +1493,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     if (doc["inSrv"].is<bool>()) status.inSrv = doc["inSrv"];
     if (doc["inTaxi"].is<bool>()) status.inTaxi = doc["inTaxi"];
     if (doc["inMulticrew"].is<bool>()) status.inMulticrew = doc["inMulticrew"];
-    updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+    updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     
     // Update route jumps (now a single integer, not an object)
     if (!doc["route"].isNull()) {
@@ -1471,8 +1569,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     // Update all displays
     updateHeader();
     updateStatusLine();
-    updateCargoBar();
-    updateBackpackDisplay();
+    updateContextPanel();
     
     Serial.printf("[SUMMARY] Fuel: %.2f/%.2f (%.1f%%), Cargo: %d/%d (Drones: %d), Hull: %.1f%%, Jumps: %d\n",
       status.fuel.fuelMain, status.fuel.fuelCapacity,
@@ -1506,7 +1603,40 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         break;
       }
     }
-    
+
+    // Exploration progress (data only; these events still get logged below)
+    bool explTouched = false;
+    if (event == "FSSDiscoveryScan") {
+      explorationHonk(doc["BodyCount"] | 0);
+      explTouched = true;
+    } else if (event == "FSSAllBodiesFound") {
+      explorationAllFound();
+      explTouched = true;
+    } else if (event == "Scan") {
+      int prevFirst = status.exploration.firstDiscovered;
+      explorationScan(doc["BodyID"] | -1,
+                      doc["WasDiscovered"] | true,
+                      doc["WasMapped"] | true);
+      // First discovery (nobody scanned this body before): celebratory chime.
+      if (status.exploration.firstDiscovered > prevFirst && !replayingHistory)
+        pendingFirstDiscBeep = true;
+      explTouched = true;
+    } else if (event == "SAAScanComplete") {
+      explorationMapped(doc["BodyID"] | -1);
+      explTouched = true;
+    } else if (event == "ApproachBody") {
+      // Entered a body's gravity well: the sidebar shows its detail card.
+      // Both events still fall through to the generic log, whose
+      // updateLogDisplay refreshes the sidebar.
+      status.nearBodyId = doc["BodyID"] | -1;
+    } else if (event == "LeaveBody") {
+      status.nearBodyId = -1;
+    }
+    // Only refresh the panel when one of the exploration events above
+    // actually touched its state - avoids a refresh for every journal
+    // event (incl. high-volume FSSSignalDiscovered and replay entries).
+    if (explTouched) updateContextPanel();
+
     if (event == "CommunityGoal") {
       // Show player's percentile band for community goals
       if (!doc["CurrentGoals"].isNull()) {
@@ -1560,6 +1690,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       // Left the old system: pinned body signals are no longer relevant
       clearPinnedBodies();
+      explorationReset();
+      status.nearBodyId = -1;
+      updateContextPanel();
       updateLogDisplay();
     } else if (event == "StartJump") {
       // Hyperspace charge engaged: the old system's data is stale NOW. The
@@ -1567,6 +1700,9 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // (StartJump with JumpType "Supercruise" changes nothing.)
       if (strcmp(doc["JumpType"] | "", "Hyperspace") == 0) {
         clearPinnedBodies();
+        explorationReset();
+        status.nearBodyId = -1;
+        updateContextPanel();
         if (doc["StarSystem"].is<const char*>()) {
           status.currentSystem = doc["StarSystem"].as<const char*>();
           status.currentStation = "";
@@ -1660,6 +1796,13 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
           addLogEntry(logBuf);
         }
       }
+    } else if (event == "FSSSignalDiscovered") {
+      // Silent, high-volume: count landable stations by largest pad, no log line.
+      if ((doc["IsStation"] | false) &&
+          explorationStation(doc["SignalName"] | "", doc["SignalType"] | "")) {
+        updateContextPanel();
+      }
+      return;  // consume: never reaches the generic log
     } else if (event == "FSSBodySignals" || event == "SAASignalsFound") {
       // Append signal counts per type, e.g. "FSSBodySignals Bi:1 Ge:2"
       // Label = first two chars of the type name ("$SAA_SignalType_Xxx;" -> "Xx")
@@ -1687,9 +1830,12 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Pin the body (by BodyID) with its signals at the top of the log view;
       // a later SAASignalsFound for the same body just refreshes the counts.
       if (totalSignals > 0 && !doc["BodyName"].isNull()) {
-        char bodyLabel[20];
-        shortBodyLabel(doc["BodyName"] | "", bodyLabel, sizeof(bodyLabel));
-        pinBodySignals(doc["BodyID"] | -1, bodyLabel, bioCount, geoCount, otherCount);
+        // Store the FULL body name; shortening happens at render time so
+        // pins created before the system name is known self-heal.
+        pinBodySignals(doc["BodyID"] | -1, doc["BodyName"] | "",
+                       bioCount, geoCount, otherCount);
+        // System-wide tally for the SIGNALS header (deduped per BodyID)
+        explorationSignals(doc["BodyID"] | -1, bioCount, geoCount, otherCount);
         // DSS mapping reveals WHICH bio genuses live here -> genus detail line
         if (doc["Genuses"].is<JsonArray>()) {
           for (JsonObject g : doc["Genuses"].as<JsonArray>()) {
@@ -1704,8 +1850,13 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Only for a live FSS discovery — DSS re-announcements and the boot-time
       // history replay stay silent.
       if (event == "FSSBodySignals" && !replayingHistory) {
-        pendingSignalBeeps += totalSignals;
-        if (pendingSignalBeeps > 12) pendingSignalBeeps = 12;  // cap the serenade
+        pendingBioBeeps += bioCount;
+        pendingGeoBeeps += geoCount;
+        pendingOtherBeeps += otherCount;
+        // cap the serenade per category
+        if (pendingBioBeeps > 8) pendingBioBeeps = 8;
+        if (pendingGeoBeeps > 8) pendingGeoBeeps = 8;
+        if (pendingOtherBeeps > 8) pendingOtherBeeps = 8;
       }
     } else if (event == "ScanOrganic") {
       // Genetic sampler progress: "Log" = 1st sample of a new organism,
@@ -1738,7 +1889,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       Serial.printf("[BACKPACK] H:%d E:%d\n",
                     status.backpack.healthpack, status.backpack.energycell);
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "BackpackChange") {
       for (JsonObject item : doc["Added"].as<JsonArray>()) {
         const char* n = item["Name"] | "";
@@ -1754,25 +1905,31 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       }
       if (status.backpack.healthpack < 0) status.backpack.healthpack = 0;
       if (status.backpack.energycell < 0) status.backpack.energycell = 0;
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "UseConsumable") {
       const char* n = doc["Name"] | "";
       if (strcmp(n, "healthpack") == 0 && status.backpack.healthpack > 0)
         status.backpack.healthpack--;
       else if (strcmp(n, "energycell") == 0 && status.backpack.energycell > 0)
         status.backpack.energycell--;
-      updateBackpackDisplay();
+      updateContextPanel();
     } else if (event == "Disembark") {
       status.onFoot = true;
-      updateBackpackDisplay();  // show the backpack panel
+      updateContextPanel();  // switch panel to BACKPACK / ON FOOT
       addLogEntry("Disembark");
     } else if (event == "Embark") {
       status.onFoot = false;
-      updateBackpackDisplay();  // hide the backpack panel
+      updateContextPanel();  // switch panel back to EXPLORATION
       addLogEntry("Embark");
-    } else if (event == "Shutdown" || event == "CarrierJump") {
-      // Session over / carrier moved: pinned body signals are stale
+    } else if (event == "CarrierJump") {
+      // Carrier moved to another system: pinned body signals are stale.
+      // NOTE: "Shutdown" (game quit) deliberately does NOT clear - the boot
+      // replay usually ends on a Shutdown entry and would wipe everything it
+      // just rebuilt; the system data stays valid until an actual jump.
       clearPinnedBodies();
+      explorationReset();
+      status.nearBodyId = -1;
+      updateContextPanel();
       addLogEntry(event.c_str());
     } else {
       // Generic journal event - only add to display if not hidden
@@ -1824,7 +1981,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       if (flags["inSrv"].is<bool>()) status.inSrv = flags["inSrv"];
       if (flags["inTaxi"].is<bool>()) status.inTaxi = flags["inTaxi"];
       if (flags["inMulticrew"].is<bool>()) status.inMulticrew = flags["inMulticrew"];
-      updateBackpackDisplay();  // onFoot may have changed -> panel visibility
+      updateContextPanel();  // onFoot may have changed -> panel content (backpack/exploration)
     }
     
     // Update legal state
@@ -1842,7 +1999,6 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     }
     
     updateHeader();
-    updateCargoBar();
   } else if (eventType == "CARGO") {
     // Parse cargo inventory
     cargoInfo.usedSpace = doc["Count"];
@@ -1867,8 +2023,8 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         }
       }
     }
-    
-    updateCargoBar();
+
+    updateHeader();
   } else if (eventType == "NavRouteClear") {
     // Route cleared -> zero out jumps
     updateJumpsRemaining(0);
@@ -1969,9 +2125,6 @@ void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
 
     update_wifi_icon();
 
-    // Bring up OTA once WiFi is ready
-    startOtaIfNeeded();
-
     // Connect to WebSocket immediately when WiFi comes up
     connectWebSocket();
   } else {
@@ -2012,6 +2165,11 @@ void WifiConnect()
 void setup()
 {
   Serial.begin(115200);
+  // Native USB-CDC: when the board hangs on a PC with no terminal reading,
+  // the TX FIFO fills and every print BLOCKS up to the default 100 ms. With
+  // logging inside lvglMutex holds that starved the render loop (display
+  // froze until a monitor drained the buffer). Drop instead of block:
+  Serial.setTxTimeoutMs(0);
   delay(100);
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
   Serial.printf("[VERSION] Build: %s %s\n", __DATE__, __TIME__);
@@ -2136,6 +2294,9 @@ void setup()
   create_fighter_ui();
   Serial.println("[UI] Creating logviewer UI...");
   create_logviewer_ui();
+  Serial.println("[UI] Creating MFD shell...");
+  create_shell_ui();
+  shell_set_active_tab(currentPage);
   Serial.println("[UI] Loading logviewer screen...");
   lv_screen_load(logviewer_screen);
 
@@ -2191,13 +2352,25 @@ void loop()
     showJumpOverlay(pendingJumpValue);
   }
 
-  // Drain queued FSSBodySignals beeps, evenly spaced so they read as one
-  // beep per signal instead of a continuous tone.
-  static uint32_t lastSignalBeepTime = 0;
-  if (pendingSignalBeeps > 0 && millis() - lastSignalBeepTime >= 150) {
-    beepSignal();
-    pendingSignalBeeps--;
-    lastSignalBeepTime = millis();
+  // Shared audio gate: chime and signal pings never overlap or butt together.
+  // The first-discovery chime has priority (code order) and earns a longer
+  // pause on both sides; pings keep their 150 ms spacing through the gate.
+  static uint32_t audioQuietUntil = 0;
+  bool audioFree = (int32_t)(millis() - audioQuietUntil) >= 0;
+
+  // First discovery: three-tone chime (queued by the WS task's Scan hook).
+  if (pendingFirstDiscBeep && audioFree) {
+    pendingFirstDiscBeep = false;
+    beepFirstDiscovery();
+    audioQuietUntil = millis() + 350;  // audible break before the pings resume
+  } else if (audioFree &&
+             (pendingBioBeeps > 0 || pendingGeoBeeps > 0 || pendingOtherBeeps > 0)) {
+    // Evenly spaced and grouped by pitch (bio high first, then geo low, then
+    // the rest) so each category is countable by ear.
+    if (pendingBioBeeps > 0)      { beepSignalBio(); pendingBioBeeps--; }
+    else if (pendingGeoBeeps > 0) { beepSignalGeo(); pendingGeoBeeps--; }
+    else                          { beepSignal();    pendingOtherBeeps--; }
+    audioQuietUntil = millis() + 150;
   }
 
   checkBleConnection();
@@ -2220,6 +2393,11 @@ void loop()
       wsClient.close();
     }
     connectWebSocket();
+  }
+  if (reqPageSwitch >= 0) {
+    int p = reqPageSwitch;
+    reqPageSwitch = -1;
+    if (p != currentPage) switchToPage(p);
   }
 
   uint32_t currentTime = millis();
@@ -2260,6 +2438,29 @@ void loop()
     }
     lastSummaryRequest = currentTime;
   }
+
+  // Fallback for the current system name: after a long exploration session the
+  // 50-entry replay window may hold no FSDJump/Location, leaving the footer on
+  // "Waiting for events...". Once the replay is done, ask Icarus directly
+  // (getSystem -> message.name) until we know where we are.
+  static uint32_t lastSystemRequest = 0;
+  if (historyLoaded && status.currentSystem.length() == 0 &&
+      (currentTime - lastSystemRequest) > SUMMARY_REQUEST_INTERVAL) {
+    if (wsClient.available()) requestSystemWs();
+    lastSystemRequest = currentTime;
+  }
+
+  // Periodic UI refresh: catches every "data changed but nothing re-rendered"
+  // case (e.g. sidebar labels healing after getSystem). Cheap: the update
+  // functions skip identical content, so an idle tick costs microseconds.
+  static uint32_t lastUiRefresh = 0;
+  if (currentTime - lastUiRefresh >= 5000) {
+    lastUiRefresh = currentTime;
+    updateHeader();
+    updateStatusLine();
+    updateContextPanel();
+    updateLogDisplay();
+  }
   
   // Print WiFi signal quality every 30 seconds
   if (WiFi.status() == WL_CONNECTED && (currentTime - lastWifiStatusPrint) > WIFI_STATUS_PRINT_INTERVAL) {
@@ -2281,14 +2482,6 @@ void loop()
     lastWifiStatusPrint = currentTime;
   }
 
-  // Handle OTA updates
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!otaInitialized) {
-      startOtaIfNeeded();
-    }
-    ArduinoOTA.handle();
-  }
-  
   // Handle screen blinking for motherlode detection
   if (blinkScreen && blinkCount > 0) {
     if (millis() - lastBlinkTime > 200) {  // Blink every 200ms
@@ -2326,7 +2519,6 @@ void loop()
     delay(5);
     return;
   }
-  static const char* pageNames[3] = {"FIGHTER", "LOG", "SYSTEM"};
   static uint16_t lastTtpState = 0;
   uint16_t ttpState = pcf->read16();
   uint16_t rising = ttpState & ~lastTtpState;
@@ -2342,11 +2534,9 @@ void loop()
     } else if (topEdge) {
       switchToPage((currentPage + 2) % 3);   // previous
       Serial.printf("[TTP] prev -> page %d\n", currentPage);
-      showPageOverlay(pageNames[currentPage]);
     } else if (bottomEdge) {
       switchToPage((currentPage + 1) % 3);   // next
       Serial.printf("[TTP] next -> page %d\n", currentPage);
-      showPageOverlay(pageNames[currentPage]);
     } else if (midEdge) {
       Serial.println("[TTP] display off");
       setDisplayPower(false);
@@ -2384,16 +2574,13 @@ void showJumpOverlay(int jumps) {
       lv_obj_delete(jump_overlay_label);
       jump_overlay_label = nullptr;
     }
-    lv_obj_t* parent = lv_screen_active();
-    if (!parent) {
-      xSemaphoreGive(lvglMutex);
-      return;
-    }
+    lv_obj_t* parent = lv_layer_top();  // persistent layer: survives page fades
     jump_overlay_label = lv_label_create(parent);
     lv_label_set_text_fmt(jump_overlay_label, "%d", jumps);
     lv_obj_set_style_text_color(jump_overlay_label, LV_COLOR_FG, 0);
     lv_obj_set_style_text_font(jump_overlay_label, LV_FONT_DEFAULT, 0);
-    lv_obj_center(jump_overlay_label);
+    lv_obj_align(jump_overlay_label, LV_ALIGN_TOP_MID, -SHELL_RAIL_W / 2,
+                 CONTENT_Y + CONTENT_H / 2 - 20);
     lv_obj_set_style_opa(jump_overlay_label, LV_OPA_COVER, 0);
     lv_obj_set_style_transform_scale(jump_overlay_label, 768, LV_PART_MAIN);
     lv_obj_update_layout(jump_overlay_label);
@@ -2425,63 +2612,13 @@ void showJumpOverlay(int jumps) {
   }
 }
 
-// Brief page-name flash after a TTP page switch (the pads have no labels).
-static lv_obj_t* page_overlay = nullptr;
-
-static void page_overlay_opa_exec(void* obj, int32_t value) {
-  lv_obj_set_style_opa(static_cast<lv_obj_t*>(obj), (lv_opa_t)value, LV_PART_MAIN);
-}
-
-static void page_overlay_anim_ready(lv_anim_t* anim) {
-  lv_obj_t* obj = static_cast<lv_obj_t*>(anim->var);
-  if (obj) {
-    lv_obj_delete_async(obj);
-    if (obj == page_overlay) page_overlay = nullptr;
-  }
-}
-
-void showPageOverlay(const char* name) {
-  if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (page_overlay) {
-      lv_obj_delete(page_overlay);
-      page_overlay = nullptr;
-    }
-    lv_obj_t* parent = lv_screen_active();
-    if (!parent) {
-      xSemaphoreGive(lvglMutex);
-      return;
-    }
-    page_overlay = lv_label_create(parent);
-    lv_label_set_text(page_overlay, name);
-    lv_obj_set_style_text_font(page_overlay, FONT_BIG, 0);
-    lv_obj_set_style_text_color(page_overlay, LV_COLOR_HIGHLIGHT_BG, 0);
-    lv_obj_set_style_bg_color(page_overlay, LV_COLOR_BG, 0);
-    lv_obj_set_style_bg_opa(page_overlay, LV_OPA_80, 0);
-    lv_obj_set_style_pad_all(page_overlay, 8, 0);
-    lv_obj_set_style_radius(page_overlay, 6, 0);
-    lv_obj_align(page_overlay, LV_ALIGN_TOP_MID, 0, 40);
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, page_overlay);
-    lv_anim_set_exec_cb(&a, page_overlay_opa_exec);
-    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_delay(&a, 600);
-    lv_anim_set_duration(&a, 400);
-    lv_anim_set_completed_cb(&a, page_overlay_anim_ready);
-    lv_anim_start(&a);
-
-    xSemaphoreGive(lvglMutex);
-  }
-}
-
 void updateJumpsRemaining(int newValue) {
   if (newValue < 0) newValue = 0;
   bool changed = status.nav.jumpsRemaining != newValue;
   status.nav.jumpsRemaining = newValue;
   if (changed && !replayingHistory) {  // no overlay animation for old events
-    pendingJumpOverlay = true;
     pendingJumpValue = newValue;
+    pendingJumpOverlay = true;
   }
 }
 
@@ -2527,6 +2664,21 @@ void requestLoadingStatusWs() {
   String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getLoadingStatus\",\"message\":null}";
   wsClient.send(payload);
   Serial.println("[WS] Sent getLoadingStatus request");
+}
+
+// Ask Icarus for the current system (response: message.name). Boot fallback
+// for when the replayed history contains no system-setting event. NOTE: the
+// response can be large in busy systems (bodies/stations arrays), so this is
+// only requested while no system name is known.
+void requestSystemWs() {
+  if (!wsClient.available()) {
+    return;
+  }
+
+  String reqId = String("esp32-sys-") + String(millis());
+  String payload = String("{\"requestId\":\"") + reqId + "\",\"name\":\"getSystem\",\"message\":{}}";
+  wsClient.send(payload);
+  Serial.println("[WS] Sent getSystem request");
 }
 
 // Fetch the most recent journal entries to rebuild log/pins/state after boot

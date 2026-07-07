@@ -4,26 +4,23 @@
 #include "../gamedata.h"   // MAX_PINNED_BODIES
 
 extern lv_obj_t *logviewer_screen;
-extern lv_obj_t *log_label;
-extern lv_obj_t *cargo_bar;
-extern lv_obj_t *header_label;
-extern lv_obj_t *fuel_bar;
-extern lv_obj_t *hull_bar;
-extern lv_obj_t *wifi_icon;
-extern lv_obj_t *websocket_icon;
-extern lv_obj_t *bluetooth_icon;
-extern lv_obj_t *backpack_panel;
-extern lv_obj_t *medpack_label;
-extern lv_obj_t *energycell_label;
-extern lv_obj_t *bioscan_label;
-extern lv_obj_t *bioscan_data_label;
+extern lv_obj_t *log_label;        // event texts (left column)
 extern lv_obj_t *jump_overlay_label;
-extern lv_obj_t *status_label;   // sidebar header: current system name
 
-// Sidebar cards for pinned body signals (filled by updatePinnedSidebarUnlocked in main.cpp;
-// caller must hold lvglMutex)
-extern lv_obj_t *pin_cards[MAX_PINNED_BODIES];
-extern lv_obj_t *pin_title_labels[MAX_PINNED_BODIES];
-extern lv_obj_t *pin_genus_labels[MAX_PINNED_BODIES];
+// SIGNALS sidebar (filled by updatePinnedSidebarUnlocked in main.cpp; caller
+// must hold lvglMutex): dynamic header rail with the system tally, ONE card
+// for the body currently in gravity influence (status.nearBodyId), and
+// compact per-category body lists (0=BIO, 1=GEO, 2=OTH).
+extern lv_obj_t *signals_rail_label;
+extern lv_obj_t *near_card;
+extern lv_obj_t *near_title_label;
+extern lv_obj_t *near_genus_label;
+extern lv_obj_t *cat_lines[3];
+
+// Context panel (bottom of the sidebar): BACKPACK on foot, EXPLORATION else.
+// updateContextPanel (main.cpp) fills the rail + 4 lines.
+extern lv_obj_t *ctx_panel;
+extern lv_obj_t *ctx_rail_label;
+extern lv_obj_t *ctx_lines[4];
 
 void create_logviewer_ui();

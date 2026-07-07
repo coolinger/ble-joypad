@@ -1,4 +1,5 @@
 #include "gamedata.h"
+#include <string.h>
 
 // Unified status instance
 StatusModel status;
@@ -21,13 +22,21 @@ static int pinTotal(const PinnedBody &pb) {
   return pb.bio + pb.geo + pb.other;
 }
 
-// Keep the list sorted descending by total signal count (stable insertion
-// sort; the list is tiny). Invariant: the last entry is always the weakest.
+// Sort key: biological signals first (the explorer's priority), then total
+// signal count. Fixes bio bodies getting locked out by earlier geo bodies
+// when the registry fills.
+static bool pinOutranks(const PinnedBody &a, const PinnedBody &b) {
+  if (a.bio != b.bio) return a.bio > b.bio;
+  return pinTotal(a) > pinTotal(b);
+}
+
+// Keep the list sorted by pinOutranks (stable insertion sort; the list is
+// tiny). Invariant: the last entry is always the weakest.
 static void sortPinnedBodies() {
   for (int i = 1; i < pinnedBodyCount; i++) {
     PinnedBody key = pinnedBodies[i];
     int j = i - 1;
-    while (j >= 0 && pinTotal(pinnedBodies[j]) < pinTotal(key)) {
+    while (j >= 0 && pinOutranks(key, pinnedBodies[j])) {
       pinnedBodies[j + 1] = pinnedBodies[j];
       j--;
     }
@@ -35,7 +44,9 @@ static void sortPinnedBodies() {
   }
 }
 
-void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) {
+static void applyPendingOrganic(int bodyId);  // defined below the pending buffer
+
+void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int other) {
   // Update an existing pin for this body (e.g. FSS first, DSS mapping later),
   // keeping the organic-scan progress.
   for (int i = 0; i < pinnedBodyCount; i++) {
@@ -43,26 +54,30 @@ void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) 
       pinnedBodies[i].bio = bio;
       pinnedBodies[i].geo = geo;
       pinnedBodies[i].other = other;
-      snprintf(pinnedBodies[i].label, sizeof(pinnedBodies[i].label), "%s", label);
+      snprintf(pinnedBodies[i].name, sizeof(pinnedBodies[i].name), "%s", bodyName);
       sortPinnedBodies();
+      applyPendingOrganic(bodyId);
       return;
     }
   }
   if (pinnedBodyCount >= MAX_PINNED_BODIES) {
-    // Full: the new body must beat the weakest pin (fewest total signals),
-    // otherwise it is not pinned at all.
-    if (bio + geo + other <= pinTotal(pinnedBodies[pinnedBodyCount - 1])) return;
+    // Full (rare at 16): the new body must outrank the weakest pin (bio
+    // first, then total), otherwise it is not pinned at all.
+    PinnedBody cand;
+    cand.bio = bio; cand.geo = geo; cand.other = other;
+    if (!pinOutranks(cand, pinnedBodies[pinnedBodyCount - 1])) return;
     pinnedBodyCount--;  // evict the weakest (list is sorted, last = weakest)
   }
   PinnedBody &pb = pinnedBodies[pinnedBodyCount++];
   pb.bodyId = bodyId;
-  snprintf(pb.label, sizeof(pb.label), "%s", label);
+  snprintf(pb.name, sizeof(pb.name), "%s", bodyName);
   pb.bio = bio;
   pb.geo = geo;
   pb.other = other;
   pb.bioDone = 0;
   pb.genusCount = 0;  // slot may be recycled after unpin/clear: drop stale genuses
   sortPinnedBodies();
+  applyPendingOrganic(bodyId);  // scans that replayed before this pin existed
 }
 
 static PinnedBody* findPinnedBody(int bodyId) {
@@ -91,13 +106,65 @@ void addPinnedGenus(int bodyId, const char* name) {
   if (pb) findOrAddGenus(pb, name);  // keeps the state if already known
 }
 
+// ScanOrganic progress that arrived before the body's signals were known.
+// The boot replay window can contain the scans but not the ORIGINAL
+// FSSBodySignals - only a later re-announcement (the game re-fires body
+// signals on approach) which recreates the pin AFTER the scans replayed.
+// Buffer such progress and apply it when the pin appears.
+#define MAX_PENDING_ORGANIC 8
+struct PendingOrganic {
+  int bodyId;
+  char genus[14];
+  uint8_t state;  // BioScanState reached so far
+};
+static PendingOrganic pendingOrganic[MAX_PENDING_ORGANIC];
+static int pendingOrganicCount = 0;
+
+static void rememberPendingOrganic(int bodyId, const char* genusName, uint8_t state) {
+  if (!genusName || !genusName[0]) return;
+  for (int i = 0; i < pendingOrganicCount; i++) {
+    if (pendingOrganic[i].bodyId == bodyId &&
+        strncasecmp(pendingOrganic[i].genus, genusName, sizeof(pendingOrganic[i].genus)) == 0) {
+      if (state > pendingOrganic[i].state) pendingOrganic[i].state = state;
+      return;
+    }
+  }
+  if (pendingOrganicCount >= MAX_PENDING_ORGANIC) return;
+  PendingOrganic &p = pendingOrganic[pendingOrganicCount++];
+  p.bodyId = bodyId;
+  snprintf(p.genus, sizeof(p.genus), "%s", genusName);
+  p.state = state;
+}
+
+// Called by pinBodySignals once a pin exists: replay buffered progress
+// through the normal path (counts bioAnalysed, may auto-unpin).
+static void applyPendingOrganic(int bodyId) {
+  for (int i = 0; i < pendingOrganicCount; ) {
+    if (pendingOrganic[i].bodyId != bodyId) { i++; continue; }
+    PendingOrganic p = pendingOrganic[i];
+    pendingOrganic[i] = pendingOrganic[--pendingOrganicCount];  // remove first:
+    // organicScanProgress may recurse into pin bookkeeping
+    organicScanProgress(p.bodyId, p.genus,
+                        p.state == BIO_DONE ? "Analyse" : "Sample");
+  }
+}
+
 void organicScanProgress(int bodyId, const char* genusName, const char* scanType) {
   PinnedBody* pb = findPinnedBody(bodyId);
-  if (!pb) return;  // body without known signals: nothing to track
+  if (!pb) {
+    // Body without known signals (yet): remember instead of dropping - the
+    // replay may deliver the pin-creating event afterwards.
+    rememberPendingOrganic(bodyId, genusName,
+                           strcmp(scanType, "Analyse") == 0 ? BIO_DONE : BIO_SCANNING);
+    return;
+  }
   BioGenus* g = findOrAddGenus(pb, genusName);
   if (!g) return;
 
   if (strcmp(scanType, "Analyse") == 0) {
+    // Count completions system-wide (survives the auto-unpin below, feeds the
+    // "open bio signals" header tally).
+    if (g->state != BIO_DONE) status.exploration.bioAnalysed++;
     g->state = BIO_DONE;  // 3rd sample analysed -> checked off
   } else if (g->state != BIO_DONE) {
     // "Log" / "Sample": this organism is now loaded in the genetic sampler.
@@ -130,6 +197,104 @@ void organicScanProgress(int bodyId, const char* genusName, const char* scanType
 
 void clearPinnedBodies() {
   pinnedBodyCount = 0;
+  pendingOrganicCount = 0;  // buffered organic progress is system-bound too
+}
+
+// ---------------- Exploration progress ----------------
+// BodyID dedupe bitmaps (BodyIDs are small ints; clamp to 0..255).
+static uint32_t scannedBits[8];
+static uint32_t mappedBits[8];
+static uint32_t unmappedBits[8];   // bodies whose Scan said WasMapped == false
+static uint32_t signalBits[8];     // bodies already counted in the signal tally
+#define EXPL_MAX_STATIONS 40
+static uint32_t stationHashes[EXPL_MAX_STATIONS];
+static int stationHashCount = 0;
+
+static bool testAndSetBit(uint32_t* bits, int id) {
+  if (id < 0 || id > 255) return false;
+  uint32_t mask = 1UL << (id & 31);
+  if (bits[id >> 5] & mask) return false;
+  bits[id >> 5] |= mask;
+  return true;
+}
+
+void explorationReset() {
+  status.exploration = ExplorationInfo();
+  memset(scannedBits, 0, sizeof(scannedBits));
+  memset(mappedBits, 0, sizeof(mappedBits));
+  memset(unmappedBits, 0, sizeof(unmappedBits));
+  memset(signalBits, 0, sizeof(signalBits));
+  stationHashCount = 0;
+}
+
+void explorationSignals(int bodyId, int bio, int geo, int other) {
+  if (bio + geo + other <= 0) return;
+  if (!testAndSetBit(signalBits, bodyId)) return;  // DSS re-announcement etc.
+  if (status.exploration.sigBodies < 255) status.exploration.sigBodies++;
+  status.exploration.sigBio += bio;
+  status.exploration.sigGeo += geo;
+  status.exploration.sigOther += other;
+}
+
+void explorationHonk(int bodyCount) {
+  status.exploration.honked = true;
+  if (bodyCount > 0) status.exploration.bodyCount = bodyCount;
+}
+
+void explorationAllFound() {
+  status.exploration.allFound = true;
+}
+
+void explorationScan(int bodyId, bool wasDiscovered, bool wasMapped) {
+  if (!testAndSetBit(scannedBits, bodyId)) return;  // body already counted
+  status.exploration.scanned++;
+  if (!wasDiscovered) status.exploration.firstDiscovered++;
+  if (!wasMapped) testAndSetBit(unmappedBits, bodyId);
+}
+
+void explorationMapped(int bodyId) {
+  if (!testAndSetBit(mappedBits, bodyId)) return;
+  status.exploration.mapped++;
+  // First map iff nobody had mapped it before our Scan (Scan precedes mapping).
+  if (bodyId >= 0 && bodyId <= 255 &&
+      (unmappedBits[bodyId >> 5] & (1UL << (bodyId & 31)))) {
+    status.exploration.firstMapped++;
+  }
+}
+
+// FNV-1a over the signal name for station dedupe.
+static uint32_t fnv1a(const char* s) {
+  uint32_t h = 2166136261u;
+  while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+  return h;
+}
+
+bool explorationStation(const char* signalName, const char* signalType) {
+  if (!signalName || !signalName[0] || !signalType) return false;
+  uint8_t* bucket = nullptr;
+  // Largest-pad classification by journal SignalType.
+  if (strcmp(signalType, "Outpost") == 0) {
+    bucket = &status.exploration.stationsM;
+  } else if (strcmp(signalType, "FleetCarrier") == 0) {
+    bucket = &status.exploration.carriers;
+  } else if (strcmp(signalType, "StationCoriolis") == 0 ||
+             strcmp(signalType, "StationONeilOrbis") == 0 ||
+             strcmp(signalType, "StationONeilCylinder") == 0 ||
+             strcmp(signalType, "StationBernalSphere") == 0 ||
+             strcmp(signalType, "StationAsteroid") == 0 ||
+             strcmp(signalType, "StationMegaShip") == 0) {
+    bucket = &status.exploration.stationsL;
+  } else {
+    return false;  // installations, USS, ... are not landable stations
+  }
+  uint32_t h = fnv1a(signalName);
+  for (int i = 0; i < stationHashCount; i++) {
+    if (stationHashes[i] == h) return false;  // already counted
+  }
+  if (stationHashCount >= EXPL_MAX_STATIONS) return false;  // full: undercount, never inflate
+  stationHashes[stationHashCount++] = h;
+  if (*bucket < 255) (*bucket)++;
+  return true;
 }
 
 // Implementations for updateJumpsRemaining/addLogEntry live in main.cpp.

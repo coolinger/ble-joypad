@@ -23,6 +23,8 @@ static lv_color_t *lv_buf2 = nullptr;
 
 static void (*touchCallback)() = nullptr;  // called on every valid touch (display wake)
 
+extern bool displayOn;  // defined in main.cpp
+
 #if LV_USE_LOG != 0
 static void lvgl_log_cb(lv_log_level_t level, const char *buf)
 {
@@ -50,6 +52,7 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     LV_UNUSED(indev);
+    static bool swallowGesture = false;
     TOUCHINFO ti;
     if (touch.getSamples(&ti) && ti.count > 0) {
         int x = ti.x[0];
@@ -61,11 +64,19 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 #endif
         if (x < 0) x = 0; if (x >= SCREEN_WIDTH)  x = SCREEN_WIDTH - 1;
         if (y < 0) y = 0; if (y >= SCREEN_HEIGHT) y = SCREEN_HEIGHT - 1;
-        data->state = LV_INDEV_STATE_PRESSED;
+        if (!displayOn) swallowGesture = true;  // gesture began on a dark screen
+        if (touchCallback) touchCallback();      // wake
+        if (swallowGesture) {
+            // Wake-only gesture: swallow the whole thing so on-glass touches
+            // (tab rail, fighter buttons) don't also register as a click.
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
         data->point.x = x;
         data->point.y = y;
-        if (touchCallback) touchCallback();
+        data->state = LV_INDEV_STATE_PRESSED;
     } else {
+        swallowGesture = false;  // finger lifted: next gesture is live
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
