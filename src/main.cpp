@@ -422,14 +422,20 @@ static void shortBodyLabel(const char* bodyName, char* out, size_t outLen);
 // name (labels self-heal once it becomes known) and inner spaces removed,
 // matching the in-game shorthand: "... 5 b a" -> "5ba".
 static void compactBodyLabel(const char* bodyName, char* out, size_t outLen) {
-  char tmp[24];
+  char tmp[28];
   shortBodyLabel(bodyName, tmp, sizeof(tmp));
+  // Strip inner spaces into a scratch buffer first ...
+  char packed[28];
   size_t o = 0;
-  for (const char* q = tmp; *q && o < outLen - 1; q++) {
-    if (*q != ' ') out[o++] = *q;
+  for (const char* q = tmp; *q && o < sizeof(packed) - 1; q++) {
+    if (*q != ' ') packed[o++] = *q;
   }
-  out[o] = '\0';
-  if (o == 0) snprintf(out, outLen, "?");
+  packed[o] = '\0';
+  if (o == 0) { snprintf(out, outLen, "?"); return; }
+  // ... then keep the TAIL if it doesn't fit: the end of a body name is the
+  // distinctive part ("...b21-1 5 b"), the head is the system prefix.
+  const char* p = (o >= outLen) ? packed + (o - (outLen - 1)) : packed;
+  snprintf(out, outLen, "%s", p);
 }
 
 // Fill the SIGNALS sidebar from pinnedBodies[] + status.exploration. Caller
@@ -1121,6 +1127,9 @@ void onWebSocketMessage(WebsocketsMessage message) {
         status.currentSystem = sysName;
         Serial.printf("[WS] getSystem: current system = %s\n", sysName);
         updateStatusLine();
+        // Body labels are shortened against the system name at render time:
+        // re-render the sidebar so pins from the replay heal immediately.
+        updateLogDisplay();
       }
     } else if (name && strcmp(name, "getLogEntries") == 0 && msg.is<JsonArray>()) {
       // Recent journal entries, newest first. Replay oldest-first so the final
