@@ -1019,7 +1019,7 @@ void replaceUmlauts(char* str) {
 }
 
 // Forward declaration
-void handleEliteEvent(const String& eventType, JsonDocument& doc);
+void handleEliteEvent(const String& eventType, JsonVariant doc);
 void requestCmdrStatusWs();
 void requestShipStatusWs();
 void requestLoadingStatusWs();
@@ -1164,9 +1164,12 @@ void onWebSocketMessage(WebsocketsMessage message) {
       Serial.printf("[WS] Replaying %d journal history entries\n", n);
       replayingHistory = true;
       for (int i = n - 1; i >= 0; i--) {
-        JsonDocument eventDoc;
-        eventDoc.set(entries[i]);
-        handleEliteEvent("JOURNAL", eventDoc);
+        // View into the (PSRAM-backed) response document - the previous
+        // per-entry deep copies churned ~1 KB internal-RAM allocations x100
+        // while lwIP on core 0 needed the same heap: abort() races at boot.
+        handleEliteEvent("JOURNAL", entries[i]);
+        // Let core 0 (WiFi/lwIP) drain its RX queue between entries.
+        vTaskDelay(1);
       }
       replayingHistory = false;
       historyLoaded = true;
@@ -1395,7 +1398,9 @@ static void shortBodyLabel(const char* bodyName, char* out, size_t outLen) {
   snprintf(out, outLen, "%s", p);
 }
 
-void handleEliteEvent(const String& eventType, JsonDocument& doc) {
+// Takes a JsonVariant (view, not copy): live events pass their document,
+// the boot replay passes array elements of the big PSRAM-backed response.
+void handleEliteEvent(const String& eventType, JsonVariant doc) {
   static char logBuf[80];
   static char tempBuf[60];
   
