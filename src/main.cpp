@@ -487,12 +487,9 @@ void updateLogDisplay() {
       
       // Validate entry has text
       if (eventLog[idx].text[0] == 0) {
-        Serial.printf("  [%d] idx=%d: <empty>\n", i, idx);
         continue;
       }
-      
-      Serial.printf("  [%d] idx=%d: %s\n", i, idx, eventLog[idx].text);
-      
+
       // Calculate space needed for this entry
       int textLen = strnlen(eventLog[idx].text, sizeof(eventLog[idx].text));
       int countPrefixLen = 0;
@@ -2060,6 +2057,11 @@ void WifiConnect()
 void setup()
 {
   Serial.begin(115200);
+  // Native USB-CDC: when the board hangs on a PC with no terminal reading,
+  // the TX FIFO fills and every print BLOCKS up to the default 100 ms. With
+  // logging inside lvglMutex holds that starved the render loop (display
+  // froze until a monitor drained the buffer). Drop instead of block:
+  Serial.setTxTimeoutMs(0);
   delay(100);
   Serial.println("\n\n[BOOT] Starting ESP32S3 BLE Joypad...");
   Serial.printf("[VERSION] Build: %s %s\n", __DATE__, __TIME__);
