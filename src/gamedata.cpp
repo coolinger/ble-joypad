@@ -44,6 +44,8 @@ static void sortPinnedBodies() {
   }
 }
 
+static void applyPendingOrganic(int bodyId);  // defined below the pending buffer
+
 void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int other) {
   // Update an existing pin for this body (e.g. FSS first, DSS mapping later),
   // keeping the organic-scan progress.
@@ -54,6 +56,7 @@ void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int othe
       pinnedBodies[i].other = other;
       snprintf(pinnedBodies[i].name, sizeof(pinnedBodies[i].name), "%s", bodyName);
       sortPinnedBodies();
+      applyPendingOrganic(bodyId);
       return;
     }
   }
@@ -74,6 +77,7 @@ void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int othe
   pb.bioDone = 0;
   pb.genusCount = 0;  // slot may be recycled after unpin/clear: drop stale genuses
   sortPinnedBodies();
+  applyPendingOrganic(bodyId);  // scans that replayed before this pin existed
 }
 
 static PinnedBody* findPinnedBody(int bodyId) {
@@ -102,9 +106,58 @@ void addPinnedGenus(int bodyId, const char* name) {
   if (pb) findOrAddGenus(pb, name);  // keeps the state if already known
 }
 
+// ScanOrganic progress that arrived before the body's signals were known.
+// The boot replay window can contain the scans but not the ORIGINAL
+// FSSBodySignals - only a later re-announcement (the game re-fires body
+// signals on approach) which recreates the pin AFTER the scans replayed.
+// Buffer such progress and apply it when the pin appears.
+#define MAX_PENDING_ORGANIC 8
+struct PendingOrganic {
+  int bodyId;
+  char genus[14];
+  uint8_t state;  // BioScanState reached so far
+};
+static PendingOrganic pendingOrganic[MAX_PENDING_ORGANIC];
+static int pendingOrganicCount = 0;
+
+static void rememberPendingOrganic(int bodyId, const char* genusName, uint8_t state) {
+  if (!genusName || !genusName[0]) return;
+  for (int i = 0; i < pendingOrganicCount; i++) {
+    if (pendingOrganic[i].bodyId == bodyId &&
+        strncasecmp(pendingOrganic[i].genus, genusName, sizeof(pendingOrganic[i].genus)) == 0) {
+      if (state > pendingOrganic[i].state) pendingOrganic[i].state = state;
+      return;
+    }
+  }
+  if (pendingOrganicCount >= MAX_PENDING_ORGANIC) return;
+  PendingOrganic &p = pendingOrganic[pendingOrganicCount++];
+  p.bodyId = bodyId;
+  snprintf(p.genus, sizeof(p.genus), "%s", genusName);
+  p.state = state;
+}
+
+// Called by pinBodySignals once a pin exists: replay buffered progress
+// through the normal path (counts bioAnalysed, may auto-unpin).
+static void applyPendingOrganic(int bodyId) {
+  for (int i = 0; i < pendingOrganicCount; ) {
+    if (pendingOrganic[i].bodyId != bodyId) { i++; continue; }
+    PendingOrganic p = pendingOrganic[i];
+    pendingOrganic[i] = pendingOrganic[--pendingOrganicCount];  // remove first:
+    // organicScanProgress may recurse into pin bookkeeping
+    organicScanProgress(p.bodyId, p.genus,
+                        p.state == BIO_DONE ? "Analyse" : "Sample");
+  }
+}
+
 void organicScanProgress(int bodyId, const char* genusName, const char* scanType) {
   PinnedBody* pb = findPinnedBody(bodyId);
-  if (!pb) return;  // body without known signals: nothing to track
+  if (!pb) {
+    // Body without known signals (yet): remember instead of dropping - the
+    // replay may deliver the pin-creating event afterwards.
+    rememberPendingOrganic(bodyId, genusName,
+                           strcmp(scanType, "Analyse") == 0 ? BIO_DONE : BIO_SCANNING);
+    return;
+  }
   BioGenus* g = findOrAddGenus(pb, genusName);
   if (!g) return;
 
@@ -144,6 +197,7 @@ void organicScanProgress(int bodyId, const char* genusName, const char* scanType
 
 void clearPinnedBodies() {
   pinnedBodyCount = 0;
+  pendingOrganicCount = 0;  // buffered organic progress is system-bound too
 }
 
 // ---------------- Exploration progress ----------------
