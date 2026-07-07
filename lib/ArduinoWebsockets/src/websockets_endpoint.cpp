@@ -9,6 +9,15 @@
 #include <Arduino.h>
 #endif
 
+// LOCAL PATCH: temporary diagnostics for the large-frame investigation.
+// Prints every abnormal frame exit with enough context to localize it.
+#define BLEJOY_WS_DIAG 1
+#if defined(ARDUINO) && BLEJOY_WS_DIAG
+#define WS_DIAG(...) Serial.printf(__VA_ARGS__)
+#else
+#define WS_DIAG(...)
+#endif
+
 namespace websockets {
 
     CloseReason GetCloseReason(uint16_t reasonCode) {
@@ -196,7 +205,11 @@ namespace internals {
         uint64_t done_reading = 0;
         while (done_reading < extendedPayload) {
             // LOCAL PATCH: wait for the stream instead of breaking on a gap.
-            if (!waitForData(socket, 3000)) break;
+            if (!waitForData(socket, 3000)) {
+                WS_DIAG("[WSDIAG] readData stall at %lu/%lu bytes\n",
+                        (unsigned long)done_reading, (unsigned long)extendedPayload);
+                break;
+            }
             uint64_t to_read = extendedPayload - done_reading >= BUFFER_SIZE ? BUFFER_SIZE : extendedPayload - done_reading;
             uint32_t numReceived = readUntilSuccessfullOrError(socket, buffer, to_read);
             if (numReceived == static_cast<uint32_t>(-1)) continue;  // transient, bounded by waitForData
@@ -208,7 +221,11 @@ namespace internals {
             done_reading += numReceived;
         }
         // LOCAL PATCH: never hand a zero-padded, truncated frame to the app.
-        if (done_reading < extendedPayload) return WSString();
+        if (done_reading < extendedPayload) {
+            WS_DIAG("[WSDIAG] readData truncated %lu/%lu\n",
+                    (unsigned long)done_reading, (unsigned long)extendedPayload);
+            return WSString();
+        }
         return data;
     }
 
@@ -224,10 +241,21 @@ namespace internals {
         // (bounded) instead of treating a momentary gap as failure. Frames
         // with a zero payload (pings/pongs) are complete after the header:
         // never wait for them.
-        if(header.payload > 0 && !waitForData(*this->_client, 3000)) return WebsocketsFrame();
+        if(header.payload > 0 && !waitForData(*this->_client, 3000)) {
+            WS_DIAG("[WSDIAG] no data after header (op=%u len7=%u)\n",
+                    (unsigned)header.opcode, (unsigned)header.payload);
+            return WebsocketsFrame();
+        }
 
         uint64_t payloadLength = readExtendedPayloadLength(*this->_client, header);
-        if(payloadLength > 0 && !waitForData(*this->_client, 3000)) return WebsocketsFrame();
+        if (payloadLength > 4096) {
+            WS_DIAG("[WSDIAG] big frame: op=%u fin=%u len=%lu\n",
+                    (unsigned)header.opcode, (unsigned)header.fin, (unsigned long)payloadLength);
+        }
+        if(payloadLength > 0 && !waitForData(*this->_client, 3000)) {
+            WS_DIAG("[WSDIAG] no data after length (len=%lu)\n", (unsigned long)payloadLength);
+            return WebsocketsFrame();
+        }
 
 #ifdef _WS_CONFIG_MAX_MESSAGE_SIZE
         if(payloadLength > _WS_CONFIG_MAX_MESSAGE_SIZE) {
@@ -249,7 +277,11 @@ namespace internals {
         // LOCAL PATCH: an empty rx buffer after a COMPLETE read is normal (it
         // was even the norm for the last pending frame); truncation is
         // signalled by readData returning an empty/short payload instead.
-        if(frame.payload.size() != payloadLength) return WebsocketsFrame();
+        if(frame.payload.size() != payloadLength) {
+            WS_DIAG("[WSDIAG] frame dropped: got %u of %lu bytes\n",
+                    (unsigned)frame.payload.size(), (unsigned long)payloadLength);
+            return WebsocketsFrame();
+        }
 
         // if masking is set un-mask the message
         if (header.mask) {
