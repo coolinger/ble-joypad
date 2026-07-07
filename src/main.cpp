@@ -2352,22 +2352,25 @@ void loop()
     showJumpOverlay(pendingJumpValue);
   }
 
-  // Drain queued FSSBodySignals pings, evenly spaced and grouped by pitch
-  // (bio high first, then geo low, then the rest) so each category is
-  // countable by ear.
-  static uint32_t lastSignalBeepTime = 0;
-  if ((pendingBioBeeps > 0 || pendingGeoBeeps > 0 || pendingOtherBeeps > 0) &&
-      millis() - lastSignalBeepTime >= 150) {
+  // Shared audio gate: chime and signal pings never overlap or butt together.
+  // The first-discovery chime has priority (code order) and earns a longer
+  // pause on both sides; pings keep their 150 ms spacing through the gate.
+  static uint32_t audioQuietUntil = 0;
+  bool audioFree = (int32_t)(millis() - audioQuietUntil) >= 0;
+
+  // First discovery: three-tone chime (queued by the WS task's Scan hook).
+  if (pendingFirstDiscBeep && audioFree) {
+    pendingFirstDiscBeep = false;
+    beepFirstDiscovery();
+    audioQuietUntil = millis() + 350;  // audible break before the pings resume
+  } else if (audioFree &&
+             (pendingBioBeeps > 0 || pendingGeoBeeps > 0 || pendingOtherBeeps > 0)) {
+    // Evenly spaced and grouped by pitch (bio high first, then geo low, then
+    // the rest) so each category is countable by ear.
     if (pendingBioBeeps > 0)      { beepSignalBio(); pendingBioBeeps--; }
     else if (pendingGeoBeeps > 0) { beepSignalGeo(); pendingGeoBeeps--; }
     else                          { beepSignal();    pendingOtherBeeps--; }
-    lastSignalBeepTime = millis();
-  }
-
-  // First discovery: three-tone chime (queued by the WS task's Scan hook).
-  if (pendingFirstDiscBeep) {
-    pendingFirstDiscBeep = false;
-    beepFirstDiscovery();
+    audioQuietUntil = millis() + 150;
   }
 
   checkBleConnection();
