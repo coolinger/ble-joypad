@@ -14,6 +14,8 @@ void playTone(uint16_t frequency, uint16_t duration_ms);
 void beepShort();
 void beepClick();
 void beepSignal();
+void beepSignalBio();
+void beepSignalGeo();
 void beepFirstDiscovery();
 void beepConnect();
 void beepDisconnect();

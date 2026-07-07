@@ -158,9 +158,12 @@ bool displayDimmed = false;                 // true while at BL_DUTY_DIM
 // (touch / page button / BLE reconnect) wakes it through wakeDisplay().
 bool displayManualOff = false;
 
-// FSSBodySignals: one short beep per detected signal. Incremented by the WS
-// task (handleEliteEvent), drained evenly spaced by loop() on core 1.
-volatile int pendingSignalBeeps = 0;
+// FSSBodySignals: one short ping per detected signal, pitched by category
+// (bio 1800 Hz, geo 900 Hz, other 1400 Hz). Incremented by the WS task
+// (handleEliteEvent), drained evenly spaced by loop() on core 1.
+volatile int pendingBioBeeps = 0;
+volatile int pendingGeoBeeps = 0;
+volatile int pendingOtherBeeps = 0;
 // Set by the WS task when a Scan yields a first discovery; loop() plays the chime.
 volatile bool pendingFirstDiscBeep = false;
 
@@ -1748,8 +1751,13 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Only for a live FSS discovery — DSS re-announcements and the boot-time
       // history replay stay silent.
       if (event == "FSSBodySignals" && !replayingHistory) {
-        pendingSignalBeeps += totalSignals;
-        if (pendingSignalBeeps > 12) pendingSignalBeeps = 12;  // cap the serenade
+        pendingBioBeeps += bioCount;
+        pendingGeoBeeps += geoCount;
+        pendingOtherBeeps += otherCount;
+        // cap the serenade per category
+        if (pendingBioBeeps > 8) pendingBioBeeps = 8;
+        if (pendingGeoBeeps > 8) pendingGeoBeeps = 8;
+        if (pendingOtherBeeps > 8) pendingOtherBeeps = 8;
       }
     } else if (event == "ScanOrganic") {
       // Genetic sampler progress: "Log" = 1st sample of a new organism,
@@ -2244,12 +2252,15 @@ void loop()
     showJumpOverlay(pendingJumpValue);
   }
 
-  // Drain queued FSSBodySignals beeps, evenly spaced so they read as one
-  // beep per signal instead of a continuous tone.
+  // Drain queued FSSBodySignals pings, evenly spaced and grouped by pitch
+  // (bio high first, then geo low, then the rest) so each category is
+  // countable by ear.
   static uint32_t lastSignalBeepTime = 0;
-  if (pendingSignalBeeps > 0 && millis() - lastSignalBeepTime >= 150) {
-    beepSignal();
-    pendingSignalBeeps--;
+  if ((pendingBioBeeps > 0 || pendingGeoBeeps > 0 || pendingOtherBeeps > 0) &&
+      millis() - lastSignalBeepTime >= 150) {
+    if (pendingBioBeeps > 0)      { beepSignalBio(); pendingBioBeeps--; }
+    else if (pendingGeoBeeps > 0) { beepSignalGeo(); pendingGeoBeeps--; }
+    else                          { beepSignal();    pendingOtherBeeps--; }
     lastSignalBeepTime = millis();
   }
 

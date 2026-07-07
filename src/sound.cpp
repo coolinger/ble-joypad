@@ -90,6 +90,20 @@ void beepSignal() {
 #endif
 }
 
+// FSS signal pings by category: biological high, geological low
+// (beepSignal's 1400 Hz stays the "everything else" pitch).
+void beepSignalBio() {
+#if (BEEP_SIGNAL)
+  playTone(1800, 40);
+#endif
+}
+
+void beepSignalGeo() {
+#if (BEEP_SIGNAL)
+  playTone(900, 40);
+#endif
+}
+
 // Rising three-tone chime: played when a Scan discovers a body nobody in the
 // galaxy has scanned before (Scan.WasDiscovered == false).
 void beepFirstDiscovery() {
