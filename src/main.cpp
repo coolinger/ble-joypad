@@ -1042,19 +1042,22 @@ void onWebSocketMessage(WebsocketsMessage message) {
     return;
   }
 
-  String data = message.data();
-
-  // Diagnose for the large-frame path: raw payload vs. converted String.
-  if (len > 4096 || data.length() != len) {
-    Serial.printf("[WS] rx raw=%u str=%u complete=%d free int=%u psram=%u\n",
-                  (unsigned)len, (unsigned)data.length(), (int)message.isComplete(),
+  // Parse straight from the library's internal std::string. Arduino String
+  // silently caps out around 64 KB (31 KB responses convert fine, a 106 KB
+  // getLogEntries payload came back as an EMPTY String despite 7 MB free
+  // PSRAM) - and the String detour cost two full-size copies anyway.
+  const websockets::WSString& raw = message.rawData();
+  if (len > 4096) {
+    Serial.printf("[WS] rx raw=%u complete=%d free int=%u psram=%u\n",
+                  (unsigned)raw.size(), (int)message.isComplete(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   }
-  
+
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
   JsonDocument doc;
-  DeserializationError error = deserializeJson(doc, data, DeserializationOption::NestingLimit(40));
+  DeserializationError error = deserializeJson(doc, raw.c_str(), raw.size(),
+                                               DeserializationOption::NestingLimit(40));
   
   if (error) {
     Serial.printf("[WS] JSON parse error: %s\n", error.c_str());
