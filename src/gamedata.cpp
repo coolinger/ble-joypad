@@ -44,7 +44,7 @@ static void sortPinnedBodies() {
   }
 }
 
-void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) {
+void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int other) {
   // Update an existing pin for this body (e.g. FSS first, DSS mapping later),
   // keeping the organic-scan progress.
   for (int i = 0; i < pinnedBodyCount; i++) {
@@ -52,7 +52,7 @@ void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) 
       pinnedBodies[i].bio = bio;
       pinnedBodies[i].geo = geo;
       pinnedBodies[i].other = other;
-      snprintf(pinnedBodies[i].label, sizeof(pinnedBodies[i].label), "%s", label);
+      snprintf(pinnedBodies[i].name, sizeof(pinnedBodies[i].name), "%s", bodyName);
       sortPinnedBodies();
       return;
     }
@@ -67,7 +67,7 @@ void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) 
   }
   PinnedBody &pb = pinnedBodies[pinnedBodyCount++];
   pb.bodyId = bodyId;
-  snprintf(pb.label, sizeof(pb.label), "%s", label);
+  snprintf(pb.name, sizeof(pb.name), "%s", bodyName);
   pb.bio = bio;
   pb.geo = geo;
   pb.other = other;

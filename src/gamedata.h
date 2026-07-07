@@ -142,7 +142,10 @@ struct BioGenus {
 
 struct PinnedBody {
   int bodyId = -1;   // journal BodyID (matches ScanOrganic "Body")
-  char label[20];    // body identifier within the system, e.g. "A 1"
+  // FULL journal BodyName. Shortening to the in-system id ("5 b a") happens
+  // at RENDER time against the then-current system name - pins created while
+  // the system name was still unknown (boot replay) self-heal that way.
+  char name[44];
   int bio = 0;
   int geo = 0;
   int other = 0;
@@ -153,7 +156,7 @@ struct PinnedBody {
 extern PinnedBody pinnedBodies[MAX_PINNED_BODIES];
 extern int pinnedBodyCount;
 
-void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other);
+void pinBodySignals(int bodyId, const char* bodyName, int bio, int geo, int other);
 void addPinnedGenus(int bodyId, const char* name);  // from SAASignalsFound Genuses
 // ScanOrganic progress: scanType is "Log" (1st sample), "Sample" (2nd/3rd)
 // or "Analyse" (complete). Updates genus states and bioDone.

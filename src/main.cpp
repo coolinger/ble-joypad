@@ -416,6 +416,22 @@ void updateStatusLine() {
 static char* logText = nullptr;  // Allocated on heap
 static const int LOG_TEXT_SIZE = 2048;  // Large buffer with PSRAM for more log entries
 
+static void shortBodyLabel(const char* bodyName, char* out, size_t outLen);
+
+// Render-time body label: system prefix stripped against the CURRENT system
+// name (labels self-heal once it becomes known) and inner spaces removed,
+// matching the in-game shorthand: "... 5 b a" -> "5ba".
+static void compactBodyLabel(const char* bodyName, char* out, size_t outLen) {
+  char tmp[24];
+  shortBodyLabel(bodyName, tmp, sizeof(tmp));
+  size_t o = 0;
+  for (const char* q = tmp; *q && o < outLen - 1; q++) {
+    if (*q != ' ') out[o++] = *q;
+  }
+  out[o] = '\0';
+  if (o == 0) snprintf(out, outLen, "?");
+}
+
 // Fill the SIGNALS sidebar from pinnedBodies[] + status.exploration. Caller
 // MUST hold lvglMutex (the mutex is not recursive - never call this from
 // outside updateLogDisplay without taking the mutex yourself).
@@ -452,8 +468,10 @@ static void updatePinnedSidebarUnlocked() {
   if (near) {
     PinnedBody &pb = *near;
     bool bioComplete = (pb.bio > 0 && pb.bioDone >= pb.bio);
+    char lbl[16];
+    compactBodyLabel(pb.name, lbl, sizeof(lbl));
     char t[64];
-    int l = snprintf(t, sizeof(t), "%s", pb.label);
+    int l = snprintf(t, sizeof(t), "%s", lbl);
     if (pb.bio > 0 && l < (int)sizeof(t))
       l += snprintf(t + l, sizeof(t) - l, "  Bio %d/%d", pb.bioDone, pb.bio);
     if (pb.geo > 0 && l < (int)sizeof(t))
@@ -496,9 +514,11 @@ static void updatePinnedSidebarUnlocked() {
     PinnedBody &pb = pinnedBodies[i];
     if (near == &pinnedBodies[i]) continue;  // shown on the card instead
     int c = (pb.bio > 0) ? 0 : (pb.geo > 0) ? 1 : 2;
+    char lbl[16];
+    compactBodyLabel(pb.name, lbl, sizeof(lbl));
     if (lens[c] < (int)sizeof(lines[c]) - 1)
       lens[c] += snprintf(lines[c] + lens[c], sizeof(lines[c]) - lens[c],
-                          " %s", pb.label);
+                          " %s", lbl);
   }
   for (int c = 0; c < 3; c++) {
     if (!cat_lines[c]) continue;
@@ -1795,9 +1815,10 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Pin the body (by BodyID) with its signals at the top of the log view;
       // a later SAASignalsFound for the same body just refreshes the counts.
       if (totalSignals > 0 && !doc["BodyName"].isNull()) {
-        char bodyLabel[20];
-        shortBodyLabel(doc["BodyName"] | "", bodyLabel, sizeof(bodyLabel));
-        pinBodySignals(doc["BodyID"] | -1, bodyLabel, bioCount, geoCount, otherCount);
+        // Store the FULL body name; shortening happens at render time so
+        // pins created before the system name is known self-heal.
+        pinBodySignals(doc["BodyID"] | -1, doc["BodyName"] | "",
+                       bioCount, geoCount, otherCount);
         // System-wide tally for the SIGNALS header (deduped per BodyID)
         explorationSignals(doc["BodyID"] | -1, bioCount, geoCount, otherCount);
         // DSS mapping reveals WHICH bio genuses live here -> genus detail line
