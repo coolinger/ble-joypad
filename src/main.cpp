@@ -1043,8 +1043,14 @@ void onWebSocketMessage(WebsocketsMessage message) {
   }
 
   String data = message.data();
-  
-  //Serial.printf("[WS] Received %d bytes\n", data.length());
+
+  // Diagnose for the large-frame path: raw payload vs. converted String.
+  if (len > 4096 || data.length() != len) {
+    Serial.printf("[WS] rx raw=%u str=%u complete=%d free int=%u psram=%u\n",
+                  (unsigned)len, (unsigned)data.length(), (int)message.isComplete(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  }
   
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
   JsonDocument doc;
