@@ -9,9 +9,10 @@
 #include <Arduino.h>
 #endif
 
-// LOCAL PATCH: temporary diagnostics for the large-frame investigation.
-// Prints every abnormal frame exit with enough context to localize it.
-#define BLEJOY_WS_DIAG 1
+// LOCAL PATCH: diagnostics for the large-frame path (prints every abnormal
+// frame exit with context). Investigation done - disabled; flip to 1 if big
+// frames ever act up again.
+#define BLEJOY_WS_DIAG 0
 #if defined(ARDUINO) && BLEJOY_WS_DIAG
 #define WS_DIAG(...) Serial.printf(__VA_ARGS__)
 #else

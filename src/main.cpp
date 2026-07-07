@@ -1030,12 +1030,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
   // getLogEntries payload came back as an EMPTY String despite 7 MB free
   // PSRAM) - and the String detour cost two full-size copies anyway.
   const websockets::WSString& raw = message.rawData();
-  if (len > 4096) {
-    Serial.printf("[WS] rx raw=%u complete=%d free int=%u psram=%u\n",
-                  (unsigned)raw.size(), (int)message.isComplete(),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-  }
 
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
   JsonDocument doc(&jsonPsram);  // pools in PSRAM: keep internal RAM for lwIP
@@ -1927,8 +1921,11 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
       status.onFoot = false;
       updateContextPanel();  // switch panel back to EXPLORATION
       addLogEntry("Embark");
-    } else if (event == "Shutdown" || event == "CarrierJump") {
-      // Session over / carrier moved: pinned body signals are stale
+    } else if (event == "CarrierJump") {
+      // Carrier moved to another system: pinned body signals are stale.
+      // NOTE: "Shutdown" (game quit) deliberately does NOT clear - the boot
+      // replay usually ends on a Shutdown entry and would wipe everything it
+      // just rebuilt; the system data stays valid until an actual jump.
       clearPinnedBodies();
       explorationReset();
       status.nearBodyId = -1;
