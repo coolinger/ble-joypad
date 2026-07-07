@@ -1264,7 +1264,6 @@ void onWebSocketMessage(WebsocketsMessage message) {
       // Commander info (name/rank) could be parsed here if needed
     } else {
       Serial.printf("[WS] Unhandled name message: %s\n", name ? name : "(null)");
-      Serial.println(data);
     }
 
     doc.clear();
