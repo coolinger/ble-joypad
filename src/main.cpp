@@ -1612,12 +1612,16 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
       explorationAllFound();
       explTouched = true;
     } else if (event == "Scan") {
-      int prevFirst = status.exploration.firstDiscovered;
       explorationScan(doc["BodyID"] | -1,
                       doc["WasDiscovered"] | true,
                       doc["WasMapped"] | true);
-      // First discovery (nobody scanned this body before): celebratory chime.
-      if (status.exploration.firstDiscovered > prevFirst && !replayingHistory)
+      // First-in-system chime: once per virgin system, on the ARRIVAL STAR's
+      // auto-scan only. The primary star (no "Parents") is the first body
+      // scanned on entry; if it's undiscovered, the whole system is. This
+      // avoids a chime on every subsequently discovered body.
+      bool isArrivalStar = !doc["Parents"].is<JsonArray>();
+      if (strcmp(doc["ScanType"] | "", "AutoScan") == 0 && isArrivalStar &&
+          !(doc["WasDiscovered"] | true) && !replayingHistory)
         pendingFirstDiscBeep = true;
       explTouched = true;
     } else if (event == "SAAScanComplete") {
