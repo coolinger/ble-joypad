@@ -1,5 +1,58 @@
 # BLE Joypad - Changelog
 
+## V5 On-Device Hardening (July 2026, post-review)
+
+Fixes and features from live exploration sessions on the finished V5 build.
+Firmware after this round: 2,078,768 bytes (66.1 % of the 3 MB partition),
+RAM 18.7 % static.
+
+### SIGNALS sidebar redesign (user design, real-data driven)
+- A 15-signal-body system blew past the old 4 card slots, and total-count
+  sorting locked bio bodies out. New scheme: dynamic header tally
+  ("SIGNALS 15  B8 G22", B = OPEN bio signals), ONE detail card only for the
+  body whose gravity well the player is in (ApproachBody/LeaveBody ->
+  `status.nearBodyId`), compact per-category body lists below
+  ("BIO: 5b(2)" with open counts; bodies with several types appear in each
+  line). Registry `MAX_PINNED_BODIES` 4 -> 16, sort/eviction bio-first.
+- Pins store the FULL BodyName; labels shorten at render time against the
+  current system name (self-healing after boot replay) and compact inner
+  spaces ("5 b a" -> "5ba").
+- ScanOrganic progress arriving before its body's pin exists (replay
+  reordering: the game re-announces FSSBodySignals on approach) is buffered
+  and applied when the pin appears.
+- `Shutdown` no longer clears signals/exploration (the replay usually ends
+  on one and wiped what it had just rebuilt); only jumps/CarrierJump clear.
+
+### Boot replay: 100 entries, crash-free
+- Replay window 50 -> 100 (the old lwIP ceiling was platform-specific).
+- Vendored `ArduinoWebsockets` with a large-frame patch: the stock lib
+  treats a momentarily empty TCP buffer as end-of-frame and truncated
+  ~100 KB responses (they arrived as EMPTY messages). Bounded 3 s waits,
+  zero-payload frames excepted, truncated frames dropped.
+- Arduino `String` silently caps near 64 KB: `deserializeJson` now parses
+  straight from the lib's internal `std::string` (`message.rawData()`).
+- Boot `abort()` on core 0 decoded: mDNS (started by the dead ArduinoOTA
+  listener) logging during the parse window while ArduinoJson's pools had
+  drained internal RAM. ArduinoOTA fully removed; WS-path JsonDocuments use
+  a PSRAM-pinned allocator; replay passes JsonVariant views (no per-entry
+  copies) and yields to core 0 between entries.
+
+### Quality of life
+- `getSystem` boot fallback: adopts the current system name when the replay
+  window held no FSDJump/Location ("Waiting for events..." fix).
+- Periodic 5 s UI refresh (change-guarded) - healed data becomes visible
+  without waiting for the next journal event.
+- Non-blocking USB-CDC TX (`Serial.setTxTimeoutMs(0)`): with a PC attached
+  but no terminal reading, blocked prints inside lvglMutex holds froze the
+  display until a monitor drained the buffer.
+- FSS signal pings pitched by category (bio 1800 Hz, geo 900 Hz, other
+  1400 Hz, grouped); rising three-tone chime on first discoveries
+  (`Scan.WasDiscovered == false`); shared audio gate so chime and pings
+  never collide.
+- JUMPS strip group follows the value/caption grid (Michroma 18, shared
+  caption baseline); tab captions rotated 90 deg; static log time column
+  removed, freed width widens the sidebar to 202 px.
+
 ## V5 MFD Overhaul (July 2026)
 
 Reworked the UI around a persistent "shell" frame drawn on `lv_layer_top()`
