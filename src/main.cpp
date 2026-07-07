@@ -1047,12 +1047,14 @@ void onWebSocketMessage(WebsocketsMessage message) {
     const char* name = doc["name"];
     JsonVariant msg = doc["message"];
 
-    // Reset timeout and wake display on game traffic — but only while a BLE
-    // host is connected (otherwise WS chatter keeps the display alive all
-    // night) and not manually switched off via the BLACK button.
-    if (bleConnected && !displayManualOff) wakeDisplay();
-
     if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
+      // Wake the display on REAL game activity only (journal events) - not
+      // on responses to our own requests or reconnect chatter: Icarus drops
+      // the idle WS every few minutes and the reconnect's ShipStatus reply
+      // kept turning the display on while the game was already closed.
+      // Gated on BLE (host present) and the manual-off latch as before.
+      if (bleConnected && !displayManualOff && !replayingHistory) wakeDisplay();
+
       String eventType = "JOURNAL";  // Reuse existing journal handler
 
       JsonDocument eventDoc(&jsonPsram);
@@ -1265,11 +1267,8 @@ void onWebSocketMessage(WebsocketsMessage message) {
   String eventType = String(type);
   Serial.printf("[WS] Processing %s event ID: %d\n", eventType.c_str(), id);
   
-  // Reset display timeout on message (only while a BLE host is connected and
-  // the display wasn't manually switched off)
-  if (bleConnected && !displayManualOff) wakeDisplay();
-  
   // Process event - reuse the doc to avoid extra allocations
+  // (no display wake here: only journal events wake, see newLogEntry above)
   JsonDocument eventDoc(&jsonPsram);
   eventDoc.set(dataObj);
   
