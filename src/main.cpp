@@ -8,7 +8,6 @@
 #include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
-#include <ArduinoOTA.h>
 #include <esp_heap_caps.h>
 #include <algorithm>
 #include "sound.h"
@@ -44,6 +43,21 @@ i2s_chan_handle_t i2s_tx_chan = NULL;
 // Audio clocking constants now in sound.h
 
 #include "colors.h"
+
+// ArduinoJson allocator that pins document pools to PSRAM. The default
+// malloc prefers INTERNAL ram for small pool chunks, so parsing a ~100 KB
+// getLogEntries response drained the internal heap - concurrently, any
+// lazy lock-init on core 0 (lwIP/newlib) failed its allocation -> abort().
+struct SpiRamJsonAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t n) override {
+    return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  void deallocate(void* p) override { heap_caps_free(p); }
+  void* reallocate(void* p, size_t n) override {
+    return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+};
+static SpiRamJsonAllocator jsonPsram;
 #include "theme.h"
 
 // Global flags
@@ -86,7 +100,6 @@ uint32_t wsReconnectDelayMs = 3000;           // start with 3s backoff
 const uint32_t WS_RECONNECT_DELAY_MAX = 60000; // cap at 60s
 uint32_t wsLastPing = 0;
 uint32_t wsLastPong = 0;
-bool otaInitialized = false;
 
 // Task handle for Core 0
 TaskHandle_t msgTaskHandle = NULL;
@@ -883,7 +896,6 @@ void requestSummary();
 void connectWebSocket();
 void updateJumpsRemaining(int newValue);
 void showJumpOverlay(int jumps);
-static void startOtaIfNeeded();
 
 void checkDisplayTimeout()
 {
@@ -923,8 +935,6 @@ void checkWifiConnection() {
       Serial.println(WiFi.localIP());
       beepConnect();
       wifiWasConnected = true;
-
-      startOtaIfNeeded();
 
       // Connect to Icarus terminal websocket as soon as WiFi is up
       delay(200);
@@ -976,33 +986,6 @@ static bool cargoHasSymbol(const char* symbol) {
   return false;
 }
 
-static void startOtaIfNeeded() {
-  if (otaInitialized) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] Start");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("[OTA] End");
-  });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    static unsigned int lastPct = 0;
-    unsigned int pct = (progress * 100U) / total;
-    if (pct != lastPct) {
-      Serial.printf("[OTA] %u%%\n", pct);
-      lastPct = pct;
-    }
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("[OTA] Error %u\n", error);
-  });
-
-  ArduinoOTA.begin();
-  otaInitialized = true;
-  Serial.println("[OTA] Ready (use WiFi IP above)");
-}
 
 // Helper function to replace umlauts with double vowels
 void replaceUmlauts(char* str) {
@@ -1055,7 +1038,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   }
 
   // Parse WebSocket JSON message format: {"type": "TYPE", "id": 123, "data": {...}}
-  JsonDocument doc;
+  JsonDocument doc(&jsonPsram);  // pools in PSRAM: keep internal RAM for lwIP
   DeserializationError error = deserializeJson(doc, raw.c_str(), raw.size(),
                                                DeserializationOption::NestingLimit(40));
   
@@ -1078,7 +1061,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
     if (name && strcmp(name, "newLogEntry") == 0 && !msg.isNull()) {
       String eventType = "JOURNAL";  // Reuse existing journal handler
 
-      JsonDocument eventDoc;
+      JsonDocument eventDoc(&jsonPsram);
       eventDoc.set(msg);
 
       printHeapStatus("before handler");
@@ -1293,7 +1276,7 @@ void onWebSocketMessage(WebsocketsMessage message) {
   if (bleConnected && !displayManualOff) wakeDisplay();
   
   // Process event - reuse the doc to avoid extra allocations
-  JsonDocument eventDoc;
+  JsonDocument eventDoc(&jsonPsram);
   eventDoc.set(dataObj);
   
   printHeapStatus("before handler");
@@ -2145,9 +2128,6 @@ void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
 
     update_wifi_icon();
 
-    // Bring up OTA once WiFi is ready
-    startOtaIfNeeded();
-
     // Connect to WebSocket immediately when WiFi comes up
     connectWebSocket();
   } else {
@@ -2505,14 +2485,6 @@ void loop()
     lastWifiStatusPrint = currentTime;
   }
 
-  // Handle OTA updates
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!otaInitialized) {
-      startOtaIfNeeded();
-    }
-    ArduinoOTA.handle();
-  }
-  
   // Handle screen blinking for motherlode detection
   if (blinkScreen && blinkCount > 0) {
     if (millis() - lastBlinkTime > 200) {  // Blink every 200ms
