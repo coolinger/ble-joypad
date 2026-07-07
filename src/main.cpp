@@ -1115,12 +1115,14 @@ void onWebSocketMessage(WebsocketsMessage message) {
                     complete, (bool)(msg["loadingInProgress"] | false));
       if (complete && !historyRequested && !historyLoaded) {
         historyRequested = true;
-        // 50, not 100 like the web client: the ~100 KB response of count=100
-        // crashed the network stack (abort on core 0, lwIP/String assembly in
-        // internal RAM). 50 (~50 KB) is proven stable. Trade-off: a spammy
-        // on-foot session can push FSSBodySignals out of the window - re-scan
-        // the body (FSS/DSS) to re-pin it.
-        requestLogEntriesWs(50);
+        // 100 like the web client. History: count=100 (~100 KB response)
+        // crashed the OLD platform (abort on core 0, lwIP/String assembly in
+        // internal RAM) and was lowered to 50. The current platform has
+        // SPIRAM_USE_MALLOC (boot log: heap ~8 MB), so big String buffers
+        // land in PSRAM - if the abort ever returns, drop back to 50.
+        // A bigger window matters: exploration sessions push ScanOrganic/
+        // FSSBodySignals pairs apart, losing bio progress on reboot.
+        requestLogEntriesWs(100);
       }
     } else if (name && strcmp(name, "getSystem") == 0 && !msg.isNull()) {
       // Current-system fallback: only adopt the name while we know nothing —
