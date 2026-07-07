@@ -1616,10 +1616,12 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
                       doc["WasDiscovered"] | true,
                       doc["WasMapped"] | true);
       // First-in-system chime: once per virgin system, on the ARRIVAL STAR's
-      // auto-scan only. The primary star (no "Parents") is the first body
-      // scanned on entry; if it's undiscovered, the whole system is. This
-      // avoids a chime on every subsequently discovered body.
-      bool isArrivalStar = !doc["Parents"].is<JsonArray>();
+      // auto-scan only (the body you drop in at, DistanceFromArrivalLS == 0 -
+      // it may orbit a barycenter, so "no Parents" is NOT a reliable marker).
+      // If that star is undiscovered the whole system is, so this fires at
+      // most once per system and never on later body discoveries.
+      bool isArrivalStar = ((float)(doc["DistanceFromArrivalLS"] | -1.0f)) < 1.0f &&
+                           ((float)(doc["DistanceFromArrivalLS"] | -1.0f)) >= 0.0f;
       if (strcmp(doc["ScanType"] | "", "AutoScan") == 0 && isArrivalStar &&
           !(doc["WasDiscovered"] | true) && !replayingHistory)
         pendingFirstDiscBeep = true;
