@@ -416,19 +416,41 @@ void updateStatusLine() {
 static char* logText = nullptr;  // Allocated on heap
 static const int LOG_TEXT_SIZE = 2048;  // Large buffer with PSRAM for more log entries
 
-// Fill the sidebar pin cards from pinnedBodies[]. Caller MUST hold lvglMutex
-// (the mutex is not recursive - never call this from outside updateLogDisplay
-// without taking the mutex yourself).
+// Fill the SIGNALS sidebar from pinnedBodies[] + status.exploration. Caller
+// MUST hold lvglMutex (the mutex is not recursive - never call this from
+// outside updateLogDisplay without taking the mutex yourself).
+// Layout: dynamic header tally, ONE detail card for the body currently in
+// gravity influence (status.nearBodyId), compact per-category body lists.
 static void updatePinnedSidebarUnlocked() {
-  for (int i = 0; i < MAX_PINNED_BODIES; i++) {
-    if (!pin_cards[i]) return;
-    if (i >= pinnedBodyCount) {
-      lv_obj_add_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
-      continue;
-    }
-    PinnedBody &pb = pinnedBodies[i];
-    lv_obj_remove_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
+  if (!signals_rail_label || !near_card) return;
 
+  // ---- header: system-wide tally (independent of the registry) ----
+  ExplorationInfo &x = status.exploration;
+  if (x.sigBodies == 0) {
+    lv_label_set_text(signals_rail_label, "SIGNALS");
+  } else {
+    int bioOpen = x.sigBio - x.bioAnalysed;
+    if (bioOpen < 0) bioOpen = 0;
+    char hdr[40];
+    int hl = snprintf(hdr, sizeof(hdr), "SIGNALS %d", x.sigBodies);
+    if (x.sigBio > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  B%d", bioOpen);
+    if (x.sigGeo > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  G%d", x.sigGeo);
+    if (x.sigOther > 0 && hl < (int)sizeof(hdr))
+      hl += snprintf(hdr + hl, sizeof(hdr) - hl, "  O%d", x.sigOther);
+    lv_label_set_text(signals_rail_label, hdr);
+  }
+
+  // ---- detail card: only for the body we are orbiting/approaching ----
+  PinnedBody *near = nullptr;
+  if (status.nearBodyId >= 0) {
+    for (int i = 0; i < pinnedBodyCount; i++) {
+      if (pinnedBodies[i].bodyId == status.nearBodyId) { near = &pinnedBodies[i]; break; }
+    }
+  }
+  if (near) {
+    PinnedBody &pb = *near;
     bool bioComplete = (pb.bio > 0 && pb.bioDone >= pb.bio);
     char t[64];
     int l = snprintf(t, sizeof(t), "%s", pb.label);
@@ -438,8 +460,8 @@ static void updatePinnedSidebarUnlocked() {
       l += snprintf(t + l, sizeof(t) - l, "  Geo %d", pb.geo);
     if (pb.other > 0 && l < (int)sizeof(t))
       l += snprintf(t + l, sizeof(t) - l, "  Sig %d", pb.other);
-    lv_label_set_text(pin_title_labels[i], t);
-    lv_obj_set_style_text_color(pin_title_labels[i],
+    lv_label_set_text(near_title_label, t);
+    lv_obj_set_style_text_color(near_title_label,
         bioComplete ? lv_color_hex(0xc6e6dc) : lv_color_hex(0xffb000), 0);
 
     if (pb.genusCount > 0) {
@@ -452,10 +474,40 @@ static void updatePinnedSidebarUnlocked() {
         else if (pb.genuses[gi].state == BIO_DONE) col = "4169e1";
         gl += snprintf(g + gl, sizeof(g) - gl, "#%s %s# ", col, pb.genuses[gi].name);
       }
-      lv_label_set_text(pin_genus_labels[i], g);
-      lv_obj_remove_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+      lv_label_set_text(near_genus_label, g);
+      lv_obj_remove_flag(near_genus_label, LV_OBJ_FLAG_HIDDEN);
     } else {
-      lv_obj_add_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(near_genus_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_remove_flag(near_card, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(near_card, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- category lines: which bodies (counts live in the header) ----
+  // Registry is sorted bio-first, so the BIO line lists them in rank order.
+  static const char *catPrefix[3] = {"BIO:", "GEO:", "OTH:"};
+  char lines[3][192];
+  int lens[3];
+  for (int c = 0; c < 3; c++) {
+    lens[c] = snprintf(lines[c], sizeof(lines[c]), "%s", catPrefix[c]);
+  }
+  for (int i = 0; i < pinnedBodyCount; i++) {
+    PinnedBody &pb = pinnedBodies[i];
+    if (near == &pinnedBodies[i]) continue;  // shown on the card instead
+    int c = (pb.bio > 0) ? 0 : (pb.geo > 0) ? 1 : 2;
+    if (lens[c] < (int)sizeof(lines[c]) - 1)
+      lens[c] += snprintf(lines[c] + lens[c], sizeof(lines[c]) - lens[c],
+                          " %s", pb.label);
+  }
+  for (int c = 0; c < 3; c++) {
+    if (!cat_lines[c]) continue;
+    bool has = lens[c] > (int)strlen(catPrefix[c]);
+    if (has) {
+      lv_label_set_text(cat_lines[c], lines[c]);
+      lv_obj_remove_flag(cat_lines[c], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(cat_lines[c], LV_OBJ_FLAG_HIDDEN);
     }
   }
 }
@@ -1537,6 +1589,13 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
     } else if (event == "SAAScanComplete") {
       explorationMapped(doc["BodyID"] | -1);
       explTouched = true;
+    } else if (event == "ApproachBody") {
+      // Entered a body's gravity well: the sidebar shows its detail card.
+      // Both events still fall through to the generic log, whose
+      // updateLogDisplay refreshes the sidebar.
+      status.nearBodyId = doc["BodyID"] | -1;
+    } else if (event == "LeaveBody") {
+      status.nearBodyId = -1;
     }
     // Only refresh the panel when one of the exploration events above
     // actually touched its state - avoids a refresh for every journal
@@ -1597,6 +1656,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Left the old system: pinned body signals are no longer relevant
       clearPinnedBodies();
       explorationReset();
+      status.nearBodyId = -1;
       updateContextPanel();
       updateLogDisplay();
     } else if (event == "StartJump") {
@@ -1606,6 +1666,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       if (strcmp(doc["JumpType"] | "", "Hyperspace") == 0) {
         clearPinnedBodies();
         explorationReset();
+        status.nearBodyId = -1;
         updateContextPanel();
         if (doc["StarSystem"].is<const char*>()) {
           status.currentSystem = doc["StarSystem"].as<const char*>();
@@ -1737,6 +1798,8 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
         char bodyLabel[20];
         shortBodyLabel(doc["BodyName"] | "", bodyLabel, sizeof(bodyLabel));
         pinBodySignals(doc["BodyID"] | -1, bodyLabel, bioCount, geoCount, otherCount);
+        // System-wide tally for the SIGNALS header (deduped per BodyID)
+        explorationSignals(doc["BodyID"] | -1, bioCount, geoCount, otherCount);
         // DSS mapping reveals WHICH bio genuses live here -> genus detail line
         if (doc["Genuses"].is<JsonArray>()) {
           for (JsonObject g : doc["Genuses"].as<JsonArray>()) {
@@ -1826,6 +1889,7 @@ void handleEliteEvent(const String& eventType, JsonDocument& doc) {
       // Session over / carrier moved: pinned body signals are stale
       clearPinnedBodies();
       explorationReset();
+      status.nearBodyId = -1;
       updateContextPanel();
       addLogEntry(event.c_str());
     } else {

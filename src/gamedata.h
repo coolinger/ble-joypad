@@ -54,6 +54,14 @@ struct ExplorationInfo {
   uint8_t stationsL = 0;      // largest pad L (Coriolis/Orbis/Ocellus/Asteroid/MegaShip)
   uint8_t stationsM = 0;      // largest pad M (Outpost)
   uint8_t carriers = 0;       // FleetCarrier
+  // System-wide signal tally (FSSBodySignals/SAASignalsFound, deduped per
+  // body). Independent of the pinned-body registry so header totals survive
+  // auto-unpins of completed bodies.
+  uint8_t sigBodies = 0;      // bodies with any signal
+  int  sigBio = 0;            // biological signals total
+  int  sigGeo = 0;            // geological signals total
+  int  sigOther = 0;          // everything else (human/thargoid/guardian/...)
+  int  bioAnalysed = 0;       // genuses completed (ScanOrganic "Analyse")
 };
 
 struct EventLogEntry {
@@ -92,6 +100,9 @@ struct StatusModel {
   bool inTaxi = false;
   bool inMulticrew = false;
   long credits = 0;
+  // Body whose gravity well the player is in (ApproachBody/LeaveBody journal
+  // events; the DSS probe scan starts there). -1 = none.
+  int nearBodyId = -1;
   std::vector<CommunityGoal> communityGoals;
 };
 
@@ -109,11 +120,13 @@ extern bool blinkScreen;
 extern int blinkCount;
 extern uint32_t lastBlinkTime;
 
-// Bodies with FSS/DSS-detected signals, pinned at the top of the log view
-// until the ship leaves the system (jump/shutdown). bioDone counts organisms
-// fully analysed (3 samples -> ScanOrganic "Analyse") against the biological
-// signal count. Per-genus scan progress is tracked for the detail line.
-#define MAX_PINNED_BODIES 4
+// Registry of bodies with FSS/DSS-detected signals, kept until the ship
+// leaves the system (jump/shutdown). Sized so a signal-rich system fits
+// whole (15 signal bodies seen in the wild); rendering decides what to show.
+// bioDone counts organisms fully analysed (3 samples -> ScanOrganic
+// "Analyse") against the biological signal count. Per-genus scan progress is
+// tracked for the detail line.
+#define MAX_PINNED_BODIES 16
 #define MAX_GENUSES 8
 
 enum BioScanState : uint8_t {
@@ -155,6 +168,9 @@ void explorationAllFound();
 void explorationScan(int bodyId, bool wasDiscovered, bool wasMapped);
 void explorationMapped(int bodyId);
 bool explorationStation(const char* signalName, const char* signalType);
+// System-wide signal tally from FSSBodySignals/SAASignalsFound (deduped by
+// BodyID, so a later DSS re-announcement doesn't double-count).
+void explorationSignals(int bodyId, int bio, int geo, int other);
 
 // Small API helpers
 void updateJumpsRemaining(int newValue);

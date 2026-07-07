@@ -7,9 +7,11 @@
 lv_obj_t *logviewer_screen = nullptr;
 lv_obj_t *log_label = nullptr;
 lv_obj_t *jump_overlay_label = nullptr;
-lv_obj_t *pin_cards[MAX_PINNED_BODIES] = {nullptr};
-lv_obj_t *pin_title_labels[MAX_PINNED_BODIES] = {nullptr};
-lv_obj_t *pin_genus_labels[MAX_PINNED_BODIES] = {nullptr};
+lv_obj_t *signals_rail_label = nullptr;
+lv_obj_t *near_card = nullptr;
+lv_obj_t *near_title_label = nullptr;
+lv_obj_t *near_genus_label = nullptr;
+lv_obj_t *cat_lines[3] = {nullptr};
 lv_obj_t *ctx_panel = nullptr;
 lv_obj_t *ctx_rail_label = nullptr;
 lv_obj_t *ctx_lines[4] = {nullptr};
@@ -64,36 +66,53 @@ void create_logviewer_ui() {
   lv_obj_set_scrollbar_mode(side, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_scroll_dir(side, LV_DIR_NONE);
 
-  lv_obj_t *sig_rail = rail(side, "SIGNALS", 0, 0, SIDE_W - 8);
-  lv_obj_set_pos(sig_rail, 0, 0);
+  // Dynamic header: system-wide signal tally, e.g. "SIGNALS 15  B8 G22"
+  signals_rail_label = rail(side, "SIGNALS", 0, 0, SIDE_W - 8);
+  lv_obj_set_pos(signals_rail_label, 0, 0);
 
-  for (int i = 0; i < MAX_PINNED_BODIES; i++) {
-    pin_cards[i] = lv_obj_create(side);
-    lv_obj_set_width(pin_cards[i], SIDE_W - 8);
-    lv_obj_set_height(pin_cards[i], LV_SIZE_CONTENT);
-    lv_obj_set_pos(pin_cards[i], 0, 20);   // stacked by flex below
-    lv_obj_add_style(pin_cards[i], &style_card, 0);
-    lv_obj_set_scrollbar_mode(pin_cards[i], LV_SCROLLBAR_MODE_OFF);
-    lv_obj_set_scroll_dir(pin_cards[i], LV_DIR_NONE);
-    lv_obj_set_flex_flow(pin_cards[i], LV_FLEX_FLOW_COLUMN);
-    lv_obj_add_flag(pin_cards[i], LV_OBJ_FLAG_HIDDEN);
+  // One card: the body whose gravity well the player is in (ApproachBody) —
+  // detail exactly where the probe scan / landing happens. Two lines: title +
+  // genus chips, like the old pin cards.
+  near_card = lv_obj_create(side);
+  lv_obj_set_width(near_card, SIDE_W - 8);
+  lv_obj_set_height(near_card, LV_SIZE_CONTENT);
+  lv_obj_add_style(near_card, &style_card, 0);
+  lv_obj_set_scrollbar_mode(near_card, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scroll_dir(near_card, LV_DIR_NONE);
+  lv_obj_set_flex_flow(near_card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_add_flag(near_card, LV_OBJ_FLAG_HIDDEN);
 
-    pin_title_labels[i] = lv_label_create(pin_cards[i]);
-    lv_obj_set_width(pin_title_labels[i], SIDE_W - 18);
-    lv_label_set_long_mode(pin_title_labels[i], LV_LABEL_LONG_MODE_WRAP);
-    lv_label_set_text(pin_title_labels[i], "");
-    lv_obj_set_style_text_font(pin_title_labels[i], FONT_BODY, 0);
-    lv_obj_set_style_text_color(pin_title_labels[i], lv_color_hex(0xffb000), 0);
+  near_title_label = lv_label_create(near_card);
+  lv_obj_set_width(near_title_label, SIDE_W - 18);
+  lv_label_set_long_mode(near_title_label, LV_LABEL_LONG_MODE_WRAP);
+  lv_label_set_text(near_title_label, "");
+  lv_obj_set_style_text_font(near_title_label, FONT_BODY, 0);
+  lv_obj_set_style_text_color(near_title_label, lv_color_hex(0xffb000), 0);
 
-    pin_genus_labels[i] = lv_label_create(pin_cards[i]);
-    lv_obj_set_width(pin_genus_labels[i], SIDE_W - 18);
-    lv_label_set_long_mode(pin_genus_labels[i], LV_LABEL_LONG_MODE_WRAP);
-    lv_label_set_recolor(pin_genus_labels[i], true);
-    lv_label_set_text(pin_genus_labels[i], "");
-    lv_obj_set_style_text_font(pin_genus_labels[i], FONT_SMALL, 0);
-    lv_obj_add_flag(pin_genus_labels[i], LV_OBJ_FLAG_HIDDEN);
+  near_genus_label = lv_label_create(near_card);
+  lv_obj_set_width(near_genus_label, SIDE_W - 18);
+  lv_label_set_long_mode(near_genus_label, LV_LABEL_LONG_MODE_WRAP);
+  lv_label_set_recolor(near_genus_label, true);
+  lv_label_set_text(near_genus_label, "");
+  lv_obj_set_style_text_font(near_genus_label, FONT_SMALL, 0);
+  lv_obj_add_flag(near_genus_label, LV_OBJ_FLAG_HIDDEN);
+
+  // Category lines below the card: compact body lists per signal type
+  // ("BIO: 5d 5e" / "GEO: 1a 1c ..."), smaller type, tighter leading —
+  // counts live in the header, these answer "which bodies".
+  for (int i = 0; i < 3; i++) {
+    cat_lines[i] = lv_label_create(side);
+    lv_obj_set_width(cat_lines[i], SIDE_W - 8);
+    lv_label_set_long_mode(cat_lines[i], LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(cat_lines[i], "");
+    lv_obj_set_style_text_font(cat_lines[i], FONT_SMALL, 0);
+    lv_obj_set_style_text_line_space(cat_lines[i], -2, 0);
+    lv_obj_set_style_text_color(cat_lines[i], LV_COLOR_FG, 0);
+    lv_obj_add_flag(cat_lines[i], LV_OBJ_FLAG_HIDDEN);
   }
-  // Stack rail + cards with flex; context panel is bottom-anchored separately.
+
+  // Stack rail + card + lines with flex; context panel is bottom-anchored
+  // separately.
   lv_obj_set_flex_flow(side, LV_FLEX_FLOW_COLUMN);
 
   // ---- context panel (bottom of sidebar, fixed) ----

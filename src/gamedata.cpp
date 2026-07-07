@@ -22,13 +22,21 @@ static int pinTotal(const PinnedBody &pb) {
   return pb.bio + pb.geo + pb.other;
 }
 
-// Keep the list sorted descending by total signal count (stable insertion
-// sort; the list is tiny). Invariant: the last entry is always the weakest.
+// Sort key: biological signals first (the explorer's priority), then total
+// signal count. Fixes bio bodies getting locked out by earlier geo bodies
+// when the registry fills.
+static bool pinOutranks(const PinnedBody &a, const PinnedBody &b) {
+  if (a.bio != b.bio) return a.bio > b.bio;
+  return pinTotal(a) > pinTotal(b);
+}
+
+// Keep the list sorted by pinOutranks (stable insertion sort; the list is
+// tiny). Invariant: the last entry is always the weakest.
 static void sortPinnedBodies() {
   for (int i = 1; i < pinnedBodyCount; i++) {
     PinnedBody key = pinnedBodies[i];
     int j = i - 1;
-    while (j >= 0 && pinTotal(pinnedBodies[j]) < pinTotal(key)) {
+    while (j >= 0 && pinOutranks(key, pinnedBodies[j])) {
       pinnedBodies[j + 1] = pinnedBodies[j];
       j--;
     }
@@ -50,9 +58,11 @@ void pinBodySignals(int bodyId, const char* label, int bio, int geo, int other) 
     }
   }
   if (pinnedBodyCount >= MAX_PINNED_BODIES) {
-    // Full: the new body must beat the weakest pin (fewest total signals),
-    // otherwise it is not pinned at all.
-    if (bio + geo + other <= pinTotal(pinnedBodies[pinnedBodyCount - 1])) return;
+    // Full (rare at 16): the new body must outrank the weakest pin (bio
+    // first, then total), otherwise it is not pinned at all.
+    PinnedBody cand;
+    cand.bio = bio; cand.geo = geo; cand.other = other;
+    if (!pinOutranks(cand, pinnedBodies[pinnedBodyCount - 1])) return;
     pinnedBodyCount--;  // evict the weakest (list is sorted, last = weakest)
   }
   PinnedBody &pb = pinnedBodies[pinnedBodyCount++];
@@ -99,6 +109,9 @@ void organicScanProgress(int bodyId, const char* genusName, const char* scanType
   if (!g) return;
 
   if (strcmp(scanType, "Analyse") == 0) {
+    // Count completions system-wide (survives the auto-unpin below, feeds the
+    // "open bio signals" header tally).
+    if (g->state != BIO_DONE) status.exploration.bioAnalysed++;
     g->state = BIO_DONE;  // 3rd sample analysed -> checked off
   } else if (g->state != BIO_DONE) {
     // "Log" / "Sample": this organism is now loaded in the genetic sampler.
@@ -138,6 +151,7 @@ void clearPinnedBodies() {
 static uint32_t scannedBits[8];
 static uint32_t mappedBits[8];
 static uint32_t unmappedBits[8];   // bodies whose Scan said WasMapped == false
+static uint32_t signalBits[8];     // bodies already counted in the signal tally
 #define EXPL_MAX_STATIONS 40
 static uint32_t stationHashes[EXPL_MAX_STATIONS];
 static int stationHashCount = 0;
@@ -155,7 +169,17 @@ void explorationReset() {
   memset(scannedBits, 0, sizeof(scannedBits));
   memset(mappedBits, 0, sizeof(mappedBits));
   memset(unmappedBits, 0, sizeof(unmappedBits));
+  memset(signalBits, 0, sizeof(signalBits));
   stationHashCount = 0;
+}
+
+void explorationSignals(int bodyId, int bio, int geo, int other) {
+  if (bio + geo + other <= 0) return;
+  if (!testAndSetBit(signalBits, bodyId)) return;  // DSS re-announcement etc.
+  if (status.exploration.sigBodies < 255) status.exploration.sigBodies++;
+  status.exploration.sigBio += bio;
+  status.exploration.sigGeo += geo;
+  status.exploration.sigOther += other;
 }
 
 void explorationHonk(int bodyCount) {
