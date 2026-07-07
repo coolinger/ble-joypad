@@ -615,9 +615,13 @@ void updateLogDisplay() {
     // Ensure null termination
     logText[LOG_TEXT_SIZE - 1] = '\0';
     
-    // Update label - this is where LVGL might run out of memory
-    Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
-    lv_label_set_text(log_label, logText);
+    // Only touch the label when the content really changed: lv_label_set_text
+    // invalidates (= full redraw of the log area) even for identical text,
+    // which would make the periodic 5 s UI tick needlessly expensive.
+    if (strcmp(lv_label_get_text(log_label), logText) != 0) {
+      Serial.printf("[LOG] Setting label text (%d bytes)\n", currentLen);
+      lv_label_set_text(log_label, logText);
+    }
 
     xSemaphoreGive(lvglMutex);
     
@@ -2439,6 +2443,18 @@ void loop()
       (currentTime - lastSystemRequest) > SUMMARY_REQUEST_INTERVAL) {
     if (wsClient.available()) requestSystemWs();
     lastSystemRequest = currentTime;
+  }
+
+  // Periodic UI refresh: catches every "data changed but nothing re-rendered"
+  // case (e.g. sidebar labels healing after getSystem). Cheap: the update
+  // functions skip identical content, so an idle tick costs microseconds.
+  static uint32_t lastUiRefresh = 0;
+  if (currentTime - lastUiRefresh >= 5000) {
+    lastUiRefresh = currentTime;
+    updateHeader();
+    updateStatusLine();
+    updateContextPanel();
+    updateLogDisplay();
   }
   
   // Print WiFi signal quality every 30 seconds
