@@ -2327,6 +2327,16 @@ void setup()
   Serial.println("[BLE] Starting BLE gamepad...");
   bleGamepad->begin(&bleGamepadConfig);
 
+  // Animated ED loader ring: hold the boot splash while WiFi comes up.
+  // WifiConnect() started WiFi async above; animate until connected or timeout.
+  Serial.println("[BOOT] Loader ring until WiFi (or timeout)...");
+  uint32_t bootStart = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - bootStart < BOOT_LOADER_TIMEOUT_MS) {
+    disp.drawBootLoaderFrame(millis() - bootStart);
+    delay(BOOT_LOADER_FRAME_MS);
+  }
+
   theme_init();
   Serial.println("[UI] Creating fighter UI...");
   create_fighter_ui();
