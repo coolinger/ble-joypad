@@ -1742,6 +1742,22 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
         updateHeader();
         Serial.printf("[HULL] Health: %.1f%%\n", status.hull.hullHealth * 100.0f);
       }
+    } else if (event == "RepairAll") {
+      // Whole ship repaired -> hull back to 100%.
+      status.hull.hullHealth = 1.0f;
+      updateHeader();
+      addLogEntry("Repair: all");
+    } else if (event == "Repair") {
+      // Single-item repair. Only "Hull"/"All" restore hull integrity; a
+      // specific module repair leaves the hull as it was.
+      const char* item = doc["Item"] | "";
+      if (strcmp(item, "Hull") == 0 || strcmp(item, "All") == 0) {
+        status.hull.hullHealth = 1.0f;
+        updateHeader();
+      }
+      char rbuf[40];
+      snprintf(rbuf, sizeof(rbuf), "Repair: %s", item[0] ? item : "?");
+      addLogEntry(rbuf);
     } else if (event == "Loadout") {
       // Authoritative hull integrity (0-1). NOTE: this is HullHealth, NOT the
       // Armour module's Health (module integrity, always ~1.0). getShipStatus
