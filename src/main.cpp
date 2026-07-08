@@ -948,10 +948,8 @@ void checkWifiConnection() {
       Serial.println(WiFi.localIP());
       beepConnect();
       wifiWasConnected = true;
-
-      // Connect to Icarus terminal websocket as soon as WiFi is up
-      delay(200);
-      connectWebSocket();
+      // WebSocket connect happens on the WS task (loop2/checkMessages), gated
+      // on BLE - never from this render task, so it can't freeze the display.
     }
   } else {
     if (wifiWasConnected) {
@@ -2091,8 +2089,13 @@ void checkMessages() {
   if (serverIP.length() > 0 && websocketPort > 0) {
     uint32_t now = millis();
 
-    // Trigger reconnect if allowed by backoff and WiFi is up
-    if (!wsClient.available() && !wsConnecting && now >= wsNextReconnect && WiFi.status() == WL_CONNECTED) {
+    // Trigger reconnect if allowed by backoff, WiFi is up, and a BLE host is
+    // connected. Two reasons for the BLE gate: the blocking connect() runs on
+    // THIS task (loop2) so it never freezes rendering, and we only want a live
+    // WS while the controller is actually in use - no reconnect chatter to
+    // Icarus when the game/PC is idle.
+    if (!wsClient.available() && !wsConnecting && now >= wsNextReconnect &&
+        WiFi.status() == WL_CONNECTED && bleConnected) {
       connectWebSocket();
     }
 
@@ -2160,9 +2163,8 @@ void onWifiConnect(const WiFiEvent_t event, const WiFiEventInfo_t info)
     beepConnect();  // Rising tone for WiFi connection
 
     update_wifi_icon();
-
-    // Connect to WebSocket immediately when WiFi comes up
-    connectWebSocket();
+    // WebSocket connect is driven by the WS task (loop2), not from this WiFi
+    // event callback - keeps blocking connect() off every task but loop2.
   } else {
     Serial.println("\nWiFi connection failed, continuing without WiFi");
   }
@@ -2425,10 +2427,13 @@ void loop()
   if (reqRestartWebSocket) {
     reqRestartWebSocket = false;
     Serial.println("[SETTINGS] Restarting WebSocket...");
-    if (wsClient.available()) {
-      wsClient.close();
-    }
-    connectWebSocket();
+    // Just drop the socket and clear the backoff; the WS task reconnects
+    // (blocking connect() stays off this render task).
+    if (wsClient.available()) wsClient.close();
+    useWebSocket = false;
+    wsConnecting = false;
+    wsNextReconnect = 0;
+    wsReconnectDelayMs = 3000;
   }
   if (reqPageSwitch >= 0) {
     int p = reqPageSwitch;
@@ -2468,10 +2473,8 @@ void loop()
       if (!historyLoaded && !historyRequested) {
         requestLoadingStatusWs();
       }
-    } else {
-      // Try to connect WS if not already
-      connectWebSocket();
     }
+    // (No connect here: the WS task owns reconnection, gated on BLE.)
     lastSummaryRequest = currentTime;
   }
 
