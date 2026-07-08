@@ -61,3 +61,8 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 #define SCREEN_HEIGHT 272
 // LVGL partial render buffer: 1/4 screen, double-buffered in PSRAM
 #define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 4)
+
+// --- Boot loader ring animation (ED loader) ---
+#define BOOT_LOADER_TIMEOUT_MS 8000   // max wait for WiFi before showing UI anyway
+#define BOOT_LOADER_FRAME_MS   33     // frame interval (~30 fps)
+#define BOOT_LOADER_SCALE      7.0f   // viewBox(40x32) -> px: 280x224, centered

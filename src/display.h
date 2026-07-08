@@ -8,6 +8,8 @@ class Display
 public:
     lv_display_t* init();
     void setTouchCallback(void (*cb)());
+    void bootLoaderInit();
+    void drawBootLoaderFrame(uint32_t elapsedMs);
 };
 
 #endif

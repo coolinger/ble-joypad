@@ -4,7 +4,7 @@
 #include <Arduino_GFX_Library.h>
 #include <bb_captouch.h>
 #include <esp_heap_caps.h>
-#include "ed_logo.h"
+#include <math.h>
 
 // NV3041A over QSPI (the JC4827W543's native path, per the vendor demos).
 // The panel handles rotation itself (DISPLAY_ROTATION in config.h); LVGL
@@ -81,6 +81,79 @@ static void touchpad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     }
 }
 
+/* -------- ED loader ring (boot splash) ----------------------------------
+   24 triangles from EDLoader1.svg (viewBox 0..40 x 0..32). Only opacity
+   pulses (base -> 1 -> base, 1000ms), staggered per delay-class N so a bright
+   wave travels around the ring. Geometry is fixed, so each frame just redraws
+   all 24 triangles in their current orange shade over the black screen — no
+   per-frame clear, no flicker. */
+struct BootTri {
+    uint8_t x0, y0, x1, y1, x2, y2;  // viewBox-unit vertices (0..40 / 0..32)
+    float   base;                    // pulse floor: 0.3 outer ring, 0.4 inner
+    uint8_t delayN;                  // delay class N (phase = N*1000/19 ms)
+};
+
+static const BootTri kBootTris[24] = {
+    // outer ring (l1), base 0.3
+    { 5, 8,10,16,15, 8, 0.3f,  1}, { 5, 8,10, 0,15, 8, 0.3f,  2},
+    {10, 0,15, 8,20, 0, 0.3f,  3}, {15, 8,20, 0,25, 8, 0.3f,  4},
+    {20, 0,25, 8,30, 0, 0.3f,  5}, {25, 8,30, 0,35, 8, 0.3f,  6},
+    {25, 8,30,16,35, 8, 0.3f,  7}, {30,16,35, 8,40,16, 0.3f,  8},
+    {30,16,35,24,40,16, 0.3f,  9}, {25,24,30,16,35,24, 0.3f, 10},
+    {25,24,30,32,35,24, 0.3f, 11}, {20,32,25,24,30,32, 0.3f, 13},
+    {15,24,20,32,25,24, 0.3f, 14}, {10,32,15,24,20,32, 0.3f, 15},
+    { 5,24,10,32,15,24, 0.3f, 16}, { 5,24,10,16,15,24, 0.3f, 17},
+    { 0,16, 5,24,10,16, 0.3f, 18}, { 0,16, 5, 8,10,16, 0.3f, 20},
+    // inner ring (l2), base 0.4
+    {10,16,15, 8,20,16, 0.4f,  0}, {15, 8,20,16,25, 8, 0.4f,  3},
+    {20,16,25, 8,30,16, 0.4f,  6}, {20,16,25,24,30,16, 0.4f,  9},
+    {15,24,20,16,25,24, 0.4f, 12}, {10,16,15,24,20,16, 0.4f, 15},
+};
+
+static int16_t bootTriPx[24][6];   // scaled display-px vertices
+static bool    bootLoaderReady = false;
+
+// phase in [0,1): rise base->1 over first 20%, linear fall 1->base over rest.
+static inline float bootPulse(float phase, float base) {
+    if (phase < 0.2f) return base + (1.0f - base) * (phase / 0.2f);
+    return 1.0f - (1.0f - base) * ((phase - 0.2f) / 0.8f);
+}
+
+void Display::bootLoaderInit() {
+    if (bootLoaderReady) return;
+    const float   s  = BOOT_LOADER_SCALE;
+    const int16_t ox = (int16_t)((panel->width()  - (int)(40 * s)) / 2);
+    const int16_t oy = (int16_t)((panel->height() - (int)(32 * s)) / 2);
+    for (int i = 0; i < 24; i++) {
+        const BootTri& t = kBootTris[i];
+        bootTriPx[i][0] = ox + (int16_t)(t.x0 * s);
+        bootTriPx[i][1] = oy + (int16_t)(t.y0 * s);
+        bootTriPx[i][2] = ox + (int16_t)(t.x1 * s);
+        bootTriPx[i][3] = oy + (int16_t)(t.y1 * s);
+        bootTriPx[i][4] = ox + (int16_t)(t.x2 * s);
+        bootTriPx[i][5] = oy + (int16_t)(t.y2 * s);
+    }
+    bootLoaderReady = true;
+}
+
+void Display::drawBootLoaderFrame(uint32_t elapsedMs) {
+    if (!bootLoaderReady) return;
+    for (int i = 0; i < 24; i++) {
+        const BootTri& t = kBootTris[i];
+        float delayMs = t.delayN * (1000.0f / 19.0f);
+        float phase = fmodf((float)elapsedMs - delayMs, 1000.0f);
+        if (phase < 0) phase += 1000.0f;
+        phase /= 1000.0f;
+        float   b = bootPulse(phase, t.base);
+        uint8_t r = (uint8_t)(0xFF * b + 0.5f);
+        uint8_t g = (uint8_t)(0x71 * b + 0.5f);
+        uint16_t color = RGB565(r, g, 0);
+        panel->fillTriangle(bootTriPx[i][0], bootTriPx[i][1],
+                            bootTriPx[i][2], bootTriPx[i][3],
+                            bootTriPx[i][4], bootTriPx[i][5], color);
+    }
+}
+
 lv_display_t* Display::init(void)
 {
     if (!panel->begin()) {
@@ -88,11 +161,10 @@ lv_display_t* Display::init(void)
     }
     panel->fillScreen(RGB565_BLACK);  // clear stale GRAM surviving from before reset
 
-    /* Boot splash (Elite Dangerous logo), centered. Stays visible while the
-       rest of setup() runs, until the first LVGL frame replaces it. */
-    panel->draw16bitRGBBitmap((panel->width()  - ED_LOGO_W) / 2,
-                              (panel->height() - ED_LOGO_H) / 2,
-                              (uint16_t *)ed_logo_map, ED_LOGO_W, ED_LOGO_H);
+    /* Boot splash: ED loader ring, centered. Frame 0 shows immediately; the
+       WiFi-wait loop in setup() animates it. First LVGL frame later replaces it. */
+    bootLoaderInit();
+    drawBootLoaderFrame(0);
 
     int tres = touch.init(TOUCH_SDA, TOUCH_SCL, TOUCH_RST, TOUCH_INT);
     Serial.printf("[TOUCH] bb_captouch init: %d, sensor type: %d\n",
