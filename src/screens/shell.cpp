@@ -107,38 +107,18 @@ void create_shell_ui() {
   shell_hull_label = value_label(strip, "--%", 252, 7);
   dim_label(strip, "HULL", 252, 22);
 
-  // ---- cargo: two-colour donut with a used(drones)/total readout above ----
-  // The ring fills dark-yellow for the limpet/drone share first, then orange
-  // for the rest of the cargo; the remainder stays dark. Icons moved to the
-  // footer to free this space. Readout supports 4-digit cargo (montserrat).
-  shell_cargo_label = lv_label_create(strip);
-  lv_label_set_text(shell_cargo_label, "0(0)/0");
-  lv_obj_set_style_text_color(shell_cargo_label, LV_COLOR_VALUE, 0);
-  lv_obj_set_style_text_font(shell_cargo_label, FONT_SMALL, 0);
-  lv_obj_set_style_text_align(shell_cargo_label, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_pos(shell_cargo_label, 334, 1);
-  lv_obj_set_width(shell_cargo_label, 112);
-
-  // Bottom arc = total cargo (orange indicator over a dark ring).
-  shell_cargo_arc = lv_arc_create(strip);
-  lv_obj_set_size(shell_cargo_arc, 28, 28);
-  lv_obj_set_pos(shell_cargo_arc, 376, 14);
-  lv_arc_set_rotation(shell_cargo_arc, 270);
-  lv_arc_set_bg_angles(shell_cargo_arc, 0, 360);
-  lv_arc_set_range(shell_cargo_arc, 0, 100);
+  // ---- cargo: two-colour donut, same size/row as FUEL/HULL. The ring fills
+  //      dark-yellow for the limpet/drone share first, then orange for the
+  //      rest of the cargo; remainder stays dark. Readout "used(drones)/total"
+  //      + CARGO caption on the shared baseline. Icons moved to the footer.
+  shell_cargo_arc = make_arc(strip, 310);      // bottom: total cargo (orange)
   lv_arc_set_value(shell_cargo_arc, 0);
-  lv_obj_remove_style(shell_cargo_arc, NULL, LV_PART_KNOB);
-  lv_obj_remove_flag(shell_cargo_arc, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_arc_width(shell_cargo_arc, 4, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(shell_cargo_arc, 4, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_color(shell_cargo_arc, LV_COLOR_GAUGE_BG, LV_PART_MAIN);
-  lv_obj_set_style_arc_color(shell_cargo_arc, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
 
-  // Overlay arc = limpet/drone share in dark yellow; its ring is transparent
-  // so the orange (other cargo) shows through beyond the drone count.
+  // Overlay: limpet/drone share in dark yellow; transparent ring so the
+  // orange cargo shows through beyond the drone count.
   shell_drones_arc = lv_arc_create(strip);
-  lv_obj_set_size(shell_drones_arc, 28, 28);
-  lv_obj_set_pos(shell_drones_arc, 376, 14);
+  lv_obj_set_size(shell_drones_arc, 34, 34);
+  lv_obj_set_pos(shell_drones_arc, 310, 4);
   lv_arc_set_rotation(shell_drones_arc, 270);
   lv_arc_set_bg_angles(shell_drones_arc, 0, 360);
   lv_arc_set_range(shell_drones_arc, 0, 100);
@@ -148,6 +128,9 @@ void create_shell_ui() {
   lv_obj_set_style_arc_opa(shell_drones_arc, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_set_style_arc_width(shell_drones_arc, 4, LV_PART_INDICATOR);
   lv_obj_set_style_arc_color(shell_drones_arc, lv_color_hex(0xbf9000), LV_PART_INDICATOR);
+
+  shell_cargo_label = value_label(strip, "0(0)/0", 348, 7);
+  dim_label(strip, "CARGO", 348, 22);
 
   // ---- tab rail ----  (stops above the footer so the icons can sit bottom-right)
   static const char *tab_names[3] = {"FTR", "LOG", "SYS"};
