@@ -8,6 +8,8 @@ lv_obj_t *shell_fuel_arc = nullptr;
 lv_obj_t *shell_fuel_label = nullptr;
 lv_obj_t *shell_hull_arc = nullptr;
 lv_obj_t *shell_hull_label = nullptr;
+lv_obj_t *shell_cargo_arc = nullptr;
+lv_obj_t *shell_drones_arc = nullptr;
 lv_obj_t *shell_cargo_label = nullptr;
 lv_obj_t *shell_mode_label = nullptr;
 lv_obj_t *wifi_icon = nullptr;
@@ -105,26 +107,54 @@ void create_shell_ui() {
   shell_hull_label = value_label(strip, "--%", 252, 7);
   dim_label(strip, "HULL", 252, 22);
 
-  shell_cargo_label = value_label(strip, "0/0", 318, 7);
-  dim_label(strip, "CARGO", 318, 22);
+  // ---- cargo: two-colour donut with a used(drones)/total readout above ----
+  // The ring fills dark-yellow for the limpet/drone share first, then orange
+  // for the rest of the cargo; the remainder stays dark. Icons moved to the
+  // footer to free this space. Readout supports 4-digit cargo (montserrat).
+  shell_cargo_label = lv_label_create(strip);
+  lv_label_set_text(shell_cargo_label, "0(0)/0");
+  lv_obj_set_style_text_color(shell_cargo_label, LV_COLOR_VALUE, 0);
+  lv_obj_set_style_text_font(shell_cargo_label, FONT_SMALL, 0);
+  lv_obj_set_style_text_align(shell_cargo_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_pos(shell_cargo_label, 334, 1);
+  lv_obj_set_width(shell_cargo_label, 112);
 
-  bluetooth_icon = lv_label_create(strip);
-  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
-  websocket_icon = lv_label_create(strip);
-  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
-  wifi_icon = lv_label_create(strip);
-  lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
-  lv_obj_t *icons[3] = {bluetooth_icon, websocket_icon, wifi_icon};
-  for (int i = 0; i < 3; i++) {
-    lv_obj_set_style_text_color(icons[i], LV_COLOR_HAIRLINE, 0);  // off state
-    lv_obj_set_style_text_font(icons[i], FONT_BODY, 0);
-    lv_obj_set_pos(icons[i], 398 + i * 28, 13);
-  }
+  // Bottom arc = total cargo (orange indicator over a dark ring).
+  shell_cargo_arc = lv_arc_create(strip);
+  lv_obj_set_size(shell_cargo_arc, 28, 28);
+  lv_obj_set_pos(shell_cargo_arc, 376, 14);
+  lv_arc_set_rotation(shell_cargo_arc, 270);
+  lv_arc_set_bg_angles(shell_cargo_arc, 0, 360);
+  lv_arc_set_range(shell_cargo_arc, 0, 100);
+  lv_arc_set_value(shell_cargo_arc, 0);
+  lv_obj_remove_style(shell_cargo_arc, NULL, LV_PART_KNOB);
+  lv_obj_remove_flag(shell_cargo_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_width(shell_cargo_arc, 4, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(shell_cargo_arc, 4, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(shell_cargo_arc, LV_COLOR_GAUGE_BG, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(shell_cargo_arc, LV_COLOR_GAUGE_FG, LV_PART_INDICATOR);
 
-  // ---- tab rail ----
+  // Overlay arc = limpet/drone share in dark yellow; its ring is transparent
+  // so the orange (other cargo) shows through beyond the drone count.
+  shell_drones_arc = lv_arc_create(strip);
+  lv_obj_set_size(shell_drones_arc, 28, 28);
+  lv_obj_set_pos(shell_drones_arc, 376, 14);
+  lv_arc_set_rotation(shell_drones_arc, 270);
+  lv_arc_set_bg_angles(shell_drones_arc, 0, 360);
+  lv_arc_set_range(shell_drones_arc, 0, 100);
+  lv_arc_set_value(shell_drones_arc, 0);
+  lv_obj_remove_style(shell_drones_arc, NULL, LV_PART_KNOB);
+  lv_obj_remove_flag(shell_drones_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_opa(shell_drones_arc, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(shell_drones_arc, 4, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(shell_drones_arc, lv_color_hex(0xbf9000), LV_PART_INDICATOR);
+
+  // ---- tab rail ----  (stops above the footer so the icons can sit bottom-right)
   static const char *tab_names[3] = {"FTR", "LOG", "SYS"};
+  const int railH = SCREEN_HEIGHT - SHELL_STRIP_H - SHELL_FOOTER_H;  // 208
+  const int tabH = railH / 3;                                        // 69
   lv_obj_t *rail = make_zone(top);
-  lv_obj_set_size(rail, SHELL_RAIL_W, SCREEN_HEIGHT - SHELL_STRIP_H);
+  lv_obj_set_size(rail, SHELL_RAIL_W, railH);
   lv_obj_set_pos(rail, SCREEN_WIDTH - SHELL_RAIL_W, SHELL_STRIP_H);
   lv_obj_set_style_border_side(rail, LV_BORDER_SIDE_LEFT, 0);
   lv_obj_set_style_border_color(rail, LV_COLOR_HAIRLINE, 0);
@@ -133,8 +163,9 @@ void create_shell_ui() {
   for (int i = 0; i < 3; i++) {
     lv_obj_t *b = lv_button_create(rail);
     tab_buttons[i] = b;
-    lv_obj_set_size(b, SHELL_RAIL_W - 1, 76);
-    lv_obj_set_pos(b, 1, i * 76);
+    // last tab absorbs the rounding remainder
+    lv_obj_set_size(b, SHELL_RAIL_W - 1, (i < 2) ? tabH : railH - 2 * tabH);
+    lv_obj_set_pos(b, 1, i * tabH);
     lv_obj_set_style_bg_color(b, LV_COLOR_BG, 0);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(b, 0, 0);
@@ -154,9 +185,9 @@ void create_shell_ui() {
     lv_obj_set_style_transform_rotation(l, 900, 0);
   }
 
-  // ---- footer ----
+  // ---- footer ----  (full width now: spans under the shortened rail)
   lv_obj_t *footer = make_zone(top);
-  lv_obj_set_size(footer, SCREEN_WIDTH - SHELL_RAIL_W, SHELL_FOOTER_H);
+  lv_obj_set_size(footer, SCREEN_WIDTH, SHELL_FOOTER_H);
   lv_obj_set_pos(footer, 0, SCREEN_HEIGHT - SHELL_FOOTER_H);
   lv_obj_set_style_border_side(footer, LV_BORDER_SIDE_TOP, 0);
   lv_obj_set_style_border_color(footer, LV_COLOR_HAIRLINE, 0);
@@ -167,7 +198,7 @@ void create_shell_ui() {
   lv_obj_set_style_text_color(status_label, LV_COLOR_FG, 0);
   lv_obj_set_style_text_font(status_label, FONT_SMALL, 0);
   lv_label_set_long_mode(status_label, LV_LABEL_LONG_MODE_DOTS);
-  lv_obj_set_width(status_label, 300);
+  lv_obj_set_width(status_label, 250);
   lv_obj_set_pos(status_label, 8, 3);
 
   shell_mode_label = lv_label_create(footer);
@@ -175,8 +206,22 @@ void create_shell_ui() {
   lv_obj_set_style_text_color(shell_mode_label, LV_COLOR_VALUE, 0);
   lv_obj_set_style_text_font(shell_mode_label, FONT_SMALL, 0);
   lv_obj_set_style_text_align(shell_mode_label, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(shell_mode_label, 316, 3);
-  lv_obj_set_width(shell_mode_label, 122);
+  lv_obj_set_pos(shell_mode_label, 262, 3);
+  lv_obj_set_width(shell_mode_label, 130);  // ends ~392, before the icons
+
+  // Connection icons: bottom-right of the footer (were top-right of the strip)
+  bluetooth_icon = lv_label_create(footer);
+  lv_label_set_text(bluetooth_icon, LV_SYMBOL_BLUETOOTH);
+  websocket_icon = lv_label_create(footer);
+  lv_label_set_text(websocket_icon, LV_SYMBOL_REFRESH);
+  wifi_icon = lv_label_create(footer);
+  lv_label_set_text(wifi_icon, LV_SYMBOL_WIFI);
+  lv_obj_t *icons[3] = {bluetooth_icon, websocket_icon, wifi_icon};
+  for (int i = 0; i < 3; i++) {
+    lv_obj_set_style_text_color(icons[i], LV_COLOR_HAIRLINE, 0);  // off state
+    lv_obj_set_style_text_font(icons[i], FONT_SMALL, 0);
+    lv_obj_set_pos(icons[i], 404 + i * 24, 3);
+  }
 }
 
 void shell_set_active_tab(int page) {

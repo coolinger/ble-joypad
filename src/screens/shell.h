@@ -19,7 +19,9 @@ extern lv_obj_t *shell_fuel_arc;
 extern lv_obj_t *shell_fuel_label;    // cyan % value
 extern lv_obj_t *shell_hull_arc;
 extern lv_obj_t *shell_hull_label;
-extern lv_obj_t *shell_cargo_label;   // "12/128"
+extern lv_obj_t *shell_cargo_arc;     // two-colour cargo donut (outer = orange)
+extern lv_obj_t *shell_drones_arc;    // overlay: dark-yellow limpet segment
+extern lv_obj_t *shell_cargo_label;   // "15(5)/128" used(drones)/total
 extern lv_obj_t *shell_mode_label;    // footer right: ON FOOT/SHIP/...
 // Relocated from the old info-screen header/sidebar (names kept so the
 // existing update functions in main.cpp stay valid):

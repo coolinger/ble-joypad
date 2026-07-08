@@ -393,8 +393,19 @@ void updateHeader() {
     lv_obj_set_style_text_color(shell_hull_label,
         hullPct <= 25 ? LV_COLOR_WARNING_FG : LV_COLOR_VALUE, 0);
 
-    lv_label_set_text_fmt(shell_cargo_label, "%d/%d",
-        status.cargo.usedSpace, status.cargo.totalCapacity);
+    // Cargo two-colour donut + "used(drones)/total" readout. The bottom arc
+    // fills orange to `used`; the overlay arc fills dark-yellow to `drones`
+    // (drawn on top), so the ring reads dark-yellow limpets then orange cargo.
+    int cargoTotal = status.cargo.totalCapacity;
+    int cargoUsed  = status.cargo.usedSpace;
+    int cargoDrones = status.cargo.dronesCount;
+    int arcMax = cargoTotal > 0 ? cargoTotal : 1;
+    lv_arc_set_range(shell_cargo_arc, 0, arcMax);
+    lv_arc_set_value(shell_cargo_arc, cargoUsed);
+    lv_arc_set_range(shell_drones_arc, 0, arcMax);
+    lv_arc_set_value(shell_drones_arc, cargoDrones);
+    lv_label_set_text_fmt(shell_cargo_label, "%d(%d)/%d",
+        cargoUsed, cargoDrones, cargoTotal);
 
     update_wifi_icon_unlocked();
     if (websocket_icon) {
