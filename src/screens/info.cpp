@@ -42,7 +42,9 @@ void create_logviewer_ui() {
   lv_obj_set_style_bg_color(logviewer_screen, LV_COLOR_BG, 0);
 
   // ---- events column (left) ----
-  rail(logviewer_screen, "EVENTS", CONTENT_X + 8, CONTENT_Y + 4, EVENTS_W);
+  // Underline stops ~10px short of the vertical divider (side panel's left
+  // border at SIDE_X), matching the SIGNALS rail's gap before the nav rail.
+  rail(logviewer_screen, "EVENTS", CONTENT_X + 8, CONTENT_Y + 4, EVENTS_W - 10);
 
   log_label = lv_label_create(logviewer_screen);
   lv_obj_set_pos(log_label, CONTENT_X + 8, CONTENT_Y + 24);
