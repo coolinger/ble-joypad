@@ -110,7 +110,6 @@ const char ignoreEvent_Music[] PROGMEM = "Music";
 const char ignoreEvent_Fileheader[] PROGMEM = "Fileheader";
 const char ignoreEvent_Commander[] PROGMEM = "Commander";
 const char ignoreEvent_LoadGame[] PROGMEM = "LoadGame";
-const char ignoreEvent_Loadout[] PROGMEM = "Loadout";
 const char ignoreEvent_Materials[] PROGMEM = "Materials";
 const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
@@ -121,7 +120,6 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Fileheader,
   ignoreEvent_Commander,
   ignoreEvent_LoadGame,
-  ignoreEvent_Loadout,
   ignoreEvent_Materials,
   ignoreEvent_MaterialCollected,
   ignoreEvent_ShipLocker,
@@ -131,9 +129,13 @@ const int ignoreJournalEventsCount = sizeof(ignoreJournalEvents) / sizeof(ignore
 
 // List of journal events to hide from display but still process
 const char hideEvent_Cargo[] PROGMEM = "Cargo";
+// Loadout is processed (it carries the authoritative HullHealth) but not
+// logged - it fires on every module/ship change and would spam the log.
+const char hideEvent_Loadout[] PROGMEM = "Loadout";
 
 const char* const hideJournalEvents[] PROGMEM = {
-  hideEvent_Cargo
+  hideEvent_Cargo,
+  hideEvent_Loadout
 };
 const int hideJournalEventsCount = sizeof(hideJournalEvents) / sizeof(hideJournalEvents[0]);
 
@@ -1210,19 +1212,10 @@ void onWebSocketMessage(WebsocketsMessage message) {
         status.cargo.cargoCount = cargoNonDrone;
       }
 
-      // Hull health from armour module (health is 0-1, but guard percent inputs)
-      float hull = status.hull.hullHealth;
-      if (msg["modules"].is<JsonObject>()) {
-        JsonObject mods = msg["modules"].as<JsonObject>();
-        JsonVariant armour = mods["Armour"];
-        if (!armour.isNull() && armour["health"].is<float>()) {
-          hull = armour["health"].as<float>();
-        }
-      }
-      if (hull > 1.0f) {
-        hull /= 100.0f;
-      }
-      status.hull.hullHealth = hull;
+      // NO hull here: getShipStatus carries only modules.Armour.health, which
+      // is the armour MODULE integrity (~1.0), not the ship's hull. Reading it
+      // clobbered the real value with 100%. Hull comes from Loadout.HullHealth
+      // and HullDamage.Health instead (see those handlers).
 
       if (msg["type"].is<const char*>()) {
         status.hull.hullType = msg["type"].as<const char*>();
@@ -1737,6 +1730,17 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
         status.hull.hullHealth = doc["Health"];
         updateHeader();
         Serial.printf("[HULL] Health: %.1f%%\n", status.hull.hullHealth * 100.0f);
+      }
+    } else if (event == "Loadout") {
+      // Authoritative hull integrity (0-1). NOTE: this is HullHealth, NOT the
+      // Armour module's Health (module integrity, always ~1.0). getShipStatus
+      // exposes only the latter, so Loadout is our reliable hull source and it
+      // lands in the replay window on every ship/module change. Hidden event:
+      // no log line (see hideJournalEvents).
+      if (doc["HullHealth"].is<float>()) {
+        status.hull.hullHealth = doc["HullHealth"].as<float>();
+        updateHeader();
+        Serial.printf("[HULL] Loadout HullHealth: %.1f%%\n", status.hull.hullHealth * 100.0f);
       }
     } else if (event == "ProspectedAsteroid") {
       // Check for motherlode material
