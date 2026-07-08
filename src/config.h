@@ -63,6 +63,8 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 #define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 4)
 
 // --- Boot loader ring animation (ED loader) ---
+#define BOOT_LOADER_MIN_MS     2000   // always animate at least this long (~2 sweeps)
 #define BOOT_LOADER_TIMEOUT_MS 8000   // max wait for WiFi before showing UI anyway
 #define BOOT_LOADER_FRAME_MS   33     // frame interval (~30 fps)
 #define BOOT_LOADER_SCALE      7.0f   // viewBox(40x32) -> px: 280x224, centered
+#define BOOT_TRANSITION_MS     300    // ring->UI fade-through-black, each direction

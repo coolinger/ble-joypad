@@ -5,7 +5,6 @@
 #include <BleGamepad.h>
 #include "display.h"
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ArduinoWebsockets.h>
 #include <esp_heap_caps.h>
@@ -86,8 +85,6 @@ bool bleConnected = false;
 //static lv_display_t* disp;
 Display disp;
 
-WiFiMulti wifiMulti;
-
 // WebSocket variables for Elite Dangerous data
 // If not discovered via KEEPALIVE, fallback to configured server IP
 String serverIP = DEFAULT_SERVER_IP;
@@ -150,6 +147,7 @@ static void jump_overlay_anim_ready(lv_anim_t* anim);
 
 // Display power management
 bool displayOn = true;
+bool wsConnectAttempted = false;  // set at the first real WS connect attempt
 uint32_t lastTouchTime = 0;
 uint32_t lastBleActiveTime = 0;
 uint32_t bleDisconnectedTime = 0;
@@ -160,6 +158,11 @@ bool ledOn = true;
 // stage before the end); without one the controller is not in use: 5 s.
 const uint32_t DISPLAY_TIMEOUT_ACTIVE_MS = 5 * 60 * 1000;
 const uint32_t DISPLAY_TIMEOUT_NO_BLE_MS = 5 * 1000;
+// Startup grace: boot + loader animation + WiFi/BLE handshake take several
+// seconds, during which no BLE host is connected. Don't let the short no-BLE
+// idle window burn out before the system is up: hold the display on until the
+// first WS connect attempt, or this long after boot, whichever comes first.
+const uint32_t DISPLAY_BOOT_GRACE_MS = 30 * 1000;
 
 // Backlight (GPIO45) is driven by LEDC PWM so we can dim it. Two-stage timeout:
 // full brightness while active, 30% for the last DISPLAY_DIM_LEAD_MS, then off.
@@ -261,6 +264,19 @@ void wakeDisplay()
   lastTouchTime = millis();
   displayManualOff = false;
   setDisplayPower(true);
+}
+
+// Smoothly ramp the backlight LEDC duty between two values over durationMs.
+// Used for the boot ring -> UI fade-through-black. Targets are passed in by the
+// caller (e.g. BL_DUTY_FULL) so the configured max brightness is respected.
+static void fadeBacklight(int from, int to, uint32_t durationMs)
+{
+  const int steps = 32;
+  for (int i = 1; i <= steps; i++) {
+    ledcWrite(BL_PIN, from + (to - from) * i / steps);
+    delay(durationMs / steps);
+  }
+  ledcWrite(BL_PIN, to);
 }
 // Helper function to print heap status including PSRAM
 void printHeapStatus(const char* location) {
@@ -914,6 +930,19 @@ void checkDisplayTimeout()
 {
   if (!displayOn) return;
 
+  // Startup grace: keep the display awake until the system has had a chance to
+  // come up — until the first WS connect attempt, or DISPLAY_BOOT_GRACE_MS after
+  // boot, whichever comes first. Then start the normal idle countdown fresh.
+  static bool idleArmed = false;
+  if (!idleArmed) {
+    if (wsConnectAttempted || millis() >= DISPLAY_BOOT_GRACE_MS) {
+      idleArmed = true;
+      lastTouchTime = millis();  // begin the idle countdown now, not at boot
+    } else {
+      return;  // still in startup grace
+    }
+  }
+
   // No BLE host connected -> nothing to control, allow only a short on-time
   // (grace starts at the disconnect: checkBleConnection resets lastTouchTime).
   uint32_t limit = bleConnected ? DISPLAY_TIMEOUT_ACTIVE_MS : DISPLAY_TIMEOUT_NO_BLE_MS;
@@ -1336,7 +1365,8 @@ void connectWebSocket() {
     String wsUrl = "ws://" + serverIP + ":" + String(websocketPort);
     
     Serial.printf("[WS] Connecting to %s\n", wsUrl.c_str());
-    
+    wsConnectAttempted = true;  // arms the display idle timer (see checkDisplayTimeout)
+
     wsClient.onMessage(onWebSocketMessage);
     wsClient.onEvent(onWebSocketEvent);
         wsConnecting = true;
@@ -2179,9 +2209,10 @@ void WifiConnect()
   WiFi.persistent(true);
   // Set hostname
   WiFi.setHostname(HOSTNAME);
-  //WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
-  wifiMulti.run();
+  // Non-blocking: begins the association and returns immediately, so the boot
+  // loader ring animates during the ~4s connect instead of freezing on it.
+  // Single AP -> plain WiFi.begin (no WiFiMulti); setAutoReconnect handles drops.
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   WiFi.onEvent(onWifiConnect, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent([](const WiFiEvent_t event, const WiFiEventInfo_t info) {
@@ -2327,15 +2358,20 @@ void setup()
   Serial.println("[BLE] Starting BLE gamepad...");
   bleGamepad->begin(&bleGamepadConfig);
 
-  // Animated ED loader ring: hold the boot splash while WiFi comes up.
-  // WifiConnect() started WiFi async above; animate until connected or timeout.
-  Serial.println("[BOOT] Loader ring until WiFi (or timeout)...");
+  // Animated ED loader ring. WiFi connects async (WifiConnect started it above)
+  // and often finishes during the BLE/I2S init before this point, so gating the
+  // animation only on "WiFi not yet connected" would run zero frames. Always
+  // animate for at least BOOT_LOADER_MIN_MS, then keep going only while WiFi is
+  // still down, up to BOOT_LOADER_TIMEOUT_MS.
+  Serial.println("[BOOT] Loader ring (min duration, then until WiFi/timeout)...");
   uint32_t bootStart = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - bootStart < BOOT_LOADER_TIMEOUT_MS) {
-    disp.drawBootLoaderFrame(millis() - bootStart);
+  uint32_t elapsed;
+  do {
+    elapsed = millis() - bootStart;
+    disp.drawBootLoaderFrame(elapsed);
     delay(BOOT_LOADER_FRAME_MS);
-  }
+  } while (elapsed < BOOT_LOADER_MIN_MS ||
+           (WiFi.status() != WL_CONNECTED && elapsed < BOOT_LOADER_TIMEOUT_MS));
 
   theme_init();
   Serial.println("[UI] Creating fighter UI...");
@@ -2348,8 +2384,12 @@ void setup()
   Serial.println("[UI] Loading logviewer screen...");
   lv_screen_load(logviewer_screen);
 
-  // Replace the boot splash with the first full UI frame.
-  lv_refr_now(NULL);
+  // Transition boot ring -> UI as a fade through black. The ring (raw GRAM) and
+  // the LVGL UI can't be cross-blended, so dim the backlight out on the ring,
+  // render the UI while dark, then fade back up to the configured brightness.
+  fadeBacklight(BL_DUTY_FULL, 0, BOOT_TRANSITION_MS);  // ring fades out
+  lv_refr_now(NULL);                                   // draw first UI frame while dark
+  fadeBacklight(0, BL_DUTY_FULL, BOOT_TRANSITION_MS);  // UI fades in
   Serial.println("[UI] Initialization complete!");
   
   // Play startup tone
@@ -2432,7 +2472,7 @@ void loop()
     Serial.println("[SETTINGS] Restarting WiFi...");
     WiFi.disconnect();
     wifiWasConnected = false;  // let checkWifiConnection re-establish WS after reconnect
-    wifiMulti.run();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
   if (reqRestartWebSocket) {
     reqRestartWebSocket = false;

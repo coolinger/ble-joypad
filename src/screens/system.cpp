@@ -6,13 +6,11 @@
 #include "theme.h"
 #include "shell.h"
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <ArduinoWebsockets.h>
 
 using namespace websockets;
 
 // externs from main
-extern WiFiMulti wifiMulti;
 extern WebsocketsClient wsClient;
 extern bool reqRestartWifi;
 extern bool reqRestartWebSocket;
