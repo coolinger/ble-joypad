@@ -59,8 +59,10 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 // Display geometry
 #define SCREEN_WIDTH 480
 #define SCREEN_HEIGHT 272
-// LVGL partial render buffer: 1/4 screen, double-buffered in PSRAM
-#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 4)
+// LVGL render buffer: FULL screen, double-buffered in PSRAM. A full-frame
+// buffer avoids the partial-refresh tearing/flicker on page transitions
+// (~510 KB of the 8 MB PSRAM for the two buffers - easily affordable).
+#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 1)
 
 // --- Boot loader ring animation (ED loader) ---
 #define BOOT_LOADER_MIN_MS     2000   // always animate at least this long (~2 sweeps)
