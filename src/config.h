@@ -59,10 +59,12 @@ static const int DEFAULT_WEBSOCKET_PORT = 3300;
 // Display geometry
 #define SCREEN_WIDTH 480
 #define SCREEN_HEIGHT 272
-// LVGL render buffer: FULL screen, double-buffered in PSRAM. A full-frame
-// buffer avoids the partial-refresh tearing/flicker on page transitions
-// (~510 KB of the 8 MB PSRAM for the two buffers - easily affordable).
-#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT / 1)
+// LVGL render buffer: FULL screen, single, in PSRAM (~255 KB of the 8 MB). A
+// full-frame buffer flushes each frame in one writePixels, avoiding the
+// partial-refresh tearing/flicker on page transitions. (Single, not double:
+// the flush is synchronous, so a second buffer buys no overlap - see
+// display.cpp.)
+#define LVGL_BUFFER_PIXELS (SCREEN_WIDTH * SCREEN_HEIGHT)
 
 // --- Boot loader ring animation (ED loader) ---
 #define BOOT_LOADER_MIN_MS     2000   // always animate at least this long (~2 sweeps)

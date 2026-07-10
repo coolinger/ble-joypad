@@ -17,9 +17,12 @@ static Arduino_NV3041A *panel = new Arduino_NV3041A(
 // GT911 capacitive touch on its own I2C pins (bb_captouch drives Wire).
 static BBCapTouch touch;
 
-// Two LVGL draw buffers (double buffering) in PSRAM.
+// LVGL draw buffer in PSRAM. Single, full-frame: the flush path is synchronous
+// (Arduino_GFX writePixels blocks and lv_display_flush_ready fires inside the
+// flush cb), so a second buffer would give zero render/transmit overlap - it
+// would just cost another ~255 KB. Full-frame + full-screen invalidation on
+// transitions means one writePixels per frame -> no banded-refresh flicker.
 static lv_color_t *lv_buf1 = nullptr;
-static lv_color_t *lv_buf2 = nullptr;
 
 static void (*touchCallback)() = nullptr;  // called on every valid touch (display wake)
 
@@ -176,24 +179,41 @@ lv_display_t* Display::init(void)
     lv_log_register_print_cb(lvgl_log_cb);
 #endif
 
-    /* Two partial draw buffers in PSRAM (64-byte aligned for cache-coherent
-       reads by the SPI master). Falls back to internal RAM if PSRAM missing. */
-    const size_t buf_bytes = LVGL_BUFFER_PIXELS * 2;  // RGB565
+    /* One full-frame draw buffer, 64-byte aligned so the SPI master reads it
+       cache-coherently. Bytes-per-pixel comes from LVGL's own color-format
+       size so it tracks LV_COLOR_DEPTH (lv_conf.h) automatically. */
+    const size_t bpp = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE);
+    size_t buf_px = LVGL_BUFFER_PIXELS;
+    size_t buf_bytes = buf_px * bpp;
     lv_buf1 = (lv_color_t*)heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM);
-    lv_buf2 = (lv_color_t*)heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM);
-    if (!lv_buf1 || !lv_buf2) {
-        Serial.println("[LVGL] PSRAM draw buffers failed, using internal RAM");
-        if (lv_buf1) { heap_caps_free(lv_buf1); lv_buf1 = nullptr; }
-        if (lv_buf2) { heap_caps_free(lv_buf2); lv_buf2 = nullptr; }
+    if (!lv_buf1) {
+        // PSRAM full-frame failed (fragmentation / degraded PSRAM). A full
+        // frame (~255 KB) can NEVER fit the S3's internal SRAM, so degrade to a
+        // 1/4-screen buffer in internal RAM: banded refresh returns (some
+        // transition flicker) but the device stays usable instead of bricking.
+        buf_px = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT / 4;
+        buf_bytes = buf_px * bpp;
+        Serial.println("[LVGL] PSRAM full-frame buffer failed, using 1/4-screen internal RAM");
         lv_buf1 = (lv_color_t*)heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        lv_buf2 = (lv_color_t*)heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    Serial.printf("[LVGL] draw buffers: %u px x2 @ %p / %p\n",
-                  (unsigned)LVGL_BUFFER_PIXELS, lv_buf1, lv_buf2);
+    Serial.printf("[LVGL] draw buffer: %u px @ %p\n", (unsigned)buf_px, lv_buf1);
 
     lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
     lv_display_set_flush_cb(disp, disp_flush_cb);
-    lv_display_set_buffers(disp, lv_buf1, lv_buf2, buf_bytes,
+    if (!lv_buf1) {
+        // Both allocations failed: passing NULL to lv_display_set_buffers trips
+        // an LV_ASSERT whose default handler is while(1) - a silent black brick.
+        // Nothing left to render into; skip buffer setup and leave the panel on
+        // the boot splash rather than hang. (Realistically unreachable: 1/4
+        // screen is ~65 KB of internal RAM.)
+        Serial.println("[LVGL] FATAL: no draw buffer available, UI disabled");
+        return disp;
+    }
+    // Single-flush (flicker-free) transitions rely on TWO things together: this
+    // full-frame buffer AND the page-switch animation invalidating the whole
+    // screen each frame. A transition that dirties only disjoint regions would
+    // fall back to multi-chunk banded flushes.
+    lv_display_set_buffers(disp, lv_buf1, NULL, buf_bytes,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     lv_indev_t *indev = lv_indev_create();
