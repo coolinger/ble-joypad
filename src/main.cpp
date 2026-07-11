@@ -108,7 +108,6 @@ const char ignoreEvent_Fileheader[] PROGMEM = "Fileheader";
 const char ignoreEvent_Commander[] PROGMEM = "Commander";
 const char ignoreEvent_LoadGame[] PROGMEM = "LoadGame";
 const char ignoreEvent_Materials[] PROGMEM = "Materials";
-const char ignoreEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 const char ignoreEvent_ShipLocker[] PROGMEM = "ShipLocker";
 const char ignoreEvent_Missions[] PROGMEM = "Missions";
 
@@ -118,7 +117,6 @@ const char* const ignoreJournalEvents[] PROGMEM = {
   ignoreEvent_Commander,
   ignoreEvent_LoadGame,
   ignoreEvent_Materials,
-  ignoreEvent_MaterialCollected,
   ignoreEvent_ShipLocker,
   ignoreEvent_Missions
 };
@@ -129,10 +127,14 @@ const char hideEvent_Cargo[] PROGMEM = "Cargo";
 // Loadout is processed (it carries the authoritative HullHealth) but not
 // logged - it fires on every module/ship change and would spam the log.
 const char hideEvent_Loadout[] PROGMEM = "Loadout";
+// MaterialCollected: processed only for the sensor-fragment counter; every
+// other material is silent (it used to be fully ignored).
+const char hideEvent_MaterialCollected[] PROGMEM = "MaterialCollected";
 
 const char* const hideJournalEvents[] PROGMEM = {
   hideEvent_Cargo,
-  hideEvent_Loadout
+  hideEvent_Loadout,
+  hideEvent_MaterialCollected
 };
 const int hideJournalEventsCount = sizeof(hideJournalEvents) / sizeof(hideJournalEvents[0]);
 
@@ -305,6 +307,9 @@ void updateContextPanel() {
   if (lvglMutex && xSemaphoreTake(lvglMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     // NOTE: ctx_lines use Montserrat (ASCII only) - keep these strings ASCII
     // (no "·"/"—" typographic characters, they would render as blanks).
+    // Caustic Thargoid green: the one alien accent, marks sensor-fragment info.
+    const lv_color_t nhsGreen = lv_color_hex(0x7fd000);
+    ExplorationInfo &x = status.exploration;
     char line[48];
     if (status.onFoot) {
       lv_label_set_text(ctx_rail_label, "BACKPACK / ON FOOT");
@@ -315,9 +320,7 @@ void updateContextPanel() {
       lv_label_set_text(ctx_lines[1], line);
       lv_label_set_text(ctx_lines[2], "");
       lv_label_set_text(ctx_lines[3], "");
-      lv_obj_set_style_text_color(ctx_lines[2], LV_COLOR_FG, 0);
     } else {
-      ExplorationInfo &x = status.exploration;
       lv_label_set_text(ctx_rail_label, "EXPLORATION");
 
       if (!x.honked) snprintf(line, sizeof(line), "HONK -   BODIES -");
@@ -343,6 +346,25 @@ void updateContextPanel() {
       }
       lv_label_set_text(ctx_lines[3], line);
     }
+
+    // Conditional last line: NHS heads-up (in ship) / fragment tally. Only
+    // appears when this system can drop Thargoid sensor fragments or some are
+    // already collected - otherwise blank.
+    bool nhsPossible = x.ammoniaLife && x.hasLandable;
+    if (status.onFoot) {
+      if (x.sensorFrags > 0) snprintf(line, sizeof(line), "Sensorfrags %d", x.sensorFrags);
+      else line[0] = '\0';
+    } else if (nhsPossible) {
+      if (x.sensorFrags > 0) snprintf(line, sizeof(line), "NHS  Frags %d", x.sensorFrags);
+      else snprintf(line, sizeof(line), "NHS: sensor frags");
+    } else if (x.sensorFrags > 0) {
+      snprintf(line, sizeof(line), "Frags %d", x.sensorFrags);
+    } else {
+      line[0] = '\0';
+    }
+    lv_label_set_text(ctx_lines[4], line);
+    lv_obj_set_style_text_color(ctx_lines[4], nhsGreen, 0);
+
     xSemaphoreGive(lvglMutex);
   }
 }
@@ -1657,6 +1679,12 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
       if (strcmp(doc["ScanType"] | "", "AutoScan") == 0 && isArrivalStar &&
           !(doc["WasDiscovered"] | true) && !replayingHistory)
         pendingFirstDiscBeep = true;
+      // Non-Human Signature predictor: ammonia-based life + a landable body in
+      // the system spawns surface Thargoid sensor-fragment sources.
+      if (strstr(doc["PlanetClass"] | "", "ammonia") ||
+          strstr(doc["PlanetClass"] | "", "Ammonia"))
+        status.exploration.ammoniaLife = true;
+      if (doc["Landable"] | false) status.exploration.hasLandable = true;
       explTouched = true;
     } else if (event == "SAAScanComplete") {
       explorationMapped(doc["BodyID"] | -1);
@@ -1769,6 +1797,12 @@ void handleEliteEvent(const String& eventType, JsonVariant doc) {
         status.hull.hullHealth = doc["Health"];
         updateHeader();
         Serial.printf("[HULL] Health: %.1f%%\n", status.hull.hullHealth * 100.0f);
+      }
+    } else if (event == "MaterialCollected") {
+      // Only the Thargoid sensor fragment counter; other materials stay silent.
+      if (strcmp(doc["Name"] | "", "unknownenergysource") == 0) {
+        status.exploration.sensorFrags += (doc["Count"] | 1);
+        updateContextPanel();
       }
     } else if (event == "RepairAll") {
       // Whole ship repaired -> hull back to 100%.

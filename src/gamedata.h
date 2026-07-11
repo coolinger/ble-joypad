@@ -62,6 +62,12 @@ struct ExplorationInfo {
   int  sigGeo = 0;            // geological signals total
   int  sigOther = 0;          // everything else (human/thargoid/guardian/...)
   int  bioAnalysed = 0;       // genuses completed (ScanOrganic "Analyse")
+  // Non-Human Signature predictor: a system with ammonia-based life AND a
+  // landable body spawns surface Thargoid sensor-fragment sources. Both flags
+  // come from Scan events; sensorFrags counts collected fragments this system.
+  bool ammoniaLife = false;   // Scan PlanetClass "...ammonia based life"/"Ammonia world"
+  bool hasLandable = false;   // any Scan with Landable == true
+  int  sensorFrags = 0;       // MaterialCollected "unknownenergysource" total
 };
 
 struct EventLogEntry {

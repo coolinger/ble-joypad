@@ -14,14 +14,14 @@ lv_obj_t *near_genus_label = nullptr;
 lv_obj_t *cat_lines[3] = {nullptr};
 lv_obj_t *ctx_panel = nullptr;
 lv_obj_t *ctx_rail_label = nullptr;
-lv_obj_t *ctx_lines[4] = {nullptr};
+lv_obj_t *ctx_lines[5] = {nullptr};
 
 // No time column (static ages were useless); the freed width goes to the
 // sidebar so long context lines ("HONK OK  BODIES 20/20 OK") fit.
 #define EVENTS_W 230
 #define SIDE_X   (EVENTS_W + 8)                   // 238
 #define SIDE_W   (CONTENT_W - SIDE_X - 6)         // 202
-#define CTX_H    76
+#define CTX_H    90   // 5 lines: the last is the conditional NHS/fragments line
 
 static lv_obj_t* rail(lv_obj_t *parent, const char *txt, int x, int y, int w) {
   lv_obj_t *l = lv_label_create(parent);
@@ -131,7 +131,7 @@ void create_logviewer_ui() {
   lv_obj_set_style_text_color(ctx_rail_label, LV_COLOR_DIM, 0);
   lv_obj_set_pos(ctx_rail_label, 0, 0);
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     ctx_lines[i] = lv_label_create(ctx_panel);
     lv_label_set_text(ctx_lines[i], "");
     lv_obj_set_style_text_font(ctx_lines[i], FONT_SMALL, 0);

@@ -21,6 +21,6 @@ extern lv_obj_t *cat_lines[3];
 // updateContextPanel (main.cpp) fills the rail + 4 lines.
 extern lv_obj_t *ctx_panel;
 extern lv_obj_t *ctx_rail_label;
-extern lv_obj_t *ctx_lines[4];
+extern lv_obj_t *ctx_lines[5];  // [4] = NHS / sensor-fragment line (conditional)
 
 void create_logviewer_ui();
